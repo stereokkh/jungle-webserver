@@ -65,7 +65,8 @@ build/      빌드 산출물 (git 무시)
 
 ### 브랜치
 - `main` — 안정 버전. **직접 push 불가, `develop` 에서 온 PR만 머지 가능**
-- `develop` — 통합 브랜치. **직접 push 불가, PR + CI 통과 후 머지**
+- `develop` — 통합 브랜치이자 **기본 브랜치**. **직접 push 불가, PR + CI 통과 후 머지**
+  - 기본 브랜치 변경 전에 클론했다면 `git remote set-head origin -a` 로 갱신
 - `feat/<기능>`, `fix/<버그>` — 작업 브랜치 → `develop` 으로 PR
 
 ```
@@ -79,6 +80,11 @@ feat/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ main
 
 `main` 추가 규칙:
 - `main ← develop only` 검사 통과 필수 (develop 이외 브랜치의 PR은 머지 불가)
+
+### 작업 관리
+- 할 일: 마일스톤 [11/25 마감](https://github.com/stereokkh/jungle-webserver/milestone/1) 의 이슈
+- 보드: [Projects](https://github.com/users/stereokkh/projects/12) — 이슈를 잡으면 Assignee 지정 + In Progress
+- PR 설명에 `close #이슈번호` 를 쓰면 develop 머지 시 이슈가 닫히고 보드에서 Done 으로 이동
 
 ### 커밋 메시지
 ```

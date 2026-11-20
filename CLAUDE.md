@@ -7,6 +7,34 @@
 - C로 작성하는 웹서버 + Proxy / Reverse Proxy (크래프톤 정글 과제)
 - **외부 HTTP 라이브러리·프레임워크 금지.** POSIX 소켓 API와 C 표준 라이브러리만 사용
 - macOS / WSL / Linux 에서 같은 소스가 빌드·실행되어야 함 (과제 요구사항)
+- 마감: **2026-11-25(수) 12:00 KST**. 3명 (트랙 A: 서버 코어·릴리스, B: HTTP 파서·프록시, C: 응답·정적·앱·검증 조율)
+
+## 설계 결정 (2026-11-20 합의)
+
+과제 원본·이슈 초안을 Codex와 교차 검토해서 정한 범위다. 바꾸려면 팀 합의 후 이 절을 먼저 고친다.
+
+| 항목 | 결정 | 이유 |
+|---|---|---|
+| 동시성 | **처음부터 `poll()` 이벤트 루프** (논블로킹). 블로킹 서버를 먼저 만들고 갈아엎지 않는다 | 팀 이식성 규칙, 느린 클라이언트 격리, 재작성 비용 회피 |
+| 동적 처리 | **서버 내장 앱 라우트** `GET /api/add`, `POST /api/echo`. CGI는 하지 않는다 | 과제가 "CGI 또는 백엔드 전달"을 허용. poll 루프 안의 CGI 파이프·`waitpid`는 서버 전체를 막을 위험 |
+| 프록시 | **Reverse Proxy만** (경로 최장 접두사 라우팅, 502/504, 마지막에 Round-Robin). 백엔드는 같은 바이너리를 프록시 설정 없이 다른 포트로 실행 | 외부 인터넷 없이 결정적 테스트 가능 |
+| 처리 순서 | 프록시 경로 → 내장 앱 경로 → 정적 파일 | 백엔드 인스턴스에서 프록시 순환 방지 |
+| 범위 밖 | CGI, Forward Proxy, 캐시, 백엔드 장애 시 자동 재시도/페일오버, chunked, TLS | 4.5일 일정. 필요하면 마감 후 후속 이슈로 |
+
+구현 시 지킬 계약 (자세한 건 이슈 #4):
+
+- 모듈(파서·응답·정적·앱·프록시 정책)은 소켓과 무관한 순수 함수로 두고 단위 테스트한다
+- 파서는 증분 방식: 완료 / 추가 입력 필요 / 오류 + **소비 바이트 수**를 반환하고, 다음 요청의 잔여 바이트를 보존한다 (keep-alive)
+- 원본 요청 대상(프록시 전달용)과 디코딩된 경로(파일 접근용)를 따로 저장한다
+- 송신은 진행 상태(offset)를 저장하고, 막히면(`EAGAIN`) 이벤트 루프에 제어권을 돌려준다. 루프 안에서 끝날 때까지 `write` 를 반복하지 않는다
+- 백엔드 주소는 설정 로드 시 `getaddrinfo` 로 한 번 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
+- 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
+- 종료(`SIGINT`/`SIGTERM`) 시 listen 소켓뿐 아니라 모든 연결·파일·업스트림을 정리한다
+
+CS:APP Tiny (이슈 #3):
+
+- 분석·비교 대상일 뿐이다. 원본(`tiny.c`, `csapp.c`)은 **커밋하지 않는다** (URL·해시·분석 문서만). `src/` 에서 `csapp.c` 를 링크하지 않는다
+- Tiny와의 벤치마크는 "관찰"로만 기록한다. "poll로 바꿔 몇 배 빨라졌다" 같은 인과 주장은 쓰지 않는다
 
 ## 지원 환경
 
@@ -44,6 +72,8 @@ include/    헤더 (.h)
 tests/      테스트 (tests/run.sh, make test 로 실행)
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
+docs/       (예정) api.md, benchmark.md, classic.md
+www/        (예정) 정적 파일 예제
 ```
 
 ## 명령
@@ -78,11 +108,21 @@ make docker-shell DISTRO=alpine         # 컨테이너 안 셸
 feat/* , fix/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ main
 ```
 
+- **기본 브랜치는 `develop`** (2026-11-20 변경). PR 대상 기본값이 develop이고, develop에 머지될 때 `close #N` 이 이슈를 닫는다. 기존 클론은 `git remote set-head origin -a` 로 갱신
 - `main`, `develop` 은 보호됨: 직접 push 불가(관리자 포함), PR + CI 5개 통과 필수, force push·삭제 금지
 - `main` 은 이 저장소의 `develop` 에서 온 PR만 머지 가능 (`main ← develop only` 검사)
 - 작업은 항상 `develop` 에서 새 브랜치를 만들어 시작: `git checkout develop && git pull && git checkout -b feat/<기능>`
 - CI push 트리거는 `develop` 만. 작업 브랜치는 PR 이벤트로만 검사됨
 - 커밋 메시지: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, `ci:` 접두사
+
+## 작업 관리 (이슈 / 보드)
+
+- 할 일은 마일스톤 **"11/25 마감"** 의 이슈 #3–#11 에 있다. 작업 전 해당 이슈의 할 일·기한·참고를 읽는다
+- 보드: https://github.com/users/stereokkh/projects/12 (Status: Todo → In Progress → In Review → Done, 필드: Track, Due). 이슈 닫힘·PR 머지 시 Done 으로 자동 이동
+- 이슈를 잡으면 Assignee 지정 + In Progress. 막히면 이슈 댓글로 남긴다
+- PR은 작게 자주. 중간 PR은 `ref #N`, 이슈를 끝내는 PR만 `close #N`
+- 일정 체크포인트: 토 10:00 #4 인터페이스 확정 → **일 저녁 프록시 GET/POST 첫 통합** (늦어지면 Round-Robin·Tiny 추가 비교를 미룬다) → 화 저녁 `develop → main` 릴리스, 수 오전은 여유
+- sanitizer(`make asan`)·종료 테스트는 각 기능 PR에서 돌린다. 마지막 날 처음 돌리지 않는다
 
 ## 개발 환경 메모
 
@@ -92,8 +132,9 @@ feat/* , fix/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ 
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현 (현재 `src/main.c` 는 포트 인자만 받는 뼈대)
-- 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 서버 기능이 생긴 뒤 추가
-- `docs/api.md` (지원 메서드, 상태 코드, 프록시 설정). 서버 기능이 생긴 뒤 추가
-- 팀원을 Collaborator로 초대한 뒤 `main`/`develop` 보호 규칙의 필수 리뷰 수를 0 → 1 로 올리기
+- 서버 구현 (현재 `src/main.c` 는 포트 인자만 받는 뼈대) → 이슈 #4–#10
+- `tests/run.sh` 는 아직 `./webserver 8080` 이 바로 exit 0 하는지 검사한다. 서버가 상주하게 되면 깨지므로 첫 서버 PR(#7)에서 백그라운드 실행 방식으로 바꾼다
+- `docs/api.md`, `docs/benchmark.md`, `docs/classic.md` → 이슈 #11, #3
+- 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
+- 팀원 Collaborator 초대는 완료. `main`/`develop` 보호 규칙의 필수 리뷰 수 0 → 1 은 아직
 - `main ← develop only` 검사는 첫 develop→main PR 때 처음 실행됨 (아직 실제 동작 미확인)
