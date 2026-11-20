@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/claude-sync.sh\" session",
+            "timeout": 20,
+            "statusMessage": "origin/develop 확인 중"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/claude-sync.sh\" prompt",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

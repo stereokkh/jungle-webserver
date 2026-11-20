@@ -89,11 +89,12 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 src/        소스 (.c)
 include/    헤더 (.h)
 tests/      테스트 (tests/run.sh, make test 로 실행)
-scripts/    보조 스크립트 (fetch-tiny.sh: CS:APP Tiny 받기·빌드)
+scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync.sh: 세션 동기화 훅)
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
-docs/       (예정) api.md, benchmark.md, classic.md
+docs/       decisions.md (결정 기록), (예정) api.md, benchmark.md, classic.md
+.claude/    settings.json (팀 공용 훅: 세션 동기화)
 www/        (예정) 정적 파일 예제
 ```
 
@@ -145,6 +146,18 @@ feat/* , fix/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ 
 - PR은 작게 자주. 중간 PR은 `ref #N`, 이슈를 끝내는 PR만 `close #N`
 - 일정 체크포인트: 토 10:00 #4 인터페이스 확정 → **일 저녁 프록시 GET/POST 첫 통합** (늦어지면 Round-Robin·Tiny 추가 비교를 미룬다) → 화 저녁 `develop → main` 릴리스, 수 오전은 여유
 - sanitizer(`make asan`)·종료 테스트는 각 기능 PR에서 돌린다. 마지막 날 처음 돌리지 않는다
+
+## 세션 간 동기화
+
+계획·관리는 Windows 쪽 세션, 코딩은 각자 WSL/macOS 세션에서 한다. 세션끼리 대화는 이어지지 않으므로 **저장소(develop)가 유일한 기준**이다.
+
+- 계획·범위·규칙이 바뀌면: `docs/decisions.md` 맨 위에 항목 추가 + 이 파일의 "지금 상태" 수정을 같은 PR로 develop에 머지한다. 대화로만 정하고 끝내지 않는다
+- `.claude/settings.json` 훅이 `scripts/claude-sync.sh` 를 실행한다
+  - 세션 시작 시, 그리고 프롬프트 중 15분에 한 번 `origin/develop` 을 fetch
+  - 현재 브랜치에 없는 커밋이 있으면 커밋 목록과 바뀐 공유 파일(CLAUDE.md, docs/, include/ 등)을 컨텍스트로 알려 준다
+  - develop 에 있고 작업 트리가 깨끗하면 fast-forward 만 한다. 작업 브랜치는 건드리지 않는다
+- 알림을 받으면: `git show origin/develop:CLAUDE.md`, `git diff HEAD...origin/develop -- docs/decisions.md include/` 를 읽고 따른다. 지금 작업과 충돌하면 진행 전에 사용자에게 알린다. 작업 브랜치의 rebase/merge 는 사용자에게 묻고 한다
+- 처음 한 번은 훅 승인이 필요할 수 있다 (Claude Code가 새 프로젝트 훅을 확인함). 끄려면 `.claude/settings.local.json` 에 `"disableAllHooks": true`
 
 ## 개발 환경 메모
 
