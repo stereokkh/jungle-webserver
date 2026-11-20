@@ -14,7 +14,7 @@
 
 int app_match(const http_request *req)
 {
-    return strncmp(req->path, APP_PREFIX, sizeof APP_PREFIX - 1) == 0;
+    return strncmp(req->target, APP_PREFIX, sizeof APP_PREFIX - 1) == 0;
 }
 
 int app_handle(const http_request *req, const char *instance_port, buffer *out)

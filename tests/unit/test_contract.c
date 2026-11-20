@@ -44,7 +44,7 @@ static void test_append_failure_keeps_buffer(void)
     if (http_append_header(&out, &h) < 0)
         CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
     buffer_clear(&out);
-    if (http_append_error(&out, 404, 0, 0) < 0)
+    if (http_append_error(&out, 404, 0, 0, NULL) < 0)
         CHECK_INT(buffer_pending(&out), 0);
     buffer_free(&out);
 }
@@ -89,6 +89,14 @@ static void test_app_match_prefix_only(void)
     CHECK_INT(app_match(&req), 0);
     set_get(&req, "/api");
     CHECK_INT(app_match(&req), 0);
+
+    /* 원본 target 기준: 표기만 바꾼 요청은 앱이 아니다 (proxy_match 와 같은 기준) */
+    set_get(&req, "/%61pi/add");
+    strcpy(req.path, "/api/add");
+    CHECK_INT(app_match(&req), 0);
+    set_get(&req, "/api/add");
+    strcpy(req.target, "/api/add?a=1&b=2");
+    CHECK_INT(app_match(&req), 1);
 }
 
 /* 정리 함수는 두 번 불러도 안전하다 (실패 경로에서 중복 정리 가능) */

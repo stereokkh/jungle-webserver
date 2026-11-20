@@ -47,7 +47,7 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 규칙:
 
 - **다른 모듈은 받은 `buffer` 에 덧붙이기만 한다.** free, clear, consume 하지 않는다
-- **덧붙이기가 실패하면 버퍼는 호출 전 그대로다** (`out->len` 을 되돌림). 반쯤 쓴 응답이 나가지 않게
+- **덧붙이기가 실패하면 버퍼는 호출 전 그대로다.** 반쯤 쓴 응답이 나가지 않게. 여러 번 나눠 덧붙이는 함수는 시작할 때 `buffer_mark`, 실패하면 `buffer_rollback` 한다 (`out->len` 을 직접 저장·복원하지 않는다. 도중에 compact 되면 어긋남)
 - **`http_request.headers`, `.body` 는 `conn.in` 안을 가리킨다.** 응답 생성과 프록시 요청 생성이 끝난 뒤에 `buffer_consume(&in, consumed)` 한다. 그 전에 `in` 에 read/append/compact 하지 않는다
 - 모듈은 자기가 열지 않은 fd 를 닫지 않는다
 - 정리 함수(`buffer_free`, `static_close`, `conn_close`)는 두 번 불러도 안전해야 한다. 실패 경로에서 중복 호출이 생기기 쉽다
@@ -85,8 +85,12 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 ## 정한 세부 규칙
 
 - **요청 크기**: 헤더 8KB(431), URI 2KB(414), 본문 1MB(413). `Transfer-Encoding` 은 501
+- **431 우선**: 요청 시작부터 빈 줄까지가 8KB 를 넘으면 다른 오류보다 먼저 431. TCP 분할과 상관없이 같은 요청은 같은 코드
+- **경로의 금지 바이트**: 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)가 있거나 `%XX` 가 잘못되면 파서가 400. `static_open` 은 이를 전제로 한다
 - **프록시 경로 매칭**: 디코딩 전 `target` 의 `?` 앞 경로로, 경로 경계에서만 (`/api` 는 `/apix` 에 안 맞음)
-- **앱 경로**: 디코딩한 `path` 가 `/api/` 로 시작. 프록시 경로가 먼저라서 프록시 인스턴스에서는 백엔드로 가고, 백엔드 인스턴스(`-c` 없음)에서는 앱이 처리한다
+- **앱 경로**: 디코딩 전 `target` 이 `/api/` 로 시작 (프록시 매칭과 같은 기준). 프록시 경로가 먼저라서 프록시 인스턴스에서는 백엔드로 가고, 백엔드 인스턴스(`-c` 없음)에서는 앱이 처리한다. `/%61pi/add` 처럼 표기를 바꾼 요청은 둘 다 안 맞아 정적 파일(404)로 간다. 정적 파일만 디코딩한 `path` 를 쓴다
+- **프록시 헤더**: hop-by-hop 헤더와 클라이언트 `Connection` 값에 적힌 이름은 빼고 전달. 클라이언트가 보낸 `X-Forwarded-For` 는 버리고 실제 클라이언트 IP 로 새로 쓴다
+- **오류 응답의 추가 헤더**: `http_append_error` 의 `extra_headers` 로 넣는다. 405 `Allow` 는 호출자가 넣고(정적 `GET, HEAD`, echo `POST`), 앱의 오류에도 `X-Instance` 를 붙인다
 - **HEAD**: 헤더는 GET 과 같게(Content-Length 포함), 본문은 보내지 않는다
-- **정적 파일 메서드**: GET, HEAD 외에는 서버가 405 (`Allow: GET, HEAD`)
+- **정적 파일 메서드**: GET, HEAD 외에는 서버가 405 (`extra_headers` = `"Allow: GET, HEAD\r\n"`)
 - **큰 배열은 스택에 두지 않는다**: `http_request`, `conn` 은 힙(calloc). `static_send_some` 의 지역 버퍼는 16KB 이하

@@ -22,9 +22,13 @@
 
 /* 백엔드로 보낼 요청 전체를 out 뒤에 덧붙인다:
  *   요청 라인 "<method_str> <target> HTTP/1.1" (원본 target 유지),
- *   req->headers 에서 hop-by-hop 헤더(Connection, Keep-Alive, Proxy-*, TE, Trailer,
- *   Transfer-Encoding, Upgrade)와 Host 를 빼고 전달, Host: <backend name>,
- *   X-Forwarded-For: <client_ip> 추가, Connection: close, 본문 그대로.
+ *   req->headers 에서 아래를 빼고 나머지를 그대로 전달한다 (이름 대소문자 무시):
+ *     - hop-by-hop 헤더: Connection, Keep-Alive, Proxy-*, TE, Trailer, Transfer-Encoding, Upgrade
+ *     - 클라이언트 Connection 헤더 값에 적힌 이름 (RFC 7230 6.1).
+ *       "Connection: close, X-Foo" 면 X-Foo 도 뺀다
+ *     - Host, X-Forwarded-For (클라이언트가 보낸 값은 믿지 않고 버린다)
+ *   그다음 Host: <backend name>, X-Forwarded-For: <client_ip>, Connection: close 를 새로 쓰고,
+ *   빈 줄, 본문 그대로.
  * 성공 0, 실패 -1 (out 은 그대로) */
 int proxy_build_request(const http_request *req, const proxy_backend *backend,
                         const char *client_ip, buffer *out);

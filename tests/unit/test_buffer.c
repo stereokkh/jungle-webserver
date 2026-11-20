@@ -116,6 +116,36 @@ static void test_clear_reuses(void)
     buffer_free(&b);
 }
 
+/* rollback 은 덧붙이는 도중 compact 가 일어나도 시작 전 내용으로 돌아간다 (PR #18 리뷰) */
+static void test_rollback_after_compact(void)
+{
+    buffer b = BUFFER_INIT;
+    char big[700];
+    size_t m;
+
+    memset(big, 'x', sizeof big);
+    REQUIRE(buffer_append(&b, big, 600) == 0);    /* cap 1024 */
+    buffer_consume(&b, 500);                      /* off 500, len 600, 남은 100 */
+    m = buffer_mark(&b);
+    CHECK_INT(m, 100);
+
+    REQUIRE(buffer_append(&b, big, 500) == 0);    /* 1100 > 1024 → compact 후 덧붙임 */
+    CHECK_INT(b.off, 0);
+    buffer_rollback(&b, m);                       /* 뒤 append 가 실패했다고 치고 되돌림 */
+    CHECK_INT(buffer_pending(&b), 100);
+    CHECK_INT(b.len, 100);
+
+    /* 되돌린 뒤에도 정상적으로 이어 쓴다 */
+    REQUIRE(buffer_append_str(&b, "ok") == 0);
+    CHECK_INT(buffer_pending(&b), 102);
+    CHECK_MEM(buffer_peek(&b) + 100, 2, "ok", 2);
+
+    /* mark 보다 짧아질 일은 없지만, 큰 mark 는 아무것도 하지 않는다 */
+    buffer_rollback(&b, 1000);
+    CHECK_INT(buffer_pending(&b), 102);
+    buffer_free(&b);
+}
+
 int main(void)
 {
     RUN(test_empty);
@@ -125,5 +155,6 @@ int main(void)
     RUN(test_compact_keeps_rest);
     RUN(test_max_rejected);
     RUN(test_clear_reuses);
+    RUN(test_rollback_after_compact);
     return test_report();
 }

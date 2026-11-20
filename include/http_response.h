@@ -29,7 +29,10 @@ int http_append_header(buffer *out, const http_response_head *h);
 
 /* 오류 응답 전체(헤더 + 짧은 HTML 본문)를 out 뒤에 덧붙인다.
  * head_only 가 1 이면 (HEAD 요청) Content-Length 는 본문 길이 그대로 두고 본문은 쓰지 않는다.
- * 405 면 Allow: GET, HEAD 를 넣는다. 성공 0, 실패 -1 (out 은 그대로) */
-int http_append_error(buffer *out, int status, int keep_alive, int head_only);
+ * extra_headers 는 http_response_head 와 같다 (CRLF 로 끝나는 줄들, 없으면 NULL).
+ * 405 의 Allow 는 호출자가 넣는다: 정적 "Allow: GET, HEAD\r\n", 앱 "Allow: POST\r\nX-Instance: 8001\r\n"
+ * 성공 0, 실패 -1 (out 은 그대로) */
+int http_append_error(buffer *out, int status, int keep_alive, int head_only,
+                      const char *extra_headers);
 
 #endif /* HTTP_RESPONSE_H */

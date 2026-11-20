@@ -17,9 +17,11 @@ parse_result http_parse_request(const char *buf, size_t len,
                                 http_request *req, size_t *consumed, int *status)
 {
     /* TODO(#5):
-     *  - "\r\n\r\n" 이 없으면: len > HTTP_MAX_HEADER 이면 431, 아니면 NEED_MORE
+     *  - 앞 HTTP_MAX_HEADER 바이트 안에 "\r\n\r\n" 이 없으면:
+     *      len >= HTTP_MAX_HEADER 이면 431, 아니면 NEED_MORE (431 을 가장 먼저 판정, 헤더 주석)
      *  - 요청 라인: 메서드(모르면 501), 대상(길면 414), 버전(HTTP/1.0|1.1 아니면 505)
-     *  - target → path(디코딩) / query 분리, path 에 NUL·잘못된 %XX 가 있으면 400
+     *  - target → path(디코딩) / query 분리,
+     *    path 에 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 가 있으면 400
      *  - 헤더: 이름 대소문자 무시. Content-Length 음수·오버플로·서로 다른 중복 → 400,
      *          Transfer-Encoding → 501
      *  - 본문: content_length 만큼 안 왔으면 NEED_MORE, 너무 크면 413

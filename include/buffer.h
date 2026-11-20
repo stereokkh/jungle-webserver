@@ -66,4 +66,20 @@ void buffer_consume(buffer *b, size_t n);
 /* 남은 바이트를 맨 앞으로 옮긴다 (입력 버퍼에 read 하기 전, 앞쪽 공간 회수) */
 void buffer_compact(buffer *b);
 
+/*
+ * 여러 번 나눠 덧붙이다 중간에 실패하면 시작 전 상태로 되돌린다:
+ *
+ *   size_t m = buffer_mark(out);
+ *   if (buffer_appendf(out, ...) < 0 || buffer_append(out, ...) < 0) {
+ *       buffer_rollback(out, m);
+ *       return -1;
+ *   }
+ *
+ * len 을 직접 저장했다 되돌리면 안 된다. 덧붙이는 도중 buffer_reserve 가 compact 해서
+ * off·len 이 바뀔 수 있다. mark 는 pending 길이라 compact 와 상관없이 맞다 (PR #18 리뷰).
+ * mark 와 rollback 사이에는 덧붙이기만 한다 (consume 하지 않는다).
+ */
+size_t buffer_mark(const buffer *b);
+void buffer_rollback(buffer *b, size_t mark);
+
 #endif /* BUFFER_H */

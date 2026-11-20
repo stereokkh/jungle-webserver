@@ -131,3 +131,14 @@ void buffer_compact(buffer *b)
     b->len -= b->off;
     b->off = 0;
 }
+
+size_t buffer_mark(const buffer *b)
+{
+    return b->len - b->off;
+}
+
+void buffer_rollback(buffer *b, size_t mark)
+{
+    if (mark < b->len - b->off)
+        b->len = b->off + mark;
+}

@@ -7,7 +7,7 @@
  *                       docroot 탈출(.., 심볼릭 링크) 차단, 500 처리
  *
  * 서버(server.c)에서 쓰는 순서:
- *   1. static_open → 실패면 http_append_error(*status)
+ *   1. static_open → 실패면 http_append_error(out, *status, keep_alive, head_only, NULL)
  *   2. http_append_header(out, { 200, f.content_type, f.size, keep_alive, NULL })
  *   3. out 버퍼를 다 보낸 뒤, HEAD 가 아니면 static_send_some 을 1 이 나올 때까지 POLLOUT 마다 부른다
  *   4. 끝나거나 실패하면 static_close (연결을 닫을 때도 반드시)
