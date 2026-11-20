@@ -34,6 +34,7 @@
 CS:APP Tiny (이슈 #3):
 
 - 분석·비교 대상일 뿐이다. 원본(`tiny.c`, `csapp.c`)은 **커밋하지 않는다** (URL·해시·분석 문서만). `src/` 에서 `csapp.c` 를 링크하지 않는다
+- 로컬에서 받기·빌드: `make classic` (= `sh scripts/fetch-tiny.sh`) → `classic/` 에 원본·`SOURCES.txt`(URL·sha256)·바이너리. `classic/` 은 `.gitignore` 대상이고, 팀 빌드 플래그·CI와 무관하다 (Makefile은 `src/*.c` 만 빌드)
 - Tiny와의 벤치마크는 "관찰"로만 기록한다. "poll로 바꿔 몇 배 빨라졌다" 같은 인과 주장은 쓰지 않는다
 
 ## 지원 환경
@@ -70,6 +71,8 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 src/        소스 (.c)
 include/    헤더 (.h)
 tests/      테스트 (tests/run.sh, make test 로 실행)
+scripts/    보조 스크립트 (fetch-tiny.sh: CS:APP Tiny 받기·빌드)
+classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
 docs/       (예정) api.md, benchmark.md, classic.md
@@ -86,6 +89,7 @@ make CC=clang                           # 컴파일러 지정
 make docker-test [DISTRO=alpine] [CC=clang]   # 컨테이너에서 빌드+테스트
 make docker-test-all                    # Ubuntu + Alpine
 make docker-shell DISTRO=alpine         # 컨테이너 안 셸
+make classic                            # CS:APP Tiny를 classic/ 에 받아 빌드 (분석용, 커밋 안 함)
 ```
 
 - Docker 컨테이너는 **검증용**이다. 소스를 읽기 전용으로 마운트하고 컨테이너 내부 복사본에서 빌드하므로 호스트 `build/` 는 건드리지 않는다

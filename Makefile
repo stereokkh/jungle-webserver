@@ -17,7 +17,7 @@ SRCS := $(wildcard $(SRC_DIR)/*.c)
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean run test docker-build docker-test docker-test-all docker-shell
+.PHONY: all clean run test classic docker-build docker-test docker-test-all docker-shell
 
 all: $(TARGET)
 
@@ -38,6 +38,10 @@ test: $(TARGET)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
+
+# CS:APP Tiny를 classic/ 에 받아서 빌드 (분석용, 커밋 안 함, CI 대상 아님). 이슈 #3
+classic:
+	sh scripts/fetch-tiny.sh
 
 # ---------------------------------------------------------------
 # Docker 검증 환경
