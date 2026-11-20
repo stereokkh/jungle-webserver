@@ -1,0 +1,20 @@
+name: main-guard
+
+# main 으로 들어오는 PR은 develop 브랜치에서 온 것만 허용
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  source-is-develop:
+    name: main ← develop only
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check source branch
+        run: |
+          echo "source: ${{ github.head_ref }} → target: ${{ github.base_ref }}"
+          if [ "${{ github.head_ref }}" != "develop" ] || \
+             [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "::error::main 에는 이 저장소의 develop 브랜치에서 온 PR만 머지할 수 있습니다."
+            exit 1
+          fi
