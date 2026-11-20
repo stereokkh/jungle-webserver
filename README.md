@@ -64,9 +64,18 @@ build/      빌드 산출물 (git 무시)
 ## 협업 규칙
 
 ### 브랜치
-- `main` — 항상 빌드되는 안정 버전
+- `main` — 안정 버전. **직접 push 불가, `develop` 에서 온 PR만 머지 가능**
 - `develop` — 통합 브랜치
 - `feat/<기능>`, `fix/<버그>` — 작업 브랜치 → `develop` 으로 PR
+
+```
+feat/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ main
+```
+
+`main` 브랜치 보호 규칙:
+- PR 필수 (직접 push 금지, 관리자 포함)
+- CI 5개 조합 모두 통과 필수
+- `main ← develop only` 검사 통과 필수 (develop 이외 브랜치의 PR은 머지 불가)
 
 ### 커밋 메시지
 ```

@@ -1,8 +1,9 @@
 name: build
 
 on:
+  # 작업 브랜치(feat/*, fix/*)는 PR 이벤트로만 검사 → 중복 실행 방지
   push:
-    branches: [main, develop, 'feat/**', 'fix/**']
+    branches: [develop]
   pull_request:
 
 jobs:
