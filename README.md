@@ -84,7 +84,7 @@ feat/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ main
 ### 작업 관리
 - 할 일: 마일스톤 [11/25 마감](https://github.com/stereokkh/jungle-webserver/milestone/1) 의 이슈
 - 보드: [Projects](https://github.com/users/stereokkh/projects/12) — 이슈를 잡으면 Assignee 지정 + In Progress
-- 노션 (각자 파트 학습 정리): [프로젝트 노션](https://app.notion.com/p/41ee390f3d9280c2be28d3f8a7865738) — 결정·규칙은 저장소의 `docs/decisions.md` / `CLAUDE.md` 가 기준
+- 노션 (각자 파트 학습 정리): [프로젝트 노션](https://app.notion.com/p/41efacdfe6e480ee9f8ccec38a3af93c) — 결정·규칙은 저장소의 `docs/decisions.md` / `CLAUDE.md` 가 기준
 - PR 설명에 `close #이슈번호` 를 쓰면 develop 머지 시 이슈가 닫히고 보드에서 Done 으로 이동
 
 ### 커밋 메시지
