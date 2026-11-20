@@ -36,3 +36,12 @@ jobs:
       # 로컬과 동일한 docker/alpine.Dockerfile 사용
       - name: Build & test in Alpine container
         run: make docker-test DISTRO=alpine CC=${{ matrix.cc }} WERROR=1
+
+  # 필수 검사는 아니다 (보호 규칙의 5개에 포함 안 됨). 실패하면 PR 에서 원인을 확인한다
+  asan:
+    name: ubuntu / asan+ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build & test with sanitizers
+        run: make asan WERROR=1

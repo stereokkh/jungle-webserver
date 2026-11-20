@@ -38,7 +38,9 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 | macOS | 맥 사용 팀원, CI (macOS 러너) |
 
 ```bash
-make test                               # 내 환경에서 빌드 + 테스트
+make unit                               # 단위 테스트만
+make test                               # 내 환경에서 빌드 + 단위 테스트 + 스모크 테스트
+make asan                               # AddressSanitizer/UBSan 빌드로 같은 테스트 (Ubuntu·WSL·macOS)
 make docker-test                        # Ubuntu 컨테이너에서
 make docker-test DISTRO=alpine          # Alpine 컨테이너에서
 make docker-test DISTRO=alpine CC=clang # 컴파일러 지정
@@ -56,7 +58,7 @@ make docker-shell DISTRO=alpine         # 컨테이너 안에서 직접 확인
 ```
 src/        소스 (.c)
 include/    헤더 (.h)
-tests/      테스트 스크립트 (make test)
+tests/      unit/ 단위 테스트(make unit), run.sh 스모크 테스트 (make test)
 docker/     검증용 Dockerfile (ubuntu, alpine)
 build/      빌드 산출물 (git 무시)
 ```

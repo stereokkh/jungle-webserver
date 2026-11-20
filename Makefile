@@ -17,7 +17,14 @@ SRCS := $(wildcard $(SRC_DIR)/*.c)
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean run test classic docker-build docker-test docker-test-all docker-shell
+# 단위 테스트: tests/unit/test_*.c 하나가 실행 파일 하나. main.c 를 뺀 모든 모듈과 링크
+UNIT_DIR  := tests/unit
+UNIT_SRCS := $(wildcard $(UNIT_DIR)/test_*.c)
+UNIT_BINS := $(UNIT_SRCS:$(UNIT_DIR)/%.c=$(BUILD_DIR)/unit/%)
+LIB_OBJS  := $(filter-out $(BUILD_DIR)/main.o,$(OBJS))
+DEPS      += $(UNIT_BINS:=.d)
+
+.PHONY: all clean run test unit asan classic docker-build docker-test docker-test-all docker-shell
 
 all: $(TARGET)
 
@@ -27,14 +34,36 @@ $(TARGET): $(OBJS)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR):
+$(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)/unit
+	$(CC) $(CPPFLAGS) -I$(UNIT_DIR) $(WARN) $(CFLAGS) -MMD -MP -MT $@ -MF $@.d \
+		-o $@ $< $(LIB_OBJS) $(LDFLAGS)
+
+$(BUILD_DIR) $(BUILD_DIR)/unit:
 	mkdir -p $@
 
 run: $(TARGET)
 	./$(TARGET) 8080
 
-test: $(TARGET)
-	sh tests/run.sh
+# make unit → 단위 테스트만, make test → 단위 테스트 + 스모크 테스트 (CI·docker-test 도 이것)
+unit: $(UNIT_BINS)
+	@echo "== unit tests"
+	@fail=0; for t in $(UNIT_BINS); do ./$$t || fail=1; done; exit $$fail
+
+test: unit $(TARGET)
+	BIN=./$(TARGET) sh tests/run.sh
+
+# make asan → AddressSanitizer + UBSan 으로 build/asan/ 에 따로 빌드해서 make test 와 같은 검사
+#   - 일반 빌드 산출물(build/*.o, ./webserver)과 섞이지 않는다
+#   - 메모리 오류·정의되지 않은 동작은 즉시 실패, Linux 에서는 종료 시 누수도 검사(LeakSanitizer)
+#   - Alpine(musl)은 ASan 미지원 → Ubuntu/WSL 또는 macOS 에서 실행
+SAN         := address,undefined
+ASAN_DIR    := $(BUILD_DIR)/asan
+ASAN_CFLAGS := -O1 -g -fno-omit-frame-pointer -fsanitize=$(SAN) -fno-sanitize-recover=all
+
+asan:
+	UBSAN_OPTIONS=print_stacktrace=1 $(MAKE) --no-print-directory \
+		BUILD_DIR=$(ASAN_DIR) TARGET=$(ASAN_DIR)/webserver \
+		CFLAGS="$(ASAN_CFLAGS)" LDFLAGS="-fsanitize=$(SAN)" test
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
