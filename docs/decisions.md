@@ -8,6 +8,25 @@
 
 ---
 
+## 2026-11-20 · 인터페이스 리뷰 반영 (PR #18)
+
+- **결정**:
+  1. 431 을 가장 먼저 판정한다 (앞 8KB 안에 `\r\n\r\n` 이 없으면 431)
+  2. `app_match` 는 `proxy_match` 와 같이 디코딩 전 `target` 을 본다. 정적 파일만 디코딩한 `path`
+  3. 프록시는 클라이언트 `Connection` 값에 적힌 헤더 이름도 뺀다 (RFC 7230 6.1)
+  4. 클라이언트가 보낸 `X-Forwarded-For` 는 버리고 새로 쓴다
+  5. `http_append_error` 에 `extra_headers` 인자를 추가하고, 405 `Allow` 는 호출자가 넣는다
+  6. 디코딩한 경로의 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 `%XX` 는 400
+  7. `buffer_mark`/`buffer_rollback` 추가. 실패 시 `len` 을 직접 복원하지 않는다
+- **이유**: 1 TCP 분할에 따라 414/431 이 갈림 (상철). 2 `/%61pi/add` 가 프록시를 건너뛰고 앱으로 감 (상철 지적, 혜성 제안). 3·4 표준 준수, 클라이언트가 지어낸 값 차단 (상철). 5 앱 오류에 `X-Instance` 가 없고 echo 의 405 `Allow` 가 틀림 (혜성). 6 `static_open` 이 믿을 보장이 헤더에 없었음 (혜성). 7 덧붙이는 도중 compact 되면 저장한 `len` 이 어긋남 (혜성)
+- **영향**: `http_request.h/.c`, `app.h/.c`, `proxy.h/.c`, `http_response.h/.c`, `static_file.h`, `buffer.h/.c`, `docs/interfaces.md`, `test_buffer.c`, `test_contract.c`. 이슈 #5 #6 #9 #10
+
+## 2026-11-20 · 모듈 인터페이스 확정안 (이슈 #4)
+
+- **결정**: 응답·프록시 요청은 고정 배열 대신 공통 `buffer`(연결이 소유, 늘어남, `off` 가 송신 진행 상태)에 덧붙인다. `http_request` 에 원본 헤더 블록(`headers`)과 `method_str` 추가, `headers`/`body` 는 입력 버퍼를 가리키므로 처리 후 consume. 반환값은 0/-1 로 통일(결과는 buffer 에). `http_append_header` 는 `http_response_head` 구조체 + `extra_headers`. `handler_route` 가 매칭된 라우트를 돌려주고 `app_match` 분리. 프록시 매칭은 디코딩 전 경로 + 경로 경계. 타임아웃 상수(클라이언트 10초, 업스트림 5초)는 `server.h`
+- **이유**: 초안대로면 프록시가 원본 헤더를 전달할 수 없고, 1MB 본문을 담을 출력 버퍼의 크기·소유자가 없고, 입력 버퍼를 당기면 body 포인터가 무효가 되고, 모듈마다 반환값 형태가 달라 연결 코드가 복잡해짐
+- **영향**: `include/*.h` 전부, `src/buffer.c`(신규), 스텁 시그니처, `docs/interfaces.md`(신규), `tests/unit/test_buffer.c`, `test_contract.c`, CODEOWNERS
+
 ## 2026-11-20 · 단위 테스트·sanitizer 기반 (이슈 #4)
 
 - **결정**: `tests/unit/test_*.c` 파일 하나가 실행 파일 하나 (main.c 를 뺀 모든 모듈과 링크). 외부 프레임워크 없이 `tests/unit/test.h` 매크로만 쓴다. `make test` 가 단위 테스트까지 돌리므로 CI 5개·docker-test 에 자동 포함. `make asan` 은 `-fsanitize=address,undefined` 로 `build/asan/` 에 따로 빌드하고, CI 에는 필수가 아닌 `ubuntu / asan+ubsan` 잡으로 추가

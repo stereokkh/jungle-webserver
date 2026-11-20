@@ -13,27 +13,39 @@
 #include "net.h"
 #include "http_request.h"
 #include "handler.h"
+#include "buffer.h"
+#include "static_file.h"
 
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 
-/* 연결 하나의 상태. 버퍼는 힙에 둔다 (musl 스레드 스택 규칙과 같은 이유로 큰 배열은 스택 금지).
- * TODO(#4): 필드와 버퍼 소유권을 확정한다 */
+/* 연결 하나의 상태 (docs/interfaces.md 의 상태 표).
+ * conn 은 calloc 으로 힙에 만든다 (http_request 가 수 KB). 이 파일 밖으로 내보내지 않는다 */
 typedef enum {
-    CONN_READING,       /* 요청을 읽는 중 (http_parse_request 가 NEED_MORE) */
-    CONN_WRITING,       /* 응답을 보내는 중 (offset 저장, EAGAIN 이면 다음 POLLOUT 까지 대기) */
-    CONN_UPSTREAM,      /* 프록시: 백엔드 연결/송수신 중 (#9) */
-    CONN_CLOSING
+    CONN_READING,        /* 요청을 읽는 중 (POLLIN). 파서가 NEED_MORE */
+    CONN_WRITING,        /* out 버퍼를 보내는 중 (POLLOUT). EAGAIN 이면 다음 POLLOUT 까지 대기 */
+    CONN_SENDING_FILE,   /* 헤더를 다 보내고 파일 조각을 보내는 중 (POLLOUT) */
+    CONN_UPSTREAM,       /* 프록시: 백엔드 연결·송수신 중 (#9 에서 세분화) */
+    CONN_CLOSING         /* 다 보내면 닫는다 (keep_alive == 0 또는 오류 응답 후) */
 } conn_state;
 
 typedef struct {
     int fd;
     conn_state state;
-    char *rbuf;  size_t rlen, rcap;     /* 읽은 바이트. 처리한 만큼 앞으로 당긴다 (keep-alive 잔여 보존) */
-    char *wbuf;  size_t wlen, woff;     /* 보낼 바이트와 보낸 위치 */
-    long last_active_ms;                /* 유휴 타임아웃 */
+    buffer in;               /* 받은 바이트. 파서는 buffer_peek(&in) 부터 본다 */
+    buffer out;              /* 보낼 바이트. out.off 가 송신 진행 상태 */
+    http_request req;        /* 파서 결과. headers/body 는 in 안을 가리킴 → 처리 후 consume */
+    int keep_alive;          /* 이번 응답 후 연결 유지 여부 */
+    static_file file;        /* CONN_SENDING_FILE 일 때 */
+    int upstream_fd;         /* 프록시 백엔드 소켓, 없으면 -1 (#9) */
+    buffer up_out;           /* 백엔드로 보낼 요청 (#9) */
+    long last_active_ms;     /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
 } conn;
+
+/* TODO(#7): conn_close(conn *c) — 모든 자원을 정리하는 유일한 함수. 두 번 불러도 안전하게.
+ *   close(fd), close(upstream_fd), static_close(&file),
+ *   buffer_free(&in/&out/&up_out), poll 목록에서 제거, free(c) */
 
 int server_run(const server_config *cfg)
 {

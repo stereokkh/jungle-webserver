@@ -18,10 +18,13 @@
 #include <unistd.h>
 
 int proxy_build_request(const http_request *req, const proxy_backend *backend,
-                        const char *client_ip, char *out, size_t cap)
+                        const char *client_ip, buffer *out)
 {
-    /* TODO(#9): 요청 라인(method target HTTP/1.1) + 헤더 재작성 + 본문 (단위 테스트 대상) */
-    (void)req; (void)backend; (void)client_ip; (void)out; (void)cap;
+    /* TODO(#9): 요청 라인(method_str target HTTP/1.1) + req->headers 를 줄 단위로 보며
+     *  hop-by-hop·Connection 에 적힌 이름·Host·X-Forwarded-For 제외
+     *  + Host/X-Forwarded-For/Connection: close + 본문 (단위 테스트 대상, 헤더 주석).
+     *  시작할 때 buffer_mark, 중간에 실패하면 buffer_rollback */
+    (void)req; (void)backend; (void)client_ip; (void)out;
     return -1;
 }
 

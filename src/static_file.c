@@ -24,16 +24,19 @@ int static_open(const char *docroot, const char *path, static_file *out, int *st
     out->fd = -1;
     out->size = 0;
     out->offset = 0;
+    out->content_type = NULL;   /* 성공 시 mime_type(실제 연 경로) */
     *status = 500;
     return -1;
 }
 
-int static_send_some(static_file *f, int sockfd)
+int static_send_some(static_file *f, int fd)
 {
-    /* TODO(#6): 고정 크기 버퍼(힙 또는 static 아님 → conn 쪽 버퍼 재사용 검토)로
-     *  pread/read → write. EAGAIN 이면 0 반환해서 이벤트 루프에 제어권을 돌려준다.
+    /* TODO(#6): char chunk[16384] (지역 버퍼) 에 pread(f->fd, chunk, n, f->offset)
+     *  → write(fd, chunk, got) → 실제로 쓴 만큼만 f->offset += written.
+     *  (일부만 써져도 다음 호출이 offset 부터 다시 pread 하므로 바이트를 잃지 않는다)
+     *  EAGAIN 이면 0 반환해서 이벤트 루프에 제어권을 돌려준다.
      *  (sendfile 은 OS마다 시그니처가 달라 쓰지 않는다) */
-    (void)f; (void)sockfd;
+    (void)f; (void)fd;
     return -1;
 }
 

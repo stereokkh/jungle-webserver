@@ -27,7 +27,7 @@
 | 처리 순서 | 프록시 경로 → 내장 앱 경로 → 정적 파일 | 백엔드 인스턴스에서 프록시 순환 방지 |
 | 범위 밖 | CGI, Forward Proxy, 캐시, 백엔드 장애 시 자동 재시도/페일오버, chunked, TLS | 4.5일 일정. 필요하면 마감 후 후속 이슈로 |
 
-구현 시 지킬 계약 (자세한 건 이슈 #4):
+구현 시 지킬 계약 (모듈 연결·버퍼 소유권·반환값 규칙은 `docs/interfaces.md`, 함수별 계약은 각 헤더 주석):
 
 - 모듈(파서·응답·정적·앱·프록시 정책)은 소켓과 무관한 순수 함수로 두고 단위 테스트한다
 - 파서는 증분 방식: 완료 / 추가 입력 필요 / 오류 + **소비 바이트 수**를 반환하고, 다음 요청의 잔여 바이트를 보존한다 (keep-alive)
@@ -51,8 +51,10 @@
 | `app` | `serve_dynamic` + `adder.c` (CGI 대신 함수) | C · #10 |
 | `proxy_config` | 없음 | B · #8 |
 | `proxy` | 없음 | B · #9 |
+| `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다. 함수 시그니처는 초안이며 #4 에서 확정한다
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer` 는 구현·테스트 완료). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c` 는 아직 스텁을 호출하지 않는다. #7 에서 CLI(`-p -r -c`)와 `server_run` 연결
 
 CS:APP Tiny (이슈 #3):
@@ -99,7 +101,7 @@ scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
-docs/       decisions.md (결정 기록), (예정) api.md, benchmark.md, classic.md
+docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), (예정) api.md, benchmark.md, classic.md
 .claude/    settings.json (팀 공용 훅: 세션 동기화)
 www/        (예정) 정적 파일 예제
 ```
