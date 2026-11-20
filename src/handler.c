@@ -7,14 +7,20 @@
  * 담당: 이슈 #4 (틀), #8 (프록시 경로 매칭), #10 (앱 경로)
  */
 #include "handler.h"
+#include "app.h"
 
 #include <stddef.h>
 #include <string.h>
 
-route_kind handler_route(const http_request *req, proxy_config *cfg)
+route_kind handler_route(const http_request *req, proxy_config *cfg, proxy_route **route)
 {
-    /* TODO(#8): cfg != NULL && proxy_match(cfg, req->target) → ROUTE_PROXY
-     * TODO(#10): req->path 가 "/api/" 로 시작 → ROUTE_APP */
-    (void)req; (void)cfg;
+    *route = NULL;
+    if (cfg != NULL) {
+        *route = proxy_match(cfg, req->target);   /* 구현: #8 */
+        if (*route != NULL)
+            return ROUTE_PROXY;
+    }
+    if (app_match(req))
+        return ROUTE_APP;
     return ROUTE_STATIC;
 }

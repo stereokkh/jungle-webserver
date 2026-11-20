@@ -5,14 +5,26 @@
  * 담당: 트랙 A · 이슈 #7 (업스트림 상태 통합은 #9, B와 협업)
  * 현대식으로 바뀌는 점: 한 번에 한 연결 → poll 로 여러 연결, keep-alive, 타임아웃,
  *                       SIGINT/SIGTERM 시 모든 자원 정리 후 종료
+ *
+ * 모듈을 어떻게 이어 붙이는지(호출 순서, 버퍼 소유권, 정리 책임)는 docs/interfaces.md
  */
 #ifndef SERVER_H
 #define SERVER_H
 
+/* 동시 연결 상한. 넘으면 accept 후 바로 닫는다 */
+#define SERVER_MAX_CONNS        1024
+
+/* 클라이언트가 이 시간 동안 아무것도 보내지/받지 않으면 연결을 닫는다
+ * (요청을 반만 보내고 멈춘 느린 클라이언트, keep-alive 유휴 연결 모두) */
+#define CLIENT_IDLE_TIMEOUT_MS  10000
+
+/* 업스트림 연결·응답 대기 상한. 응답 시작 전에 넘으면 504 */
+#define UPSTREAM_TIMEOUT_MS     5000
+
 typedef struct {
     const char *port;        /* -p */
     const char *docroot;     /* -r */
-    const char *proxy_conf;  /* -c (없으면 NULL) */
+    const char *proxy_conf;  /* -c (없으면 NULL → 프록시 없는 백엔드 인스턴스) */
 } server_config;
 
 /* 이벤트 루프를 돌린다. 시그널로 정상 종료하면 0, 초기화 실패 시 -1 */

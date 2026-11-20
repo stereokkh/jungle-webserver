@@ -13,6 +13,8 @@
 /include/server.h         @Shirokuma0704
 /src/handler.c            @Shirokuma0704
 /include/handler.h        @Shirokuma0704
+/src/buffer.c             @Shirokuma0704
+/include/buffer.h         @Shirokuma0704
 
 # B 상철의 파일 → 리뷰어 C 혜성
 /src/http_request.c       @sikhesung

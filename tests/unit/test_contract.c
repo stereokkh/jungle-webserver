@@ -7,6 +7,7 @@
 #include "test.h"
 
 #include "app.h"
+#include "buffer.h"
 #include "handler.h"
 #include "http_request.h"
 #include "http_response.h"
@@ -33,48 +34,67 @@ static void test_reason_never_null(void)
     CHECK(http_reason(-1) != NULL);
 }
 
-/* 버퍼가 모자라면 -1 이고 cap 을 넘어 쓰지 않는다 */
-static void test_build_respects_cap(void)
+/* 덧붙이기에 실패하면 out 은 손대지 않은 상태 그대로다 (스텁은 항상 실패) */
+static void test_append_failure_keeps_buffer(void)
 {
-    char buf[1];
-    CHECK_INT(http_build_header(buf, 0, 200, "text/plain", 0, 1), -1);
-    CHECK_INT(http_build_error(buf, 0, 404, 0), -1);
+    buffer out = BUFFER_INIT;
+    http_response_head h = { 200, "text/plain", 0, 1, NULL };
+
+    REQUIRE(buffer_append_str(&out, "keep") == 0);
+    if (http_append_header(&out, &h) < 0)
+        CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
+    buffer_clear(&out);
+    if (http_append_error(&out, 404, 0, 0) < 0)
+        CHECK_INT(buffer_pending(&out), 0);
+    buffer_free(&out);
 }
 
-/* 프록시 설정이 없으면(백엔드 인스턴스) 일반 경로는 정적 파일로 간다 */
+static void set_get(http_request *req, const char *path)
+{
+    memset(req, 0, sizeof *req);
+    req->method = HTTP_GET;
+    strcpy(req->method_str, "GET");
+    strcpy(req->target, path);
+    strcpy(req->path, path);
+    req->version_minor = 1;
+    req->content_length = -1;
+}
+
+/* 프록시 설정이 없으면(백엔드 인스턴스) 앱 경로는 앱, 나머지는 정적 파일로 간다 */
 static void test_route_without_proxy(void)
 {
     static http_request req;   /* 수 KB 라서 스택에 두지 않는다 */
-    memset(&req, 0, sizeof req);
-    req.method = HTTP_GET;
-    strcpy(req.target, "/index.html");
-    strcpy(req.path, "/index.html");
-    req.content_length = -1;
+    static proxy_route dummy;
+    proxy_route *route = &dummy;   /* NULL 로 바뀌는지 본다 */
 
-    CHECK_INT(handler_route(&req, NULL), ROUTE_STATIC);
+    set_get(&req, "/index.html");
+    CHECK_INT(handler_route(&req, NULL, &route), ROUTE_STATIC);
+    CHECK(route == NULL);
+
+    set_get(&req, "/api/add");
+    CHECK_INT(handler_route(&req, NULL, &route), ROUTE_APP);
+    CHECK(route == NULL);
 }
 
-/* 앱 경로가 아니면 0 을 돌려주고 아무것도 쓰지 않는다 */
-static void test_app_ignores_other_paths(void)
+/* 앱 경로는 "/api/" 접두사로만 판단한다 (Tiny 의 strstr("cgi-bin") 오판 방지) */
+static void test_app_match_prefix_only(void)
 {
     static http_request req;
-    char out[64];
-    size_t out_len = 123;
 
-    memset(&req, 0, sizeof req);
-    req.method = HTTP_GET;
-    strcpy(req.target, "/index.html");
-    strcpy(req.path, "/index.html");
-    req.content_length = -1;
-
-    CHECK_INT(app_handle(&req, "8080", out, sizeof out, &out_len), 0);
-    CHECK_INT(out_len, 0);
+    set_get(&req, "/api/echo");
+    CHECK_INT(app_match(&req), 1);
+    set_get(&req, "/index.html");
+    CHECK_INT(app_match(&req), 0);
+    set_get(&req, "/static/api/x");
+    CHECK_INT(app_match(&req), 0);
+    set_get(&req, "/api");
+    CHECK_INT(app_match(&req), 0);
 }
 
 /* 정리 함수는 두 번 불러도 안전하다 (실패 경로에서 중복 정리 가능) */
 static void test_static_close_idempotent(void)
 {
-    static_file f = { .fd = -1, .size = 0, .offset = 0 };
+    static_file f = STATIC_FILE_INIT;
     static_close(&f);
     static_close(&f);
     CHECK_INT(f.fd, -1);
@@ -92,9 +112,9 @@ int main(void)
 {
     RUN(test_mime_never_null);
     RUN(test_reason_never_null);
-    RUN(test_build_respects_cap);
+    RUN(test_append_failure_keeps_buffer);
     RUN(test_route_without_proxy);
-    RUN(test_app_ignores_other_paths);
+    RUN(test_app_match_prefix_only);
     RUN(test_static_close_idempotent);
     RUN(test_next_backend_null_safe);
     return test_report();
