@@ -1,0 +1,33 @@
+# 교차 리뷰: A(건호)의 파일은 B(상철)가, B의 파일은 C(혜성)가, C의 파일은 A가 리뷰한다.
+# 여기 적힌 사람이 PR 리뷰어로 자동 요청된다. (승인 1개는 develop 보호 규칙이 요구)
+# 마지막에 매칭되는 줄이 우선한다.
+
+# 공통 파일: 작성자 외 두 명에게 요청 (둘 중 아무나 승인)
+*                         @stereokkh @Shirokuma0704 @sikhesung
+
+# A 건호의 파일 → 리뷰어 B 상철
+/src/main.c               @Shirokuma0704
+/src/net.c                @Shirokuma0704
+/include/net.h            @Shirokuma0704
+/src/server.c             @Shirokuma0704
+/include/server.h         @Shirokuma0704
+/src/handler.c            @Shirokuma0704
+/include/handler.h        @Shirokuma0704
+
+# B 상철의 파일 → 리뷰어 C 혜성
+/src/http_request.c       @sikhesung
+/include/http_request.h   @sikhesung
+/src/proxy_config.c       @sikhesung
+/include/proxy_config.h   @sikhesung
+/src/proxy.c              @sikhesung
+/include/proxy.h          @sikhesung
+
+# C 혜성의 파일 → 리뷰어 A 건호
+/src/http_response.c      @stereokkh
+/include/http_response.h  @stereokkh
+/src/mime.c               @stereokkh
+/include/mime.h           @stereokkh
+/src/static_file.c        @stereokkh
+/include/static_file.h    @stereokkh
+/src/app.c                @stereokkh
+/include/app.h            @stereokkh
