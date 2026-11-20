@@ -1,0 +1,6 @@
+# Windows에서 클론해도 WSL/macOS/Linux와 동일하게 LF 유지
+* text=auto eol=lf
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.sh text eol=lf

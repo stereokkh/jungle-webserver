@@ -1,0 +1,25 @@
+# Build output
+build/
+bin/
+*.o
+*.d
+*.a
+*.so
+*.dSYM/
+a.out
+
+# Binaries
+/webserver
+/proxy
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs / local
+*.log
+.env
