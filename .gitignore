@@ -20,6 +20,9 @@ a.out
 .DS_Store
 Thumbs.db
 
+# CS:APP Tiny 원본 (scripts/fetch-tiny.sh 로 받음). 저작권 때문에 커밋하지 않는다 (이슈 #3)
+/classic/
+
 # Logs / local
 *.log
 .env
