@@ -2,17 +2,36 @@ name: build
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'feat/**', 'fix/**']
   pull_request:
 
 jobs:
-  build:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, cc: gcc }
+          - { os: ubuntu-latest, cc: clang }
+          - { os: macos-latest,  cc: clang }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
-        run: make CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -g"
+        run: make CC=${{ matrix.cc }} WERROR=1
+      - name: Test
+        run: make test CC=${{ matrix.cc }}
+
+  alpine:
+    name: alpine (musl) / ${{ matrix.cc }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # 로컬과 동일한 docker/alpine.Dockerfile 사용
+      - name: Build & test in Alpine container
+        run: make docker-test DISTRO=alpine CC=${{ matrix.cc }} WERROR=1
