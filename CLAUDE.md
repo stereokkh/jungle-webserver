@@ -31,6 +31,24 @@
 - 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
 - 종료(`SIGINT`/`SIGTERM`) 시 listen 소켓뿐 아니라 모든 연결·파일·업스트림을 정리한다
 
+파일 구조와 CS:APP Tiny 대응 (각 파일 맨 위 주석에 자세히):
+
+| 파일 (`src/*.c`, `include/*.h`) | Tiny 대응 | 트랙 · 이슈 |
+|---|---|---|
+| `net` | `open_listenfd` | A · #7 |
+| `server` | `main` 의 반복 accept 루프 → poll 이벤트 루프 | A · #7 |
+| `handler` | `doit` 의 정적/동적 분기 → 프록시 → 앱 → 정적 | A(틀) · #4, #8, #10 |
+| `http_request` | `doit` 요청 라인, `read_requesthdrs`, `parse_uri` | B · #5 |
+| `http_response` | `clienterror`, `serve_static` 헤더 | C · #6 |
+| `mime` | `get_filetype` | C · #6 |
+| `static_file` | `serve_static`, `parse_uri` 정적 경로 | C · #6 |
+| `app` | `serve_dynamic` + `adder.c` (CGI 대신 함수) | C · #10 |
+| `proxy_config` | 없음 | B · #8 |
+| `proxy` | 없음 | B · #9 |
+
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다. 함수 시그니처는 초안이며 #4 에서 확정한다
+- `main.c` 는 아직 스텁을 호출하지 않는다. #7 에서 CLI(`-p -r -c`)와 `server_run` 연결
+
 CS:APP Tiny (이슈 #3):
 
 - 분석·비교 대상일 뿐이다. 원본(`tiny.c`, `csapp.c`)은 **커밋하지 않는다** (URL·해시·분석 문서만). `src/` 에서 `csapp.c` 를 링크하지 않는다
