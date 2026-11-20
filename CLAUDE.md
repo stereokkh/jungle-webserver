@@ -1,0 +1,99 @@
+# CLAUDE.md
+
+이 파일은 Claude가 이 저장소에서 작업을 시작할 때 읽는 프로젝트 안내입니다. 사람이 읽을 사용법은 README.md에 있습니다.
+
+## 프로젝트
+
+- C로 작성하는 웹서버 + Proxy / Reverse Proxy (크래프톤 정글 과제)
+- **외부 HTTP 라이브러리·프레임워크 금지.** POSIX 소켓 API와 C 표준 라이브러리만 사용
+- macOS / WSL / Linux 에서 같은 소스가 빌드·실행되어야 함 (과제 요구사항)
+
+## 지원 환경
+
+| 우선순위 | 환경 | 이유 |
+|---|---|---|
+| 1 | Linux glibc (Ubuntu) | 실제 서버 운영 환경, WSL 기본 배포판 |
+| 2 | macOS (clang) | 팀원·채점자의 개발 환경. 빌드되고 동작하면 충분, OS별 최적화 대상 아님 |
+| 2 | Alpine (musl) | Docker 배포 이미지용 |
+| 미지원 | Windows 네이티브 | POSIX가 아님 (Winsock). WSL 또는 Docker 사용 |
+
+## 이식성 규칙 (코드 작성 시 반드시 지킬 것)
+
+POSIX로 해결되는 방법을 먼저 쓴다.
+
+| 쓰지 말 것 (Linux 전용 등) | 대신 쓸 것 (POSIX) |
+|---|---|
+| `MSG_NOSIGNAL` | 시작 시 `signal(SIGPIPE, SIG_IGN)` |
+| `socket(..., SOCK_NONBLOCK)`, `accept4()` | `fcntl(fd, F_SETFL, O_NONBLOCK)` |
+| `gethostbyname()` | `getaddrinfo()` (IPv4/IPv6) |
+| `epoll` / `kqueue` 를 기본 경로로 | `poll()` 기본, epoll/kqueue는 나중에 최적화로만 |
+| `sendfile()` | `read`/`write` 루프 (시그니처가 OS마다 다름) |
+
+- `struct sockaddr_*` 는 사용 전 반드시 `memset` 0 초기화 (macOS에는 `sin_len` 필드가 있음)
+- 헤더는 필요한 것을 모두 직접 include (`<sys/types.h>`, `<sys/socket.h>`, `<netinet/in.h>`, `<arpa/inet.h>`, `<netdb.h>`, `<unistd.h>`). Ubuntu에서는 다른 헤더를 통해 따라 들어와서 빌드되지만 macOS/musl에서는 실패함
+- 스레드를 쓸 경우 큰 버퍼를 스택에 잡지 말 것 (musl 기본 스레드 스택 128KB → Alpine에서만 segfault)
+- IPv6 소켓의 `IPV6_V6ONLY` 기본값이 OS마다 다르므로 필요하면 명시적으로 설정
+- OS별 분기(`#ifdef __linux__`, `#ifdef __APPLE__`)는 `src/platform/` 같은 한 곳에만 모은다. 나머지 코드에 흩뿌리지 않는다
+- 빌드 플래그: `-std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic`. macOS 전용 확장이 필요하면 해당 파일에서만 `_DARWIN_C_SOURCE` 정의
+
+## 디렉터리
+
+```
+src/        소스 (.c)
+include/    헤더 (.h)
+tests/      테스트 (tests/run.sh, make test 로 실행)
+docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
+.github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
+```
+
+## 명령
+
+```bash
+make                                    # ./webserver 빌드
+make test                               # 빌드 + 테스트
+make WERROR=1                           # 경고를 에러로 (CI와 동일)
+make CC=clang                           # 컴파일러 지정
+make docker-test [DISTRO=alpine] [CC=clang]   # 컨테이너에서 빌드+테스트
+make docker-test-all                    # Ubuntu + Alpine
+make docker-shell DISTRO=alpine         # 컨테이너 안 셸
+```
+
+- Docker 컨테이너는 **검증용**이다. 소스를 읽기 전용으로 마운트하고 컨테이너 내부 복사본에서 빌드하므로 호스트 `build/` 는 건드리지 않는다
+- macOS는 Docker로 띄울 수 없으므로 CI(macos-latest)가 확인한다
+
+## 검증 흐름
+
+| 단계 | 어디서 |
+|---|---|
+| 개발 | 각자 환경 (Windows는 WSL Ubuntu, 맥은 macOS) |
+| 빠른 확인 | 로컬 `make test`, `make docker-test DISTRO=alpine` |
+| 최종 판정 | CI: ubuntu(gcc, clang), macos(clang), alpine(gcc, clang), 모두 `-Werror` |
+
+- 기능을 추가하면 `tests/run.sh` 에 테스트를 추가한다 (서버를 띄우고 curl로 요청/응답 확인)
+- 작업을 마치면 최소 `make test` 를 돌리고, 소켓·헤더 관련 변경이면 `make docker-test DISTRO=alpine` 과 `make CC=clang WERROR=1` 도 확인한다
+
+## 브랜치 / PR 규칙
+
+```
+feat/* , fix/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ main
+```
+
+- `main`, `develop` 은 보호됨: 직접 push 불가(관리자 포함), PR + CI 5개 통과 필수, force push·삭제 금지
+- `main` 은 이 저장소의 `develop` 에서 온 PR만 머지 가능 (`main ← develop only` 검사)
+- 작업은 항상 `develop` 에서 새 브랜치를 만들어 시작: `git checkout develop && git pull && git checkout -b feat/<기능>`
+- CI push 트리거는 `develop` 만. 작업 브랜치는 PR 이벤트로만 검사됨
+- 커밋 메시지: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`, `ci:` 접두사
+
+## 개발 환경 메모
+
+- Windows 사용자는 WSL Ubuntu 안(`~/jungle-webserver`)에 클론해서 작업한다. `/mnt/c/...` 경로는 느리고 권한 문제가 있음
+- Claude CLI도 WSL 안에 설치한 것을 쓴다 (`which claude` → `~/.local/bin/claude`). WSL에서 `claude.exe` 가 잡히면 Windows 쪽이 실행된 것이고, 이때는 make/gcc가 없다
+- Docker Desktop → Settings → Resources → WSL Integration 에서 Ubuntu를 켜야 WSL에서 `make docker-test` 가 동작한다
+
+## 아직 하지 않은 것 (나중에 할 일)
+
+- 서버 구현 (현재 `src/main.c` 는 포트 인자만 받는 뼈대)
+- 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 서버 기능이 생긴 뒤 추가
+- `docs/api.md` (지원 메서드, 상태 코드, 프록시 설정). 서버 기능이 생긴 뒤 추가
+- 팀원을 Collaborator로 초대한 뒤 `main`/`develop` 보호 규칙의 필수 리뷰 수를 0 → 1 로 올리기
+- `main ← develop only` 검사는 첫 develop→main PR 때 처음 실행됨 (아직 실제 동작 미확인)
