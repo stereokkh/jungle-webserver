@@ -170,7 +170,7 @@ feat/* , fix/* ──PR(CI)──▶ develop ──PR(CI + main-guard)──▶ 
 
 ### 노션과 저장소의 역할
 
-- **프로젝트 노션**: https://app.notion.com/p/41efacdfe6e480ee9f8ccec38a3af93c (팀원 워크스페이스)
+- **프로젝트 노션**: https://app.notion.com/p/jungle-webserver-41efacdfe6e480e59bc8e888ca466fb6 (팀원 워크스페이스)
 - **노션**: 각자 자기 파트의 학습 정리 (Tiny 분석, 개념, 주석 단 코드 설명). 사람이 읽는 공부 노트
 - **저장소**: 결정·규칙·인터페이스·코드. **기준은 항상 저장소**다. 노션에서 정한 결정은 반드시 `docs/decisions.md` + 이 파일에 옮긴다 (노션에 연결되지 않은 세션·팀원도 있음)
 
@@ -207,5 +207,5 @@ Claude의 노션 사용 범위:
 - `docs/api.md`, `docs/benchmark.md`, `docs/classic.md` → 이슈 #11, #3
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)
-- 노션 접근 확인: 건호의 Notion 연결이 개인 워크스페이스로 되어 있어 프로젝트 페이지가 아직 안 열림 (팀원 워크스페이스 멤버 초대 후 재연결 필요)
+- 노션 접근: 2026-11-20 새 주소로 프로젝트 페이지 읽기 확인됨 (claude.ai Notion 커넥터). 저장소 `.mcp.json` 의 Notion MCP 로그인은 팀원별로 확인 필요
 - `main ← develop only` 검사는 첫 develop→main PR 때 처음 실행됨 (아직 실제 동작 미확인)
