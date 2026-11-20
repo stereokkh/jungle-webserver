@@ -66,6 +66,14 @@ static int is_tchar(unsigned char c)
     return c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL;
 }
 
+/* Host 값에 쓸 수 있는 글자: 이름·IPv4·[IPv6]·:포트 (RFC 3986 reg-name + IP-literal). 공백 등은 안 됨 */
+static int is_host_char(unsigned char c)
+{
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+        return 1;
+    return c != '\0' && strchr("-._~!$&'()*+,;=%:[]", c) != NULL;
+}
+
 static unsigned char lower(unsigned char c)
 {
     return (c >= 'A' && c <= 'Z') ? (unsigned char)(c - 'A' + 'a') : c;
@@ -172,8 +180,8 @@ static int parse_request_line(const char *p, size_t n, http_request *req)
     if (tlen == 0 || t[0] != '/')
         return 400;
     for (i = 0; i < tlen; i++)
-        if ((unsigned char)t[i] < 0x21 || (unsigned char)t[i] > 0x7E)
-            return 400;
+        if ((unsigned char)t[i] < 0x21 || (unsigned char)t[i] > 0x7E || t[i] == '#')
+            return 400;               /* '#'(fragment) 는 요청 대상에 올 수 없다 (RFC 9112 3.2) */
     memcpy(req->target, t, tlen);
     req->target[tlen] = '\0';
 
@@ -297,6 +305,9 @@ static int parse_header_line(const char *line, size_t n, http_request *req, head
     if (ci_equal(line, nlen, "host")) {
         if (hs->saw_host || vlen > HTTP_MAX_HOST)
             return 400;               /* Host 두 개는 어느 쪽을 믿을지 모른다 */
+        for (i = 0; i < vlen; i++)    /* 잘못된 Host 값은 400 (RFC 9112 3.2). "example com" 등 */
+            if (!is_host_char((unsigned char)v[i]))
+                return 400;
         hs->saw_host = 1;
         memcpy(req->host, v, vlen);
         req->host[vlen] = '\0';
@@ -304,8 +315,10 @@ static int parse_header_line(const char *line, size_t n, http_request *req, head
         long cl;
         if (parse_content_length(v, vlen, &cl) < 0)
             return 400;
-        if (req->content_length >= 0 && req->content_length != cl)
-            return 400;               /* 서로 다른 중복 값: 본문 경계를 정할 수 없다 */
+        /* 중복은 값이 같아도 400. RFC 는 같은 값이면 받아도 되지만, 프록시가 원본 헤더를
+         * 그대로 넘기므로(#9) 백엔드가 두 줄을 다르게 해석할 여지를 아예 없앤다 */
+        if (req->content_length >= 0)
+            return 400;
         req->content_length = cl;
     } else if (ci_equal(line, nlen, "transfer-encoding")) {
         hs->saw_te = 1;
@@ -375,8 +388,16 @@ parse_result http_parse_request(const char *buf, size_t len,
     /* 1. 431 을 가장 먼저 판정 (헤더 주석). 앞 8KB 안에서만 빈 줄을 찾으므로
      *    TCP 가 어떻게 나눠 보내든 같은 요청은 같은 결과가 나온다 */
     head_end = find(start, window - skip, "\r\n\r\n", 4);
-    if (head_end == NULL)
-        return len >= HTTP_MAX_HEADER ? fail(status, 431) : PARSE_NEED_MORE;
+    if (head_end == NULL) {
+        if (len < HTTP_MAX_HEADER)
+            return PARSE_NEED_MORE;
+        /* 431 이어도 첫 줄이 와 있으면 버전은 채운다 (응답의 Connection 결정용, 헤더 주석).
+         * 다른 필드도 채워질 수 있지만 ERROR 에서는 status 만 의미가 있다 */
+        line_end = find(start, window - skip, "\r\n", 2);
+        if (line_end != NULL)
+            (void)parse_request_line(start, (size_t)(line_end - start), req);
+        return fail(status, 431);
+    }
     head_len = (size_t)(head_end - buf) + 4;   /* buf 처음부터 빈 줄 끝까지 */
 
     /* 2. 요청 라인: 첫 CRLF 까지. 빈 줄을 찾았으니 CRLF 는 반드시 있다 */

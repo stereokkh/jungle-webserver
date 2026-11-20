@@ -66,6 +66,8 @@ typedef struct {
  *   - ERROR 면 *status 만 의미가 있고 *req 는 일부만 채워졌을 수 있다
  *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다)
  *   - Transfer-Encoding 이 있으면 501 (chunked 는 범위 밖)
+ *   - Content-Length 가 두 줄 이상이면 값이 같아도 400 (프록시가 원본 헤더를 그대로 넘기므로)
+ *   - 요청 라인 앞의 빈 줄(CRLF)은 건너뛴다 (RFC 9112 2.2). 건너뛴 바이트도 아래 8KB 와 consumed 에 들어간다
  *   - 431 을 다른 오류보다 먼저 판정한다. TCP 가 어떻게 나눠 보내든 같은 요청은 같은 코드를 받아야 한다:
  *       buf 앞 HTTP_MAX_HEADER 바이트 안에서 "\r\n\r\n" 을 찾는다
  *       → 있으면 계속, 없고 len >= HTTP_MAX_HEADER 면 431, 없고 더 짧으면 NEED_MORE

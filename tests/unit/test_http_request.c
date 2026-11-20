@@ -120,6 +120,8 @@ static void test_pipelined(void)
     CHECK_STR(req.target, "/b");
     CHECK_MEM(req.body, req.body_len, "hi", 2);
     second = consumed;
+    CHECK_INT(second, 50);                    /* 다음 요청의 첫 바이트 'G' 를 먹지 않는다 */
+    CHECK(rest[second] == 'G');
 
     /* 세 번째는 덜 왔다 */
     CHECK_INT(parse(rest + second), PARSE_NEED_MORE);
@@ -227,6 +229,30 @@ static void test_host(void)
     CHECK_ERROR("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400);   /* 중복 */
     CHECK_INT(parse("GET / HTTP/1.1\r\nhOsT:   spaced  \r\n\r\n"), PARSE_DONE);
     CHECK_STR(req.host, "spaced");                                      /* 이름 대소문자, OWS */
+
+    CHECK_ERROR("GET / HTTP/1.1\r\nHost: example com\r\n\r\n", 400);   /* 잘못된 Host 값 */
+    CHECK_ERROR("GET / HTTP/1.1\r\nHost: a/b\r\n\r\n", 400);
+    CHECK_INT(parse("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n"), PARSE_DONE);
+    CHECK_STR(req.host, "[::1]:8080");
+}
+
+/* 문자열 리터럴로는 못 넘기는 NUL 바이트: 헤더 값에 있으면 400, 본문에 있으면 그대로 */
+static void test_nul_bytes(void)
+{
+    static const char in_header[] = "GET / HTTP/1.1\r\nHost: x\r\nX-A: a\0b\r\n\r\n";
+    static const char in_body[] = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\na\0b";
+
+    CHECK_INT(parse_n(in_header, sizeof in_header - 1), PARSE_ERROR);
+    CHECK_INT(status, 400);
+
+    REQUIRE(parse_n(in_body, sizeof in_body - 1) == PARSE_DONE);
+    CHECK_MEM(req.body, req.body_len, "a\0b", 3);
+}
+
+/* '#' 는 요청 대상에 올 수 없다 */
+static void test_fragment_in_target(void)
+{
+    CHECK_ERROR("GET /docs#intro HTTP/1.1\r\nHost: x\r\n\r\n", 400);
 }
 
 static void test_content_length(void)
@@ -239,10 +265,8 @@ static void test_content_length(void)
     CHECK_ERROR("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048577\r\n\r\n", 413);
     CHECK_ERROR("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", 501);
 
-    /* 같은 값 중복은 받는다 */
-    REQUIRE(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\nok")
-            == PARSE_DONE);
-    CHECK_MEM(req.body, req.body_len, "ok", 2);
+    /* 같은 값 중복도 400 (프록시가 원본 헤더를 그대로 넘기므로, http_request.h) */
+    CHECK_ERROR("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\nok", 400);
 
     /* 상한 정확히 1MB 는 413 이 아니라 본문을 기다린다 */
     CHECK_INT(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n"), PARSE_NEED_MORE);
@@ -325,10 +349,15 @@ static void test_header_limit_boundary(void)
     CHECK_INT(parse(s), PARSE_DONE);
     CHECK_INT(consumed, HTTP_MAX_HEADER);
 
+    /* 같은 8192 바이트 요청의 마지막 바이트가 늦게 오면: 8191 은 NEED_MORE, 8192 에서 DONE */
+    CHECK_INT(parse_n(s, HTTP_MAX_HEADER - 1), PARSE_NEED_MORE);
+    CHECK_INT(parse_n(s, HTTP_MAX_HEADER), PARSE_DONE);
+
     strcpy(s, head);
     memset(s + hl, 'p', pad + 1);
     strcpy(s + hl + pad + 1, "\r\n\r\n");
     CHECK_ERROR(s, 431);
+    CHECK_INT(req.version_minor, 1);          /* 431 이어도 첫 줄의 버전은 채운다 */
 }
 
 int main(void)
@@ -346,6 +375,8 @@ int main(void)
     RUN(test_methods);
     RUN(test_versions);
     RUN(test_host);
+    RUN(test_nul_bytes);
+    RUN(test_fragment_in_target);
     RUN(test_content_length);
     RUN(test_connection);
     RUN(test_header_syntax);
