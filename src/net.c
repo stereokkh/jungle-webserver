@@ -45,7 +45,9 @@ static int listen_family(int family, const char *port)
     rc = getaddrinfo(NULL, port, &hints, &res);
     if (rc != 0) {
         /* getaddrinfo 는 errno 대신 EAI_* 를 돌려준다. 호출자는 errno 만 보므로 옮겨 둔다 */
-        if (rc != EAI_SYSTEM)
+        if (rc == EAI_MEMORY)
+            errno = ENOMEM;
+        else if (rc != EAI_SYSTEM)
             errno = (rc == EAI_FAMILY) ? EAFNOSUPPORT : EINVAL;
         return -1;
     }

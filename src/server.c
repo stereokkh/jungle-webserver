@@ -37,6 +37,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,10 @@
 /* accept 가 fd 고갈(EMFILE 등)로 실패하면 이 시간 동안 listen 소켓을 감시하지 않는다.
  * 그대로 두면 대기열의 연결 때문에 poll 이 계속 깨어나 CPU 를 다 쓴다 */
 #define ACCEPT_PAUSE_MS 100
+
+/* poll 한 바퀴에 accept 할 최대 연결 수. 대기열이 계속 차 있어도 기존 연결 처리·유휴 만료·
+ * 종료 시그널 확인이 밀리지 않게 한다. 남은 연결은 다음 바퀴에 poll 이 다시 알려 준다 */
+#define ACCEPT_PER_PASS 64
 
 /* 연결 하나의 상태 (docs/interfaces.md 의 상태 표).
  * conn 은 calloc 으로 힙에 만든다 (http_request 가 수 KB). 이 파일 밖으로 내보내지 않는다 */
@@ -70,7 +75,7 @@ typedef struct {
     static_file file;        /* CONN_SENDING_FILE 일 때 */
     int upstream_fd;         /* 프록시 백엔드 소켓, 없으면 -1 (#9) */
     buffer up_out;           /* 백엔드로 보낼 요청 (#9) */
-    long last_active_ms;     /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
+    int64_t last_active_ms;     /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
     size_t hdr_scanned;      /* 임시(handle_request): 헤더 끝을 이미 찾아본 바이트 수 */
 } conn;
 
@@ -81,7 +86,7 @@ enum { PFD_SIGNAL = 0, PFD_LISTEN = 1, PFD_FIRST_CONN = 2 };
 typedef struct {
     const server_config *cfg;
     int listen_fd;
-    long accept_resume_ms;                      /* 0 이 아니면 이 시각까지 accept 쉼 */
+    int64_t accept_resume_ms;                   /* 0 이 아니면 이 시각까지 accept 쉼 */
     conn *conns[SERVER_MAX_CONNS];              /* 빈 칸은 NULL */
     size_t nconns;
     struct pollfd pfds[PFD_FIRST_CONN + SERVER_MAX_CONNS];
@@ -99,6 +104,9 @@ typedef struct {
  */
 static volatile sig_atomic_t stop_requested;
 static int sig_pipe[2] = { -1, -1 };
+/* 핸들러가 읽는 쓰기 끝. C11 에서 핸들러가 안전하게 접근할 수 있는 정적 객체는
+ * volatile sig_atomic_t 뿐이라 sig_pipe[1] 과 따로 둔다 (fd 는 시작 직후 만든 작은 수) */
+static volatile sig_atomic_t sig_wfd = -1;
 
 static void on_stop_signal(int sig)
 {
@@ -107,8 +115,8 @@ static void on_stop_signal(int sig)
 
     (void)sig;
     stop_requested = 1;
-    if (sig_pipe[1] >= 0) {
-        r = write(sig_pipe[1], "x", 1);   /* 파이프가 차서 EAGAIN 이어도 이미 깨울 바이트가 있다 */
+    if (sig_wfd >= 0) {
+        r = write(sig_wfd, "x", 1);   /* 파이프가 차서 EAGAIN 이어도 이미 깨울 바이트가 있다 */
         (void)r;
     }
     errno = saved;
@@ -122,6 +130,7 @@ static int setup_signals(void)
         return -1;
     if (net_set_nonblocking(sig_pipe[0]) < 0 || net_set_nonblocking(sig_pipe[1]) < 0)
         return -1;
+    sig_wfd = sig_pipe[1];
 
     /* 끊긴 소켓에 write 하면 SIGPIPE 로 프로세스가 죽는다. 무시하고 EPIPE 로 받는다
      * (MSG_NOSIGNAL 은 Linux 전용이라 쓰지 않는다) */
@@ -140,6 +149,7 @@ static void close_signal_pipe(void)
 {
     int r = sig_pipe[0], w = sig_pipe[1];
 
+    sig_wfd = -1;
     sig_pipe[0] = sig_pipe[1] = -1;   /* 핸들러가 닫힌(재사용될) fd 에 쓰지 않게 먼저 지운다 */
     if (r >= 0)
         close(r);
@@ -156,12 +166,13 @@ static void drain_signal_pipe(void)
 }
 
 /* 단조 시계(ms). 벽시계(time)는 시스템 시간을 바꾸면 뒤로 갈 수 있다 */
-static long now_ms(void)
+/* long 이 32비트인 환경에서는 부팅 후 약 24일이면 tv_sec * 1000 이 넘쳐서 int64_t 를 쓴다 */
+static int64_t now_ms(void)
 {
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int would_block(int err)
@@ -331,7 +342,10 @@ static void conn_on_writable(server *s, size_t slot)
         conn_close(s, slot);
         return;
     }
-    c->state = CONN_READING;       /* keep-alive (#7 다음 PR 에서 남은 입력 바이트 처리) */
+    /* keep-alive (#7 다음 PR 에서 남은 입력 바이트 처리).
+     * TODO(#7 다음 PR): CONN_SENDING_FILE 이 끝나면(static_send_some == 1) 여기로 오기 전에
+     * static_close(&c->file). 안 닫으면 다음 요청의 static_open 이 fd 를 덮어써 새어 나간다 */
+    c->state = CONN_READING;
 }
 
 /* ---------------------------------------------------------------
@@ -340,7 +354,9 @@ static void conn_on_writable(server *s, size_t slot)
 
 static void accept_ready(server *s)
 {
-    for (;;) {
+    int n;
+
+    for (n = 0; n < ACCEPT_PER_PASS && !stop_requested; n++) {
         int fd = accept(s->listen_fd, NULL, NULL);
 
         if (fd < 0) {
@@ -366,9 +382,9 @@ static void accept_ready(server *s)
  * --------------------------------------------------------------- */
 
 /* 유휴 시간을 넘긴 연결을 닫고, 다음 poll 대기 시간(ms, 없으면 -1)을 돌려준다 */
-static int expire_idle(server *s, long now)
+static int expire_idle(server *s, int64_t now)
 {
-    long next = -1, left;
+    int64_t next = -1, left;
     size_t i;
 
     for (i = 0; i < SERVER_MAX_CONNS; i++) {

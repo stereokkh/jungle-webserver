@@ -3,7 +3,8 @@
 #
 # - POSIX sh 만 쓴다 (Ubuntu dash, Alpine busybox, macOS sh). macOS 에는 timeout 명령이 없어서
 #   제한 시간은 wait_exit 의 감시 프로세스로 직접 잰다.
-# - 서버 준비는 sleep 어림잡기가 아니라 curl 이 성공할 때까지 최대 5초 기다린다.
+# - 서버 준비는 sleep 어림잡기가 아니라 로그에 listening 이 찍히고 curl 이 성공할 때까지 기다린다.
+#   curl 만 보면 포트를 다른 서버가 쓰고 있을 때 그 서버의 응답을 준비 완료로 착각한다.
 # - 서버를 기다리는 함수는 $(...) 안에서 부르지 않는다. 서브셸은 서버의 부모가 아니라서
 #   wait 로 회수하지 못하고, 끝난 서버가 좀비로 남아 kill -0 이 계속 성공한다 ("안 꺼짐" 오판).
 set -u
@@ -20,6 +21,7 @@ mkdir -p "$DOCROOT"
 fail=0
 SERVER_PID=
 BG_PIDS=
+STALL_N=0
 EXIT_CODE=
 
 cleanup() {
@@ -51,13 +53,18 @@ wait_exit() {
     [ "$EXIT_CODE" -ne 137 ]   # 137 = 128 + SIGKILL(9): 감시 프로세스가 죽임
 }
 
-# 서버를 백그라운드로 띄우고 응답할 때까지 최대 5초 기다린다
+# 서버를 백그라운드로 띄우고 응답할 때까지 기다린다 (0.1초 x 50번).
+# 우리 서버가 listen 에 성공했다는 로그가 나온 뒤에만 curl 을 보낸다. 시작에 실패했으면
+# (포트 충돌 등) 바로 실패한다
 start_server() {
     "$BIN" -p "$PORT" -r "$DOCROOT" "$@" >"$LOG" 2>&1 &
     SERVER_PID=$!
     i=0
     while [ $i -lt 50 ]; do
-        curl -s -o /dev/null -m 1 "$URL" && return 0
+        grep -q '^webserver: cannot' "$LOG" && return 1
+        if grep -q '^webserver: listening' "$LOG"; then
+            curl -s -o /dev/null -m 1 "$URL" && return 0
+        fi
         sleep 0.1
         i=$((i + 1))
     done
@@ -94,10 +101,29 @@ http_code() {
     curl -s -o /dev/null -w '%{http_code}' -m 3 "$@"
 }
 
-# 아무것도 보내지 않거나(인자 없음) 요청을 반만 보내고 멈춘 연결을 열어 둔다
+# 아무것도 보내지 않거나(인자 없음) 요청을 반만 보내고 멈춘 연결을 열어 둔다.
+# - 파이프(a | nc &)는 $! 가 마지막 프로세스뿐이라 앞쪽 sleep 이 남는다. FIFO 로 나눠
+#   보내는 쪽과 nc 쪽의 PID 를 둘 다 기억한다
+# - nc 가 끝나면(연결 실패, nc 없음, 서버가 닫음) $TMP/stall.N.closed 를 만든다.
+#   check_stalled_open 이 이것으로 연결이 정말 열려 있는지 본다
 open_stalled_conn() {
-    ( printf '%b' "${1:-}"; sleep 5 ) | nc "$HOST" "$PORT" >/dev/null 2>&1 &
+    STALL_N=$((STALL_N + 1))
+    _f=$TMP/stall.$STALL_N
+    mkfifo "$_f" || return 1
+    ( nc "$HOST" "$PORT" <"$_f" >/dev/null 2>&1; : >"$_f.closed" ) &
     BG_PIDS="$BG_PIDS $!"
+    ( printf '%b' "${1:-}"; exec sleep 5 ) >"$_f" &
+    BG_PIDS="$BG_PIDS $!"
+}
+
+# 지금까지 연 느린 연결이 모두 열려 있는지 (없으면 그 테스트는 아무것도 검사하지 않은 것)
+check_stalled_open() {
+    for _c in "$TMP"/stall.*.closed; do
+        [ -e "$_c" ] || continue
+        bad "$1: stalled connection was not held open (${_c##*/})"
+        return 1
+    done
+    return 0
 }
 
 close_stalled_conns() {
@@ -105,19 +131,25 @@ close_stalled_conns() {
         kill "$p" 2>/dev/null
     done
     BG_PIDS=
+    rm -f "$TMP"/stall.*
 }
 
 echo "== smoke test ($(uname -s))"
 
 [ -x "$BIN" ] && ok "binary exists" || { bad "binary exists"; exit 1; }
+for tool in curl nc mkfifo; do
+    command -v "$tool" >/dev/null 2>&1 || { bad "$tool is required"; exit 1; }
+done
 
 expect_exit1 "no args -> exit 1"
 expect_exit1 "missing -r -> exit 1"          -p "$PORT"
 expect_exit1 "missing -p -> exit 1"          -r "$DOCROOT"
 expect_exit1 "bad port -> exit 1"            -p 80x -r "$DOCROOT"
 expect_exit1 "port 0 -> exit 1"              -p 0 -r "$DOCROOT"
+expect_exit1 "leading zero port -> exit 1"   -p 08080 -r "$DOCROOT"
 expect_exit1 "docroot missing -> exit 1"     -p "$PORT" -r "$TMP/nope"
-expect_exit1 "docroot is a file -> exit 1"   -p "$PORT" -r "$LOG"
+: >"$TMP/afile"
+expect_exit1 "docroot is a file -> exit 1"   -p "$PORT" -r "$TMP/afile"
 expect_exit1 "extra argument -> exit 1"      -p "$PORT" -r "$DOCROOT" extra
 
 : >"$LOG"
@@ -159,9 +191,11 @@ expect_exit1 "port in use -> exit 1" -p "$PORT" -r "$DOCROOT"
 open_stalled_conn
 open_stalled_conn 'GET / HTTP/1.1\r\nHost: x\r\n'
 sleep 0.3
-code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "$URL")
-[ "$code" = 200 ] && ok "stalled connections do not block others" \
-                  || bad "stalled connections do not block others (got $code)"
+if check_stalled_open "stalled connections do not block others"; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 2 "$URL")
+    [ "$code" = 200 ] && ok "stalled connections do not block others" \
+                      || bad "stalled connections do not block others (got $code)"
+fi
 close_stalled_conns
 
 # 동시 요청 50개
@@ -188,6 +222,7 @@ stop_server TERM
 if start_server; then
     open_stalled_conn 'GET / HTTP/1.1\r\n'
     sleep 0.3
+    check_stalled_open "SIGINT with open connection"
     stop_server INT
     close_stalled_conns
 else

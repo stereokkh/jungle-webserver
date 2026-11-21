@@ -21,12 +21,14 @@ static void usage(const char *prog)
     fprintf(stderr, "usage: %s -p <port> -r <docroot> [-c <proxy.conf>]\n", prog);
 }
 
-/* 1..65535 의 10진수만 받는다 ("80x", "", "+80", "0" 거절) */
+/* 1..65535 의 10진수만 받는다 ("80x", "", "+80", "0", "08080" 거절).
+ * 포트 문자열은 #10 에서 X-Instance 헤더 값으로 그대로 쓰므로 표기를 하나로 맞춘다
+ * (선행 0 거절은 #26 프록시 설정 파일과 같은 규칙) */
 static int valid_port(const char *s)
 {
     long v = 0;
 
-    if (*s == '\0')
+    if (*s == '\0' || *s == '0')
         return 0;
     for (; *s; s++) {
         if (*s < '0' || *s > '9')
@@ -35,7 +37,7 @@ static int valid_port(const char *s)
         if (v > 65535)
             return 0;
     }
-    return v >= 1;
+    return 1;
 }
 
 int main(int argc, char **argv)
