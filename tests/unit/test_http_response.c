@@ -164,7 +164,32 @@ static void test_header_bad_extra(void)
     h.extra_headers = "\n";
     CHECK_INT(http_append_header(&out, &h), -1);
     CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: GET"), -1);
+
+    /* 빈 줄이 끼면 헤더가 거기서 끝난 것으로 읽혀 본문 길이가 어긋난다 */
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\r\n\r\n"), -1);
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "\r\n"), -1);
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\r\n\r\nX-Instance: 8001\r\n"), -1);
     CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
+
+    /* 여러 줄은 괜찮다 */
+    CHECK_INT(http_append_error(&out, 405, 1, 1, "Allow: POST\r\nX-Instance: 8001\r\n"), 0);
+    buffer_clear(&out);
+    REQUIRE(buffer_append_str(&out, "keep") == 0);
+
+    /* 상태 코드는 3자리 (100~599) */
+    h.extra_headers = NULL;
+    h.status = 99;
+    CHECK_INT(http_append_header(&out, &h), -1);
+    h.status = 600;
+    CHECK_INT(http_append_header(&out, &h), -1);
+    CHECK_INT(http_append_error(&out, 0, 0, 0, NULL), -1);
+    CHECK_INT(http_append_error(&out, 1000, 0, 0, NULL), -1);
+    CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
+    h.status = 100;
+    CHECK_INT(http_append_header(&out, &h), 0);
+    buffer_clear(&out);
+    h.status = 599;
+    CHECK_INT(http_append_header(&out, &h), 0);
 
     CHECK_INT(http_append_header(NULL, &h), -1);
     CHECK_INT(http_append_header(&out, NULL), -1);

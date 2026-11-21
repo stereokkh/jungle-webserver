@@ -66,7 +66,9 @@ static int format_http_date(char *dst, size_t cap)
     return (n == HTTP_DATE_LEN && (size_t)n < cap) ? 0 : -1;
 }
 
-/* NULL, "" 이거나 CRLF 로 끝나면 1 (호출 코드의 실수 검사, http_response.h 참고) */
+/* NULL, "" 이거나 CRLF 로 끝나는 줄들이면 1 (호출 코드의 실수 검사, http_response.h 참고).
+ * 빈 줄("\r\n" 로 시작하거나 "\r\n\r\n" 포함)은 거절: 헤더가 거기서 끝난 것으로 읽혀
+ * Content-Length 와 실제 본문이 어긋나고 keep-alive 의 다음 응답까지 밀린다 */
 static int extra_headers_ok(const char *x)
 {
     size_t n;
@@ -74,7 +76,8 @@ static int extra_headers_ok(const char *x)
     if (x == NULL || x[0] == '\0')
         return 1;
     n = strlen(x);
-    return n >= 2 && x[n - 2] == '\r' && x[n - 1] == '\n';
+    return n >= 2 && x[n - 2] == '\r' && x[n - 1] == '\n' &&
+           strncmp(x, "\r\n", 2) != 0 && strstr(x, "\r\n\r\n") == NULL;
 }
 
 int http_append_header(buffer *out, const http_response_head *h)
@@ -83,7 +86,9 @@ int http_append_header(buffer *out, const http_response_head *h)
     size_t mark;
     int keep_alive;
 
-    if (out == NULL || h == NULL || !extra_headers_ok(h->extra_headers))
+    /* 상태 코드는 3자리(100~599)여야 클라이언트가 응답으로 읽는다 */
+    if (out == NULL || h == NULL || h->status < 100 || h->status > 599 ||
+        !extra_headers_ok(h->extra_headers))
         return -1;
 
     /* 길이를 모르면 연결 종료가 응답의 끝이므로 keep-alive 를 쓸 수 없다 */
