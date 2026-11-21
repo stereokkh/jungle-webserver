@@ -93,4 +93,5 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 - **오류 응답의 추가 헤더**: `http_append_error` 의 `extra_headers` 로 넣는다. 405 `Allow` 는 호출자가 넣고(정적 `GET, HEAD`, echo `POST`), 앱의 오류에도 `X-Instance` 를 붙인다
 - **HEAD**: 헤더는 GET 과 같게(Content-Length 포함), 본문은 보내지 않는다
 - **정적 파일 메서드**: GET, HEAD 외에는 서버가 405 (`extra_headers` = `"Allow: GET, HEAD\r\n"`)
+- **정적 파일 경로 판정** (`static_open`): `.`·`..`·`//` 를 먼저 글자로 정리하고, 루트 위로 가면 파일 존재와 상관없이 403. 그다음 `realpath` 결과가 docroot 밖이면(심볼릭 링크) 403. 디렉터리는 `index.html`(없으면 404), `/파일/` 처럼 파일 뒤 `/` 는 404, 일반 파일이 아니면 403, docroot 를 못 찾으면 500
 - **큰 배열은 스택에 두지 않는다**: `http_request`, `conn` 은 힙(calloc). `static_send_some` 의 지역 버퍼는 16KB 이하
