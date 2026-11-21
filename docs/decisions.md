@@ -8,6 +8,16 @@
 
 ---
 
+## 2026-11-21 · 응답 헤더 규칙 4가지 (PR #21, 이슈 #6)
+
+- **결정**:
+  1. `http_append_header` 의 줄 순서를 상태 줄, `Date`, `Server`, `Content-Type`, `Content-Length`, `Connection`, `extra_headers`, 빈 줄로 고정. 상태 코드가 100~599 밖이면 -1
+  2. `content_length < 0` (길이 모름) 이면 `Content-Length` 를 생략하고 `keep_alive` 와 상관없이 `Connection: close`
+  3. `extra_headers` 는 `NULL`, `""`, 또는 CRLF 로 끝나는 줄들만 (빈 줄·짝 없는 CR·LF 금지). `content_type` 에 CR·LF 가 있어도 -1
+  4. 오류 본문은 상태 코드와 문구만 (`<html><body><h1>404 Not Found</h1></body></html>`). 요청 내용은 넣지 않는다
+- **이유**: 1 응답 모양이 정해져야 테스트가 필요한 줄을 찾을 수 있음. `Date` 때문에 전체 바이트 비교는 못 함. 2 길이가 없으면 클라이언트가 응답 끝을 연결 종료로만 알 수 있음. 3 빈 줄·짝 없는 LF 가 들어가면 헤더가 거기서 끝나 응답 분할(keep-alive 다음 응답까지 밀림). 4 Tiny `clienterror` 가 요청 경로를 본문에 넣어 반사형 XSS (#3)
+- **영향**: `src/http_response.c`, `include/http_response.h`, `docs/interfaces.md` "정한 세부 규칙", `tests/unit/test_http_response.c`. 시그니처는 그대로. 서버(#7)·프록시(#9)는 고정 문자열·`mime_type()` 상수만 넘기므로 영향 없음 (건호 확인)
+
 ## 2026-11-20 · 프로젝트 노션 주소 변경
 
 - **결정**: 프로젝트 노션 주소를 https://app.notion.com/p/jungle-webserver-41efacdfe6e480e59bc8e888ca466fb6 ("jungle-webserver" 페이지) 로 바꾼다. 아래 "프로젝트 노션 연결" 항목의 이전 주소는 더 이상 쓰지 않는다. 사용 범위(이 페이지와 하위 페이지만, 쓰기 전 확인)는 그대로
