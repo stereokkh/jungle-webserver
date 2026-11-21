@@ -22,7 +22,9 @@ typedef enum { HTTP_GET, HTTP_POST, HTTP_HEAD, HTTP_METHOD_OTHER } http_method;
 
 typedef enum {
     PARSE_DONE,       /* 요청 하나 완성. *consumed = 요청 라인 + 헤더 + 본문 길이 */
-    PARSE_NEED_MORE,  /* 아직 덜 왔다. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다 */
+    PARSE_NEED_MORE,  /* 아직 덜 왔다. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다.
+                       * *consumed = 헤더가 끝났으면 요청 전체 길이(헤더 + 본문), 아니면 0.
+                       * 소비한 길이가 아니므로 consume 하지 않는다 */
     PARSE_ERROR       /* *status 에 응답할 상태 코드 (400, 413, 414, 431, 501, 505) */
 } parse_result;
 
@@ -60,8 +62,16 @@ typedef struct {
 /*
  * buf[0..len) 에서 요청 하나를 파싱한다.
  *   - buf 는 NUL 로 끝나지 않는다. len 을 넘어 읽지 않는다 (make asan 이 검사)
- *   - 상태를 저장하지 않는다. NEED_MORE 후에는 더 읽고 처음부터 다시 부른다
- *     (헤더 상한이 8KB 라 다시 파싱해도 비용이 작다)
+ *   - 상태를 저장하지 않는다. NEED_MORE 면 *consumed 를 보고 언제 다시 부를지 정한다:
+ *       0  → 헤더가 아직 덜 옴. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다
+ *            (헤더 상한이 8KB 라 다시 파싱해도 비용이 작다)
+ *       >0 → 헤더는 끝나고 본문만 덜 옴. 값 = 요청 전체 길이 (건너뛴 앞 빈 줄 + 헤더 + 본문,
+ *            DONE 이 될 때의 *consumed 와 같은 값). buf 로 넘기는 미소비 바이트
+ *            (buffer_pending) 가 이 값 이상이 될 때까지 다시 부르지 않는다 (PR #24 리뷰).
+ *            본문이 1 바이트씩 오면 바이트마다 헤더 전체를 다시 파싱하게 되고, 바이트마다
+ *            유휴 타이머도 리셋돼 타임아웃으로도 끊기지 않기 때문이다.
+ *            소비한 길이가 아니므로 consume 하지 않는다. 413 을 먼저 판정하므로
+ *            값은 HTTP_MAX_HEADER + HTTP_MAX_BODY 이하다
  *   - DONE 이면 buf + *consumed 부터가 다음 요청이다 (keep-alive 파이프라이닝 잔여)
  *   - ERROR 면 *status 만 의미가 있고 *req 는 일부만 채워졌을 수 있다
  *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다)

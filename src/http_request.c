@@ -377,7 +377,7 @@ parse_result http_parse_request(const char *buf, size_t len,
 
     memset(req, 0, sizeof *req);
     req->content_length = -1;
-    *consumed = 0;                    /* DONE 일 때만 0 이 아니다 */
+    *consumed = 0;                    /* DONE: 소비한 길이, 본문 대기 NEED_MORE: 필요한 총 길이, 나머지 0 */
     *status = 0;
 
     /* 0. 요청 라인 앞의 빈 줄(CRLF)은 건너뛴다 (RFC 9112 2.2). keep-alive 에서 POST 본문 뒤에
@@ -423,8 +423,13 @@ parse_result http_parse_request(const char *buf, size_t len,
     if (req->content_length > HTTP_MAX_BODY)
         return fail(status, 413);
     body_len = req->content_length > 0 ? (size_t)req->content_length : 0;
-    if (len - head_len < body_len)
+    if (len - head_len < body_len) {
+        /* 헤더는 끝났고 본문만 덜 옴: 요청 전체 길이를 알려 준다 (헤더 주석).
+         * 서버는 in 이 이만큼 찰 때까지 다시 부르지 않는다. 본문이 잘게 와도 헤더를 매번
+         * 다시 파싱하지 않게 하려는 것이다 (PR #24 리뷰). 소비한 바이트 수가 아니다 */
+        *consumed = head_len + body_len;
         return PARSE_NEED_MORE;
+    }
     req->body = body_len > 0 ? buf + head_len : NULL;
     req->body_len = body_len;
 

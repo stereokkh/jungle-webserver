@@ -49,6 +49,11 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 - **다른 모듈은 받은 `buffer` 에 덧붙이기만 한다.** free, clear, consume 하지 않는다
 - **덧붙이기가 실패하면 버퍼는 호출 전 그대로다.** 반쯤 쓴 응답이 나가지 않게. 여러 번 나눠 덧붙이는 함수는 시작할 때 `buffer_mark`, 실패하면 `buffer_rollback` 한다 (`out->len` 을 직접 저장·복원하지 않는다. 도중에 compact 되면 어긋남)
 - **`http_request.headers`, `.body` 는 `conn.in` 안을 가리킨다.** 응답 생성과 프록시 요청 생성이 끝난 뒤에 `buffer_consume(&in, consumed)` 한다. 그 전에 `in` 에 read/append/compact 하지 않는다
+- **`NEED_MORE` 의 `consumed` 는 "필요한 총 길이"다.** 헤더가 끝나고 본문만 덜 왔으면 요청 전체 길이(`head_len + body_len`, DONE 때의 `consumed` 와 같은 값), 헤더가 아직이면 0 (본문이 잘게 오면 바이트마다 헤더를 다시 파싱하고 유휴 타이머도 리셋되므로, PR #24 리뷰)
+  - 비교 기준은 `in.len` 이 아니라 **`buffer_pending(&in)`** (아직 consume 안 한 바이트, 즉 지금 요청의 시작부터). 앞 요청을 consume 한 뒤 `off` 가 남아 있어도 맞다
+  - 서버는 0 이 아니면 이 값을 기억하고, `buffer_pending(&in)` 이 이 값 이상이 될 때까지 파서만 다시 부르지 않는다. 소켓 읽기, 유휴 타임아웃, 연결 종료·오류 처리는 그대로 한다
+  - 이 요청의 파싱이 `DONE` 이나 `ERROR` 로 끝나면 기억한 값을 지운다 (다음 요청에 남기면 이미 다 온 짧은 요청을 기다리게 된다)
+  - 이 값은 consume 하지 않는다
 - 모듈은 자기가 열지 않은 fd 를 닫지 않는다
 - 정리 함수(`buffer_free`, `static_close`, `conn_close`)는 두 번 불러도 안전해야 한다. 실패 경로에서 중복 호출이 생기기 쉽다
 

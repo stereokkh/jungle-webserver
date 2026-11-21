@@ -82,17 +82,21 @@ static void test_post_body(void)
     CHECK_INT(consumed, strlen(s));
 }
 
-/* 1 바이트씩 도착: 마지막 바이트 전까지는 전부 NEED_MORE + consumed 0 (Tiny 재현 ①의 반대) */
+/* 1 바이트씩 도착: 마지막 바이트 전까지는 전부 NEED_MORE (Tiny 재현 ①의 반대).
+ * consumed 는 빈 줄까지 오기 전엔 0, 빈 줄이 오면 그때부터 요청 전체 길이 n (PR #24 리뷰) */
 static void test_one_byte_at_a_time(void)
 {
     const char *s = "POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
-    size_t n = strlen(s), k;
+    size_t n = strlen(s), head = n - 5, k;
     int bad = 0;
 
     for (k = 0; k < n; k++) {
-        if (parse_n(s, k) != PARSE_NEED_MORE || consumed != 0) {
+        size_t want = k >= head ? n : 0;
+
+        if (parse_n(s, k) != PARSE_NEED_MORE || consumed != want) {
             bad = 1;
-            fprintf(stderr, "    prefix %zu bytes: not NEED_MORE\n", k);
+            fprintf(stderr, "    prefix %zu bytes: want NEED_MORE + consumed %zu, got consumed %zu\n",
+                    k, want, consumed);
             break;
         }
     }
@@ -185,7 +189,12 @@ static void test_leading_empty_lines(void)
     CHECK_MEM(req.headers, req.headers_len, "Host: x\r\n", 9);
 
     CHECK_INT(parse("\r\n\r\n"), PARSE_NEED_MORE);   /* 아직 요청 라인이 안 옴 */
+    CHECK_INT(consumed, 0);                          /* 빈 줄만 건너뛴 것은 헤더 끝이 아니다 */
     CHECK_INT(parse("\r\n"), PARSE_NEED_MORE);
+
+    /* 본문 대기 NEED_MORE 의 필요한 총 길이에도 건너뛴 빈 줄이 들어간다 (DONE 의 consumed 와 같은 기준) */
+    CHECK_INT(parse("\r\nPOST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab"), PARSE_NEED_MORE);
+    CHECK_INT(consumed, strlen("\r\nPOST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab") + 1);
 }
 
 /* 헤더는 작고 본문이 8KB 보다 큰 요청: 431 이 아니라 DONE (8KB 창은 헤더에만 적용) */
@@ -204,6 +213,13 @@ static void test_large_body(void)
     CHECK(req.body == g_buf + hl);
 
     CHECK_INT(parse_n(s, hl + 8999), PARSE_NEED_MORE);   /* 본문 1 바이트 모자람 */
+    CHECK_INT(consumed, hl + 9000);                       /* 필요한 총 길이 */
+
+    /* 헤더 직후, 본문이 하나도 안 왔어도 같은 값 */
+    CHECK_INT(parse_n(s, hl), PARSE_NEED_MORE);
+    CHECK_INT(consumed, hl + 9000);
+    /* 빈 줄의 마지막 LF 가 아직이면 헤더가 안 끝난 것이라 0 */
+    CHECK_INT(parse_n(s, hl - 1), PARSE_NEED_MORE);
     CHECK_INT(consumed, 0);
 }
 
@@ -274,9 +290,9 @@ static void test_content_length(void)
     /* 같은 값 중복도 400 (프록시가 원본 헤더를 그대로 넘기므로, http_request.h) */
     CHECK_ERROR("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\nok", 400);
 
-    /* 상한 정확히 1MB 는 413 이 아니라 본문을 기다린다 */
+    /* 상한 정확히 1MB 는 413 이 아니라 본문을 기다린다. consumed = 헤더 + 1MB */
     CHECK_INT(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n"), PARSE_NEED_MORE);
-    CHECK_INT(consumed, 0);
+    CHECK_INT(consumed, strlen("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n") + 1048576);
 }
 
 static void test_connection(void)

@@ -8,6 +8,13 @@
 
 ---
 
+## 2026-11-21 · 본문 대기 중인 NEED_MORE 는 필요한 총 길이를 알려 준다 (PR #24)
+
+- **결정**: `http_parse_request` 가 헤더는 다 받고 본문만 덜 받아 `NEED_MORE` 를 돌려줄 때 `*consumed` 에 요청 전체 길이(`head_len + body_len`)를 넣는다. 헤더가 아직이면 지금처럼 0. 서버(#7)는 이 값을 기억해 `in` 이 그만큼 찰 때까지 파서를 다시 부르지 않는다. 시그니처는 그대로
+- **이유**: 파서가 상태를 저장하지 않아서, 본문이 1 바이트씩 오면 바이트마다 헤더 전체를 다시 파싱한다(합계 ≈ 헤더 길이 × 호출 횟수). 헤더 쪽은 8KB 상한으로 묶이지만 본문은 최대 1MB 다. 바이트마다 유휴 타이머도 리셋돼 타임아웃으로도 끊기지 않는다 (상철 계산 + 건호 리뷰)
+- **영향**: `include/http_request.h`, `src/http_request.c`, `tests/unit/test_http_request.c`, `docs/interfaces.md`, `CLAUDE.md` 계약, #7 `server.c` 의 파서 호출부 (비교 기준은 `buffer_pending(&in)`, DONE·ERROR 에서 기억한 값을 지움)
+- **메모**: `Expect: 100-continue` 는 #9 뿐 아니라 프록시를 안 거치는 `POST /api/echo`(#10) 에도 해당한다. curl 은 1초 기다린 뒤 본문을 보내서 멈추지는 않고 1초 지연이 생긴다 (건호 확인). 지금은 처리하지 않는다
+
 ## 2026-11-20 · 프로젝트 노션 주소 변경
 
 - **결정**: 프로젝트 노션 주소를 https://app.notion.com/p/jungle-webserver-41efacdfe6e480e59bc8e888ca466fb6 ("jungle-webserver" 페이지) 로 바꾼다. 아래 "프로젝트 노션 연결" 항목의 이전 주소는 더 이상 쓰지 않는다. 사용 범위(이 페이지와 하위 페이지만, 쓰기 전 확인)는 그대로
