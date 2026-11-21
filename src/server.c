@@ -42,6 +42,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
@@ -252,6 +253,12 @@ static int respond_static(server *s, conn *c, int head)
         return http_append_error(&c->out, 405, c->keep_alive, head, "Allow: GET, HEAD\r\n");
     if (static_open(s->cfg->docroot, c->req.path, &c->file, &status) < 0)
         return http_append_error(&c->out, status, c->keep_alive, head, NULL);
+    /* Content-Length 는 long (http_response_head). long 이 32비트인 환경에서 2GB 넘는 파일은
+     * 길이가 잘려 응답 경계가 어긋나므로 500 으로 답한다 (CI 는 모두 64비트라 지금은 안 걸림) */
+    if (c->file.size > (off_t)LONG_MAX) {
+        static_close(&c->file);
+        return http_append_error(&c->out, 500, c->keep_alive, head, NULL);
+    }
 
     memset(&h, 0, sizeof h);
     h.status = 200;
@@ -285,8 +292,9 @@ static int respond(server *s, conn *c)
     case ROUTE_APP:
         if (app_handle(&c->req, s->cfg->port, &c->out) == 0)
             return 0;
-        /* app_handle 은 메모리 부족일 때만 -1 이지만, #10 전까지는 스텁이 항상 -1 이다.
-         * 연결을 그냥 끊지 않고 500 으로 답한다 (out 은 app_handle 이 그대로 둠) */
+        /* TODO(#10): app_handle 은 메모리 부족일 때만 -1 이지만, #10 전까지는 스텁이 항상 -1 이다.
+         * 연결을 그냥 끊지 않고 500 으로 답한다 (out 은 app_handle 이 그대로 둠).
+         * #10 뒤에도 남겨도 무해하다: 정말 메모리가 없으면 500 도 못 써서 -1 → 연결 닫기 */
         c->keep_alive = 0;
         return http_append_error(&c->out, 500, 0, head, NULL);
     case ROUTE_STATIC:
