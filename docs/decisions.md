@@ -8,6 +8,18 @@
 
 ---
 
+## 2026-11-21 · 프록시 설정 형식과 요청 재작성 규칙 (이슈 #8)
+
+- **결정**:
+  1. 설정 파일: 한 줄에 `접두사 host:port...`, `#` 주석, 줄 1024바이트·접두사 127·이름 63·라우트 16·라우트당 백엔드 8, 포트 1-65535, 같은 접두사 중복과 빈 파일은 오류. 오류는 -1 + stderr `파일:줄: 이유`, cfg 는 전부 0
+  2. 이름은 로드 시 한 번 해석하고 IPv4 를 먼저 고른다. IPv6 는 `[::1]:포트` 로 명시 (`AI_ADDRCONFIG` 는 쓰지 않음)
+  3. 접두사를 떼지 않고 원본 `target` 을 그대로 전달한다
+  4. `Content-Length` 는 클라이언트 줄을 버리고 본문 길이로 다시 쓴다 (원래 있었을 때만). `Connection` 에 적힌 이름은 클라이언트 줄에만 작용하고 프록시가 쓰는 줄(Host, X-Forwarded-For, Via, Content-Length, Connection)은 지우지 못한다
+  5. `Expect` 는 항상 뺀다
+  6. `proxy_build_request` 는 #9 가 아니라 #8 에서 구현한다
+- **이유**: 2 주소를 하나만 저장하고 재시도가 없어서 family 가 틀리면 복구 없이 502 가 된다. 이 WSL 에서 `open_listenfd` 식 listener 는 0.0.0.0 만 묶었고(노션 #3 관찰), `localhost` 가 ::1 로 먼저 풀리는 환경(Docker, macOS)에서 거절이 난다. 4 RFC 9110 7.6.1 은 중개자가 Connection 에 적힌 필드를 지우라고 하고, 메시지 길이는 홉마다 보내는 쪽이 정한다 (RFC 9112 6.3). 본문이 있는데 길이가 없는 메시지는 만들지 않는다. 5 본문이 이미 전부 버퍼에 있어 기다릴 것이 없고, 전달하면 백엔드의 `100 Continue` 를 #9 가 건너뛰어야 한다. 4·5 는 PR #24 에서 #9 로 미룬 두 항목이다
+- **영향**: `proxy_config.h/.c`, `proxy.h/.c`, `docs/interfaces.md`, `CLAUDE.md`, `tests/unit/test_proxy_config.c`, `tests/unit/test_proxy.c`. #7 (백엔드 인스턴스는 IPv4 loopback 을 받아야 함), #9 (요청 생성은 끝났고 연결·중계가 남음)
+
 ## 2026-11-21 · 본문 대기 중인 NEED_MORE 는 필요한 총 길이를 알려 준다 (PR #24)
 
 - **결정**: `http_parse_request` 가 헤더는 다 받고 본문만 덜 받아 `NEED_MORE` 를 돌려줄 때 `*consumed` 에 요청 전체 길이(`head_len + body_len`)를 넣는다. 헤더가 아직이면 지금처럼 0. 서버(#7)는 이 값을 기억해 `in` 이 그만큼 찰 때까지 파서를 다시 부르지 않는다. 시그니처는 그대로

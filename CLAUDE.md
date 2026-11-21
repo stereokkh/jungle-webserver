@@ -50,10 +50,10 @@
 | `static_file` | `serve_static`, `parse_uri` 정적 경로 | C · #6 |
 | `app` | `serve_dynamic` + `adder.c` (CGI 대신 함수) | C · #10 |
 | `proxy_config` | 없음 | B · #8 |
-| `proxy` | 없음 | B · #9 |
+| `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer` 는 구현·테스트 완료). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c` 는 아직 스텁을 호출하지 않는다. #7 에서 CLI(`-p -r -c`)와 `server_run` 연결
 
