@@ -21,8 +21,10 @@ sudo apt update && sudo apt install -y build-essential git curl
 ## 빌드 & 실행
 
 ```bash
-make            # ./webserver 생성
-./webserver 8080
+make                                  # ./webserver 생성
+./webserver -p 8080 -r www            # Ctrl-C(SIGINT)·SIGTERM 으로 종료
+./webserver -p 8080 -r www -c proxy.conf   # Reverse Proxy 설정 (지금은 읽기만, 중계는 #9 · 형식은 docs/interfaces.md)
+make run                              # = ./webserver -p 8080 -r www
 make clean
 ```
 
