@@ -97,4 +97,5 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 - **`extra_headers` 형식**: `NULL`, `""`, 또는 CRLF 로 끝나는 줄들 (빈 줄·짝 없는 CR·LF 없이, 응답 분할 방지). `content_type` 에 CR·LF 가 있어도 -1. 아니면 `http_append_*` 가 -1 (호출 코드 실수 검사). 서버가 만든 값만 넣고 요청에서 온 값은 넣지 않는다
 - **오류 본문**: `<html><body><h1>404 Not Found</h1></body></html>` 처럼 상태 코드와 문구만. 요청 경로 등 요청 내용은 넣지 않는다 (Tiny `clienterror` 반사형 XSS, #3)
 - **정적 파일 메서드**: GET, HEAD 외에는 서버가 405 (`extra_headers` = `"Allow: GET, HEAD\r\n"`)
+- **정적 파일 경로 판정** (`static_open`): `.`·`..`·`//` 를 먼저 글자로 정리하고, 루트 위로 가면 파일 존재와 상관없이 403. 그다음 `realpath` 결과가 docroot 밖이면(심볼릭 링크) 403. 디렉터리는 `index.html`(없으면 404), `/파일/` 처럼 파일 뒤 `/` 는 404, 일반 파일이 아니면 403, docroot 를 못 찾으면 500
 - **큰 배열은 스택에 두지 않는다**: `http_request`, `conn` 은 힙(calloc). `static_send_some` 의 지역 버퍼는 16KB 이하
