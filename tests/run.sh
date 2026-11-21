@@ -20,6 +20,8 @@ mkdir -p "$DOCROOT/sub"
 printf '<h1>smoke</h1>\n' >"$DOCROOT/index.html"
 printf 'sub file\n' >"$DOCROOT/sub/a.txt"
 head -c 1048576 /dev/urandom >"$DOCROOT/big.bin"   # 여러 POLLOUT 에 나눠 보내지는 크기
+printf 'secret\n' >"$TMP/secret.txt"
+ln -s ../secret.txt "$DOCROOT/link.txt"            # docroot 밖을 가리키는 링크
 
 fail=0
 SERVER_PID=
@@ -200,7 +202,13 @@ expect_code() {
     [ "$got" = "$want" ] && ok "$desc -> $want" || bad "$desc -> $want (got $got)"
 }
 expect_code 404 "GET missing file"        "${URL}nope.html"
-expect_code 403 "GET ../ outside docroot" --path-as-is "${URL}../etc/passwd"
+expect_code 403 "GET symlink to outside docroot" "${URL}link.txt"
+# .. 조각: 지금은 static_open 이 403, PR #27 머지 후에는 파서가 400. 어느 쪽이든 막혔으면 통과
+got=$(http_code --path-as-is "${URL}../etc/passwd")
+case $got in
+    403|400) ok "GET ../ outside docroot -> blocked ($got)" ;;
+    *)       bad "GET ../ outside docroot -> 403 or 400 (got $got)" ;;
+esac
 expect_code 405 "POST static file"        -d x "$URL"
 expect_code 431 "9KB header"              -H "X-Big: $(head -c 9000 /dev/zero | tr '\0' a)" "$URL"
 head -c 1100000 /dev/zero >"$TMP/huge"
