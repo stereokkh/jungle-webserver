@@ -143,6 +143,12 @@ static void test_target_split(void)
     REQUIRE(parse("GET /%61pi/add HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
     CHECK_STR(req.target, "/%61pi/add");      /* 라우팅은 이 원본으로 (decisions 2026-11-20) */
     CHECK_STR(req.path, "/api/add");
+
+    /* 디코딩은 한 번만: %25 는 '%' 가 되고 거기서 멈춘다. 두 번 풀면 "/../secret" 이 된다.
+     * static_open 은 글자 그대로의 "%2e%2e" 를 폴더 이름으로 보고 404 (PR #22 의 B 확인 요청) */
+    REQUIRE(parse("GET /%252e%252e/secret HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/%252e%252e/secret");
+    CHECK_STR(req.path, "/%2e%2e/secret");
 }
 
 /* path 의 금지 바이트와 잘못된 %XX → 400 */

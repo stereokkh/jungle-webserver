@@ -17,7 +17,7 @@
  *     원본 헤더 블록 위치(headers)를 남긴다 (프록시 전달용, #9).
  *   - Tiny 는 uri 를 그대로 "." 뒤에 붙여 파일을 연다 (재현 ②: ../ 로 classic/ 밖 파일이 열림).
  *     여기서는 원본 target, 디코딩한 path, query 를 나눠 담고, path 에 제어 문자·잘못된 %XX 가
- *     있으면 400. ".." 를 막는 건 static_open 의 realpath 몫이다 (#6).
+ *     있으면 400. ".." 를 막는 건 static_open 몫이다 (#6, PR #22: 글자 단위 정리 + realpath).
  *   - Tiny 는 version 을 읽기만 하고 버리고(응답은 항상 1.0), 메서드는 strcasecmp 로 비교한다.
  *     여기서는 HTTP/1.0·1.1 만 받고(그 외 505), 메서드는 대소문자를 구분한다 (RFC 9112 3.1).
  *
@@ -192,7 +192,8 @@ static int parse_request_line(const char *p, size_t n, http_request *req)
  * req->target(NUL 종료) 을 '?' 에서 나눠 path(퍼센트 디코딩) 와 query(디코딩 안 함) 에 담는다.
  * 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)가 있거나 %XX 가 잘못되면 400.
  *   - %00 을 통과시키면 path 가 C 문자열로는 중간에서 끊겨, 검사한 이름과 연 파일이 달라진다
- *   - "..", "%2E%2E" 는 여기서 막지 않는다. 디코딩만 정확히 하고 static_open 이 realpath 로 막는다
+ *   - "..", "%2E%2E" 는 여기서 막지 않는다. 디코딩만 정확히 하고 static_open 이 막는다
+ *     (#22: ".." 는 글자 단위로 정리해 루트 위면 403, 심볼릭 링크 탈출은 realpath 로 403)
  */
 static int split_target(http_request *req)
 {
