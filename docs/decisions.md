@@ -28,6 +28,25 @@
 - **영향**: `include/http_request.h`, `src/http_request.c`, `tests/unit/test_http_request.c`, `docs/interfaces.md`, `CLAUDE.md` 계약, #7 `server.c` 의 파서 호출부 (비교 기준은 `buffer_pending(&in)`, DONE·ERROR 에서 기억한 값을 지움)
 - **메모**: `Expect: 100-continue` 는 #9 뿐 아니라 프록시를 안 거치는 `POST /api/echo`(#10) 에도 해당한다. curl 은 1초 기다린 뒤 본문을 보내서 멈추지는 않고 1초 지연이 생긴다 (건호 확인). 지금은 처리하지 않는다
 
+## 2026-11-21 · 정적 파일 경로 판정 (PR #22, 이슈 #6)
+
+- **결정**:
+  1. `static_open` 은 `.`·`..`·`//` 를 글자 단위로 먼저 정리하고, 루트 위로 가면 파일 존재와 상관없이 403
+  2. 그다음 `realpath` 결과가 docroot 밖이면(심볼릭 링크) 403. 디렉터리는 끝 `/` 가 없어도(`/docs`) 리다이렉트 없이 `index.html`(없으면 404), `/파일/` 은 404, 일반 파일이 아니면 403, docroot 를 못 찾으면 500
+  3. `realpath`(XSI 확장)를 쓰는 파일은 맨 위에 `#define _XOPEN_SOURCE 700` 을 둔다. 공통 플래그 `-D_POSIX_C_SOURCE=200809L` 은 그대로
+- **이유**: 1 Tiny `parse_uri` 가 `/../secret.txt` 를 200 으로 열었음 (#3). 존재 여부로 403/404 가 갈리면 docroot 밖 파일이 있는지 알려 주게 됨. 2 글자 정리만으로는 docroot 안의 링크가 밖을 가리키는 경우를 못 막음. `/docs` 에 301 → `/docs/` 를 하지 않아 그 페이지의 상대 링크는 `/` 기준으로 풀린다. 지금 `www/` 는 절대 경로만 써서 괜찮고, 필요해지면 후속 (건호 리뷰). 3 musl·clang 은 `_POSIX_C_SOURCE` 만으로 `realpath` 선언을 보여 주지 않아 CI 가 실패함 (glibc gcc 는 통과해서 로컬에서 못 잡음)
+- **영향**: `src/static_file.c`, `include/static_file.h`, `docs/interfaces.md` "정한 세부 규칙", `tests/unit/test_static_file.c`, `www/`. 시그니처는 그대로. 파서(#5)는 디코딩한 path 를 넘기고 NUL·제어 문자는 400 으로 막는다 (상철 확인)
+
+## 2026-11-21 · 응답 헤더 규칙 4가지 (PR #21, 이슈 #6)
+
+- **결정**:
+  1. `http_append_header` 의 줄 순서를 상태 줄, `Date`, `Server`, `Content-Type`, `Content-Length`, `Connection`, `extra_headers`, 빈 줄로 고정. 상태 코드가 100~599 밖이면 -1
+  2. `content_length < 0` (길이 모름) 이면 `Content-Length` 를 생략하고 `keep_alive` 와 상관없이 `Connection: close`
+  3. `extra_headers` 는 `NULL`, `""`, 또는 CRLF 로 끝나는 줄들만 (빈 줄·짝 없는 CR·LF 금지). `content_type` 에 CR·LF 가 있어도 -1
+  4. 오류 본문은 상태 코드와 문구만 (`<html><body><h1>404 Not Found</h1></body></html>`). 요청 내용은 넣지 않는다
+- **이유**: 1 응답 모양이 정해져야 테스트가 필요한 줄을 찾을 수 있음. `Date` 때문에 전체 바이트 비교는 못 함. 2 길이가 없으면 클라이언트가 응답 끝을 연결 종료로만 알 수 있음. 3 빈 줄·짝 없는 LF 가 들어가면 헤더가 거기서 끝나 응답 분할(keep-alive 다음 응답까지 밀림). 4 Tiny `clienterror` 가 요청 경로를 본문에 넣어 반사형 XSS (#3)
+- **영향**: `src/http_response.c`, `include/http_response.h`, `docs/interfaces.md` "정한 세부 규칙", `tests/unit/test_http_response.c`. 시그니처는 그대로. 서버(#7)·프록시(#9)는 고정 문자열·`mime_type()` 상수만 넘기므로 영향 없음 (건호 확인)
+
 ## 2026-11-20 · 프로젝트 노션 주소 변경
 
 - **결정**: 프로젝트 노션 주소를 https://app.notion.com/p/jungle-webserver-41efacdfe6e480e59bc8e888ca466fb6 ("jungle-webserver" 페이지) 로 바꾼다. 아래 "프로젝트 노션 연결" 항목의 이전 주소는 더 이상 쓰지 않는다. 사용 범위(이 페이지와 하위 페이지만, 쓰기 전 확인)는 그대로

@@ -98,5 +98,10 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 - **프록시 설정 파일 (`proxy_config_load`)**: 한 줄에 `접두사 host:port...` (IPv6 는 `[::1]:8001`), `#` 주석, 빈 파일은 오류. 한도: 줄 1024바이트, 접두사 127, 백엔드 토큰 63, 라우트 16, 라우트당 백엔드 8, 포트 1-65535 (앞자리 0 없는 10진수, 숫자 호스트도 앞자리 0 없는 점 넷 IPv4). 이름은 시작할 때 한 번 해석하고 IPv4 를 먼저 고른다 (`localhost` 가 `::1` 로 풀려 연결이 거절되는 것을 피함. 백엔드 인스턴스는 IPv4 loopback 을 받아야 한다). 오류는 -1 과 stderr `파일:줄: 이유` (줄이 없는 파일 전체 오류는 `파일: 이유`) 이고 서버는 시작하지 않는다
 - **오류 응답의 추가 헤더**: `http_append_error` 의 `extra_headers` 로 넣는다. 405 `Allow` 는 호출자가 넣고(정적 `GET, HEAD`, echo `POST`), 앱의 오류에도 `X-Instance` 를 붙인다
 - **HEAD**: 헤더는 GET 과 같게(Content-Length 포함), 본문은 보내지 않는다
+- **응답 헤더 모양** (`http_append_header`): 상태 코드는 100~599 (밖이면 -1). 줄 순서는 상태 줄, `Date`, `Server: jungle-webserver`, `Content-Type`, `Content-Length`, `Connection`, `extra_headers`, 빈 줄로 고정. `Date` 가 들어가므로 응답 모듈은 소켓과 무관하지만 결과가 현재 시각에 따라 달라진다. 응답을 검사하는 테스트는 전체 바이트 비교 대신 필요한 줄을 `strstr` 로 찾는다
+- **길이를 모르는 응답**: `content_length < 0` 이면 `Content-Length` 를 생략하고, `keep_alive` 와 상관없이 `Connection: close` 를 쓴다 (클라이언트가 응답 끝을 연결 종료로만 알 수 있음)
+- **`extra_headers` 형식**: `NULL`, `""`, 또는 CRLF 로 끝나는 줄들 (빈 줄·짝 없는 CR·LF 없이, 응답 분할 방지). `content_type` 에 CR·LF 가 있어도 -1. 아니면 `http_append_*` 가 -1 (호출 코드 실수 검사). 서버가 만든 값만 넣고 요청에서 온 값은 넣지 않는다
+- **오류 본문**: `<html><body><h1>404 Not Found</h1></body></html>` 처럼 상태 코드와 문구만. 요청 경로 등 요청 내용은 넣지 않는다 (Tiny `clienterror` 반사형 XSS, #3)
 - **정적 파일 메서드**: GET, HEAD 외에는 서버가 405 (`extra_headers` = `"Allow: GET, HEAD\r\n"`)
+- **정적 파일 경로 판정** (`static_open`): `.`·`..`·`//` 를 먼저 글자로 정리하고, 루트 위로 가면 파일 존재와 상관없이 403. 그다음 `realpath` 결과가 docroot 밖이면(심볼릭 링크) 403. 디렉터리는 `index.html`(없으면 404), `/파일/` 처럼 파일 뒤 `/` 는 404, 일반 파일이 아니면 403, docroot 를 못 찾으면 500
 - **큰 배열은 스택에 두지 않는다**: `http_request`, `conn` 은 힙(calloc). `static_send_some` 의 지역 버퍼는 16KB 이하
