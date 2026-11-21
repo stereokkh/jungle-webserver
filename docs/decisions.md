@@ -8,6 +8,15 @@
 
 ---
 
+## 2026-11-21 · 정적 파일 경로 판정 (PR #22, 이슈 #6)
+
+- **결정**:
+  1. `static_open` 은 `.`·`..`·`//` 를 글자 단위로 먼저 정리하고, 루트 위로 가면 파일 존재와 상관없이 403
+  2. 그다음 `realpath` 결과가 docroot 밖이면(심볼릭 링크) 403. 디렉터리는 `index.html`(없으면 404), `/파일/` 은 404, 일반 파일이 아니면 403, docroot 를 못 찾으면 500
+  3. `realpath`(XSI 확장)를 쓰는 파일은 맨 위에 `#define _XOPEN_SOURCE 700` 을 둔다. 공통 플래그 `-D_POSIX_C_SOURCE=200809L` 은 그대로
+- **이유**: 1 Tiny `parse_uri` 가 `/../secret.txt` 를 200 으로 열었음 (#3). 존재 여부로 403/404 가 갈리면 docroot 밖 파일이 있는지 알려 주게 됨. 2 글자 정리만으로는 docroot 안의 링크가 밖을 가리키는 경우를 못 막음. 3 musl·clang 은 `_POSIX_C_SOURCE` 만으로 `realpath` 선언을 보여 주지 않아 CI 가 실패함 (glibc gcc 는 통과해서 로컬에서 못 잡음)
+- **영향**: `src/static_file.c`, `include/static_file.h`, `docs/interfaces.md` "정한 세부 규칙", `tests/unit/test_static_file.c`, `www/`. 시그니처는 그대로. 파서(#5)는 디코딩한 path 를 넘기고 NUL·제어 문자는 400 으로 막는다 (상철 확인)
+
 ## 2026-11-20 · 프로젝트 노션 주소 변경
 
 - **결정**: 프로젝트 노션 주소를 https://app.notion.com/p/jungle-webserver-41efacdfe6e480e59bc8e888ca466fb6 ("jungle-webserver" 페이지) 로 바꾼다. 아래 "프로젝트 노션 연결" 항목의 이전 주소는 더 이상 쓰지 않는다. 사용 범위(이 페이지와 하위 페이지만, 쓰기 전 확인)는 그대로
