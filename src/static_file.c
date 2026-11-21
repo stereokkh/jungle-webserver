@@ -40,7 +40,7 @@
 /* realpath/open 실패 errno → 응답 상태 */
 static int errno_status(int e)
 {
-    if (e == ENOENT || e == ENOTDIR)
+    if (e == ENOENT || e == ENOTDIR || e == ENAMETOOLONG)   /* 긴 이름: macOS PATH_MAX 는 1024 */
         return 404;
     if (e == EACCES || e == ELOOP)   /* ELOOP: O_NOFOLLOW 가 링크를 만남 */
         return 403;
@@ -193,8 +193,11 @@ int static_open(const char *docroot, const char *path, static_file *out, int *st
         goto fail;
     }
 
-    /* 6단계 */
-    fd = open(real, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* 6단계. O_NONBLOCK: stat 과 open 사이에 FIFO 로 바뀌어도 open 이 서버 전체를 멈추지 않게
+     *        (일반 파일 읽기에는 영향 없음, 아래 fstat 이 다시 거른다)
+     * shortcut: realpath 와 open 사이에 중간 디렉터리를 링크로 바꾸면 밖을 열 수 있다.
+     *           docroot 에 공격자가 쓸 수 있을 때만 문제. 그런 배포라면 openat 으로 한 칸씩 연다 */
+    fd = open(real, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         *status = errno_status(errno);
         goto fail;

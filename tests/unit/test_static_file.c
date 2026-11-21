@@ -219,6 +219,13 @@ static void test_open_errors(void)
     CHECK_INT(try_open("/nope.html"), 404);
     CHECK_INT(try_open("/index.html/"), 404);       /* 파일 뒤에 '/' */
     CHECK_INT(try_open("/index.html/x"), 404);
+    {   /* 이름 한 칸이 NAME_MAX(255) 를 넘으면 ENAMETOOLONG → 500 이 아니라 404 */
+        char longp[302];
+        longp[0] = '/';
+        memset(longp + 1, 'a', 300);
+        longp[301] = '\0';
+        CHECK_INT(try_open(longp), 404);
+    }
     CHECK_INT(try_open("/fifo"), 403);              /* 일반 파일 아님 (open 하면 멈춤) */
     if (geteuid() != 0)                             /* root 는 권한 검사를 무시한다 */
         CHECK_INT(try_open("/locked.txt"), 403);
