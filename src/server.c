@@ -322,9 +322,12 @@ static int handle_request(server *s, conn *c)
 
     if (r == PARSE_ERROR) {
         /* 요청이 깨져 다음 요청이 어디서 시작하는지 모른다 → 오류 응답 후 닫는다.
-         * HEAD 인지도 믿을 수 없어서 본문까지 쓴다 (어차피 닫으므로 다음 응답과 섞이지 않음) */
+         * HEAD 면 본문을 쓰지 않는다 (RFC 9110 9.3.2). 파서는 req 를 0(= HTTP_GET)으로 지우고
+         * 요청 라인에서 "HEAD" 를 읽었을 때만 HTTP_HEAD 로 바꾸므로, 요청 라인 전에 난 오류(431 등)는
+         * GET 으로 남아 본문까지 쓴다. 어차피 닫으므로 그래도 다음 응답과 섞이지 않는다.
+         * (ERROR 때 method 는 http_request.h 계약에 아직 없다. PR #29 에서 상철님께 확인 중) */
         c->keep_alive = 0;
-        if (http_append_error(&c->out, status, 0, 0, NULL) < 0)
+        if (http_append_error(&c->out, status, 0, c->req.method == HTTP_HEAD, NULL) < 0)
             return -1;
         c->state = CONN_CLOSING;
         return 0;

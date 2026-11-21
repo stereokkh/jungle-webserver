@@ -243,6 +243,15 @@ fi
 ( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/bad"
 grep -q '^HTTP/1.1 400' "$TMP/bad" && ok "malformed request -> 400" || bad "malformed request -> 400 (got $(cat "$TMP/bad"))"
 
+# 파서 오류도 HEAD 면 본문 없이 (Transfer-Encoding 은 501)
+( printf 'HEAD / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'; sleep 1 ) |
+    nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' >"$TMP/head501"
+if grep -q '^HTTP/1.1 501' "$TMP/head501" && ! grep -q '<html>' "$TMP/head501"; then
+    ok "HEAD with parse error -> 501, no body"
+else
+    bad "HEAD with parse error -> 501, no body (got: $(head -1 "$TMP/head501"))"
+fi
+
 # IPv6 소켓으로 열렸으면 ::1 로도 받아야 한다. 이 머신에 IPv6 루프백이 없으면(컨테이너 등)
 # 연결 자체가 안 되므로, "거부(refused)"일 때만 실패로 본다
 if grep -q 'IPv6' "$LOG"; then
