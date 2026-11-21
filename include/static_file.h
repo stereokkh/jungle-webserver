@@ -27,7 +27,17 @@ typedef struct {
 #define STATIC_FILE_INIT { -1, 0, 0, NULL }
 
 /* docroot + path(디코딩된 경로)를 연다. 디렉터리면 index.html.
- * 성공 0, 실패 -1 + *status (403, 404, 500). 실패해도 out->fd 는 -1 */
+ * 성공 0, 실패 -1 + *status (403, 404, 500). 실패해도 out->fd 는 -1
+ *
+ * 판정 예 (docroot = www):
+ *   "/", "/docs", "/docs/"        → 0, 그 디렉터리의 index.html
+ *   "//a.html", "/img/../a.html"  → 0, 안에서 움직이는 . .. // 는 정리
+ *   "/../secret", "/a/../../x"    → 403, 루트 위로 가면 파일이 있든 없든 403
+ *   docroot 밖을 가리키는 링크     → 403 (realpath 로 실제 경로 확인)
+ *   "/nope", "/a.html/", 빈 디렉터리 → 404
+ *   FIFO·장치 등 일반 파일 아님    → 403 (open 전에 검사, 멈추지 않음)
+ *   읽기 권한 없음 → 403, docroot 자체가 없음 → 500
+ * path 는 '/' 로 시작해야 한다 (아니면 403). % 디코딩은 파서 몫 */
 int static_open(const char *docroot, const char *path, static_file *out, int *status);
 
 /* 다음 조각을 fd(클라이언트 소켓, 테스트에서는 pipe)로 보낸다.
