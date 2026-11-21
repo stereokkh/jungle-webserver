@@ -49,8 +49,11 @@ typedef struct {
  *     성공하면 아무것도 출력하지 않는다. cfg 는 호출할 때마다 처음부터 다시 채운다
  *   - 이름은 여기서 getaddrinfo 로 한 번만 해석한다. 백엔드마다 주소 하나만 저장하고
  *     재시도·페일오버가 없으므로, 이름이 IPv4 와 IPv6 로 모두 해석되면 IPv4 를 고른다.
- *     백엔드는 같은 바이너리를 다른 포트로 띄운 것이고 net_listen(#7)은 open_listenfd 식으로 0.0.0.0 을 먼저 묶을 예정이므로
- *     "localhost" 가 ::1 로 먼저 풀리면 연결 거절이 되기 때문이다. IPv6 만 받는 백엔드는 "[::1]:포트" 로 쓴다
+ *     백엔드는 같은 바이너리를 다른 포트로 띄운 것이다. net_listen(#7, PR #25)은 IPv6 소켓 하나에
+ *     IPV6_V6ONLY=0 으로 IPv4·IPv6 를 둘 다 받고, IPv6 를 못 쓰는 환경에서는 IPv4 만 연다.
+ *     두 경우 모두 IPv4 loopback 은 받으므로 IPv4 를 고르면 어느 쪽이든 연결된다.
+ *     "localhost" 가 ::1 로 먼저 풀리는 환경(Docker, macOS)에서 ::1 을 고르면 IPv4 만 연 백엔드에서
+ *     연결 거절이 난다. IPv6 로만 보내고 싶으면 "[::1]:포트" 로 쓴다
  *     (#7 에 대한 요구: 백엔드 인스턴스는 loopback 의 IPv4 연결을 받아야 한다)
  */
 int proxy_config_load(const char *path, proxy_config *cfg);
