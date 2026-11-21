@@ -55,7 +55,7 @@
 
 - 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file` 은 구현·테스트 완료). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
-- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 첫 PR 에서 구현했다. 지금 서버는 요청 헤더 끝까지 받으면 고정 200 + `Connection: close` 를 보낸다. #7 다음 PR 에서 `server.c` 의 `handle_request()` 를 `docs/interfaces.md` 2~4단계(파서·정적 파일·응답)로 바꾸고, keep-alive, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃을 붙인다
+- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 앱(#10)·프록시(#9)는 모듈이 붙으면 `server.c` 의 `respond()` 에서 스텁 처리(500, 502)만 걷어 내면 된다
 
 CS:APP Tiny (이슈 #3):
 
@@ -202,8 +202,8 @@ Claude의 노션 사용 범위:
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현: poll 루프·CLI·종료 처리는 #7 첫 PR 에서 완료. keep-alive·모듈 연결(#7 다음 PR), 파서·응답·정적·앱·프록시 → 이슈 #5 #6 #8 #9 #10
-- `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 431 처럼 "읽지 않은 입력이 남은 채 닫는" 응답은 RST 때문에 클라이언트가 응답을 못 받을 수 있어 아직 넣지 않았다 (#7 다음 PR 에서 lingering close 로 처리)
+- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive 는 #7 에서 완료. 남은 것은 앱(#10), 프록시 설정·중계(#8 #9, 업스트림 상태는 A·B 협업)
+- `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
 - `docs/api.md`, `docs/benchmark.md`, `docs/classic.md` → 이슈 #11, #3
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)

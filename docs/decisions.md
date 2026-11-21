@@ -8,6 +8,27 @@
 
 ---
 
+## 2026-11-21 · 서버 모듈 연결·keep-alive·요청 타임아웃·lingering close (이슈 #7 두 번째 PR)
+
+결정
+1. `handle_request` 는 `http_parse_request` → `handler_route` → (정적) `static_open` + `http_append_header` 순서로 응답을 만들고, 응답을 다 만든 뒤에 `buffer_consume` 한다. 파일 본문은 `CONN_SENDING_FILE` 에서 `static_send_some` 으로 나눠 보내고, 다 보내면 바로 `static_close` 한다 (keep-alive 에서 다음 `static_open` 이 fd 를 덮어쓰지 않게, PR #25 혜성 리뷰)
+2. 파서 `NEED_MORE` 의 `consumed` 가 0 이 아니면 `need_len` 에 기억하고 `buffer_pending(&in)` 이 그만큼 찰 때까지 파서를 부르지 않는다. DONE·ERROR 에서 지운다 (PR #24 계약)
+3. keep-alive·파이프라이닝: 응답을 끝까지 보낸 뒤 `in` 에 남은 바이트가 있으면 새 바이트를 기다리지 않고 바로 다음 요청을 처리한다. 응답을 보내는 동안은 읽지 않는다
+4. 요청 타임아웃 `CLIENT_REQUEST_TIMEOUT_MS` = 30초 (요청의 첫 바이트부터 완성까지). 넘으면 응답 없이 닫는다
+5. 연결을 닫는 응답은 `shutdown(SHUT_WR)` 후 `CONN_LINGERING` 에서 남은 입력을 읽어 버리다가 EOF 나 2초(`CLIENT_LINGER_TIMEOUT_MS`)에 닫는다
+6. 파서 오류(400, 413, 414, 431, 501, 505)는 `keep_alive = 0` 으로 오류 응답 후 닫는다. HEAD 면 본문을 쓰지 않는다 (`req.method == HTTP_HEAD`. 요청 라인 전에 난 431 등은 method 가 기본값 GET 이라 본문까지 씀). 앱 스텁(-1)은 500, 프록시 경로는 502 로 임시 처리
+7. 파일 크기가 `LONG_MAX` 를 넘으면 500 (`http_response_head.content_length` 가 `long`)
+
+이유
+- 유휴 타이머는 바이트가 올 때마다 리셋돼서, 헤더나 본문을 1바이트씩 보내는 클라이언트는 연결 하나를 무기한 붙잡을 수 있다. 30초는 1MB 본문 상한을 약 35KB/s 로도 받을 수 있는 값
+- 읽지 않은 입력을 남긴 채 `close` 하면 커널이 RST 를 보내고, 클라이언트는 아직 읽지 않은 응답(413, 431 등)을 버릴 수 있다 (RFC 9112 9.6). Linux 루프백에서는 lingering 없이도 재현되지 않았지만(20/20) 네트워크·OS 에 따라 달라서 표준 방식을 따른다
+- 파서 오류는 요청 경계를 믿을 수 없어 다음 요청을 이어 처리할 수 없다. HEAD 를 파서가 읽기 전에 난 오류는 본문이 붙지만, 응답 뒤에 닫으므로 다음 응답과 섞이지 않는다. ERROR 때 `method` 동작은 `http_request.h` 계약에 아직 없어 PR #29 에서 상철님께 확인 중
+- `long` 이 32비트인 환경에서 2GB 넘는 파일은 Content-Length 가 잘려 응답 경계가 어긋난다
+
+영향
+- `src/server.c`, `include/server.h` (`CLIENT_REQUEST_TIMEOUT_MS`, `CLIENT_LINGER_TIMEOUT_MS`), `docs/interfaces.md` 상태·타임아웃 표, `tests/run.sh` (정적 200·1MB·404·403(링크)·`..` 차단(403 또는 #27 뒤 400)·405·431·413·HEAD·keep-alive·1.0/1.1 기본 Connection·파이프라이닝(한꺼번에, 반쪽)·400·파서 오류 HEAD)
+- #9 는 `respond()` 의 `ROUTE_PROXY` 분기, #10 은 `ROUTE_APP` 의 500 대체 처리를 걷어 낸다
+
 ## 2026-11-21 · 서버 CLI·listen 소켓·종료 방식 (이슈 #7 첫 PR)
 
 - **결정**:

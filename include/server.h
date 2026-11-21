@@ -18,6 +18,18 @@
  * (요청을 반만 보내고 멈춘 느린 클라이언트, keep-alive 유휴 연결 모두) */
 #define CLIENT_IDLE_TIMEOUT_MS  10000
 
+/* 요청 하나를 다 받을 때까지의 상한 (그 요청의 첫 바이트부터). 유휴 타이머는 바이트가 올 때마다
+ * 리셋되므로, 헤더·본문을 1바이트씩 보내는 느린 클라이언트(slow loris)는 이것으로 끊는다.
+ * 넘으면 응답 없이 닫는다. #ifndef 는 수동 검증 때 -D 로 줄여 빌드하기 위한 것 */
+#ifndef CLIENT_REQUEST_TIMEOUT_MS
+#define CLIENT_REQUEST_TIMEOUT_MS 30000
+#endif
+
+/* 응답을 보내고 닫을 때 송신만 먼저 닫고(shutdown), 클라이언트가 보낸 나머지를 읽어 버리며
+ * 기다리는 최대 시간 (lingering close). 읽지 않은 입력을 남긴 채 close 하면 커널이 RST 를 보내
+ * 클라이언트가 아직 읽지 않은 응답(413, 431 등)까지 버려질 수 있다 */
+#define CLIENT_LINGER_TIMEOUT_MS  2000
+
 /* 업스트림 연결·응답 대기 상한. 응답 시작 전에 넘으면 504 */
 #define UPSTREAM_TIMEOUT_MS     5000
 

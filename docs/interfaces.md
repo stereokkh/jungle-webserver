@@ -74,17 +74,22 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 | 상태 | poll 이벤트 | 다음 |
 |---|---|---|
 | `CONN_READING` | 클라이언트 POLLIN | 요청 완성 → 응답 준비 후 `CONN_WRITING` |
-| `CONN_WRITING` | 클라이언트 POLLOUT | out 다 보냄 → 파일 있으면 `CONN_SENDING_FILE`, 아니면 keep-alive 면 `CONN_READING` / 아니면 닫기 |
+| `CONN_WRITING` | 클라이언트 POLLOUT | out 다 보냄 → 파일 있으면 `CONN_SENDING_FILE`, 아니면 keep-alive 면 `CONN_READING` / 아니면 `CONN_LINGERING` |
 | `CONN_SENDING_FILE` | 클라이언트 POLLOUT | `static_send_some` 이 1 → `static_close` → keep-alive 판단 |
 | `CONN_UPSTREAM` | 업스트림 POLLOUT/POLLIN | #9 에서 세분화 (연결 중 / 요청 송신 / 응답 중계) |
-| `CONN_CLOSING` | 클라이언트 POLLOUT | out 다 보내면 닫기 (오류 응답 후, `Connection: close`) |
+| `CONN_CLOSING` | 클라이언트 POLLOUT | out 다 보내면 `CONN_LINGERING` (파서 오류 응답 후, `Connection: close`) |
+| `CONN_LINGERING` | 클라이언트 POLLIN | `shutdown(SHUT_WR)` 뒤 받은 바이트는 버림. EOF·오류·마감이면 `conn_close` |
 
 | 타임아웃 | 값 | 넘으면 |
 |---|---|---|
 | `CLIENT_IDLE_TIMEOUT_MS` | 10초 | 연결 닫기 (요청을 덜 보낸 느린 클라이언트, keep-alive 유휴) |
+| `CLIENT_REQUEST_TIMEOUT_MS` | 30초 | 요청 하나의 첫 바이트부터 완성까지. 넘으면 응답 없이 닫기 (1바이트씩 보내 유휴 타이머를 계속 리셋하는 slow loris) |
+| `CLIENT_LINGER_TIMEOUT_MS` | 2초 | `CONN_LINGERING` 의 상한. 넘으면 닫기 |
 | `UPSTREAM_TIMEOUT_MS` | 5초 | 응답 시작 전이면 504, 시작 후면 연결 닫기 |
 
-- 같은 연결의 다음 요청(파이프라이닝)은 현재 응답을 다 보낸 뒤 `in` 에 남은 바이트로 처리한다
+- 같은 연결의 다음 요청(파이프라이닝)은 현재 응답을 다 보낸 뒤 `in` 에 남은 바이트로 처리한다. 응답을 보내는 동안에는 클라이언트 소켓을 읽지 않는다 (POLLOUT 만 감시)
+- 연결을 닫는 응답(`keep_alive == 0`, 오류 응답)은 바로 `close` 하지 않고 lingering close 한다. 읽지 않은 입력이 남은 채 `close` 하면 커널이 RST 를 보내 클라이언트가 아직 읽지 않은 응답까지 버려질 수 있다
+- 아직 스텁인 경로: `ROUTE_APP` 은 `app_handle` 이 -1 이면 500 + 닫기 (#10 전까지), `ROUTE_PROXY` 는 502 + 닫기 (#9 전까지. #8 전에는 `-c` 가 실패해 여기로 오지 않음)
 - `SIGINT`/`SIGTERM`: 새 연결을 받지 않고 모든 `conn` 을 `conn_close` 한 뒤 `server_run` 이 0 을 반환한다
 
 ## 정한 세부 규칙
