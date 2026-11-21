@@ -286,7 +286,7 @@ static int respond(server *s, conn *c)
     switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
     case ROUTE_PROXY:
         /* TODO(#9): proxy_build_request → proxy_connect_start → CONN_UPSTREAM.
-         * proxy_config_load(#8) 가 아직 스텁이라 지금은 여기로 오지 않는다 */
+         * #9 전까지는 프록시 경로에 502 로 답하고 닫는다 (#8 설정 로드가 머지되면 -c 로 여기 온다) */
         c->keep_alive = 0;
         return http_append_error(&c->out, 502, 0, head, NULL);
     case ROUTE_APP:
