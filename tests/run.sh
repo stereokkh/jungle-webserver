@@ -239,6 +239,20 @@ else
     bad "pipelined requests -> 200, 200, 404 in order (got: $(tr '\n' ' ' <"$TMP/pipe"))"
 fi
 
+# 파이프라이닝 (반쪽): 첫 응답 뒤 in 에 남은 다음 요청의 앞부분이 버려지지 않고,
+# 나중에 온 나머지와 합쳐져 처리되는지 (server.c conn_response_done).
+# 남은 바이트를 "바로" 처리하는지는 위의 한꺼번에 보내는 테스트가 본다 (이 경우는 나머지가
+# 도착하면 poll 이 깨워 주므로 바로 처리하지 않아도 통과한다)
+( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /sub/a.txt HT'
+  sleep 0.5
+  printf 'TP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+  sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' | grep -E '^HTTP/1.1|^sub file' >"$TMP/pipe2"
+if [ "$(tr '\n' ' ' <"$TMP/pipe2")" = "HTTP/1.1 200 OK HTTP/1.1 200 OK sub file " ]; then
+    ok "pipelined request split across reads -> 200, 200"
+else
+    bad "pipelined request split across reads -> 200, 200 (got: $(tr '\n' ' ' <"$TMP/pipe2"))"
+fi
+
 # 깨진 요청 -> 400
 ( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/bad"
 grep -q '^HTTP/1.1 400' "$TMP/bad" && ok "malformed request -> 400" || bad "malformed request -> 400 (got $(cat "$TMP/bad"))"
