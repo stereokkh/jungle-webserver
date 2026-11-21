@@ -171,6 +171,22 @@ static void test_header_bad_extra(void)
     CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\r\n\r\nX-Instance: 8001\r\n"), -1);
     CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
 
+    /* 짝 없는 LF·CR: LF 로만 줄을 끊는 쪽에서는 "\n\r\n" 이 빈 줄 (응답 분할) */
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\n\r\n"), -1);
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\nX-Evil: 1\r\n"), -1);
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\rX-Evil: 1\r\n"), -1);
+    CHECK_INT(http_append_error(&out, 405, 1, 0, "Allow: POST\r\nX-Evil: 1\r"), -1);
+    CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
+
+    /* Content-Type 에 줄바꿈이 있으면 그 뒤가 새 헤더가 된다 */
+    h.extra_headers = NULL;
+    h.content_type = "text/html\r\nSet-Cookie: a=1";
+    CHECK_INT(http_append_header(&out, &h), -1);
+    h.content_type = "text/html\nX: 1";
+    CHECK_INT(http_append_header(&out, &h), -1);
+    CHECK_MEM(buffer_peek(&out), buffer_pending(&out), "keep", 4);
+    h.content_type = NULL;
+
     /* 여러 줄은 괜찮다 */
     CHECK_INT(http_append_error(&out, 405, 1, 1, "Allow: POST\r\nX-Instance: 8001\r\n"), 0);
     buffer_clear(&out);

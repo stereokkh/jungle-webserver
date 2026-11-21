@@ -66,18 +66,35 @@ static int format_http_date(char *dst, size_t cap)
     return (n == HTTP_DATE_LEN && (size_t)n < cap) ? 0 : -1;
 }
 
-/* NULL, "" 이거나 CRLF 로 끝나는 줄들이면 1 (호출 코드의 실수 검사, http_response.h 참고).
- * 빈 줄("\r\n" 로 시작하거나 "\r\n\r\n" 포함)은 거절: 헤더가 거기서 끝난 것으로 읽혀
- * Content-Length 와 실제 본문이 어긋나고 keep-alive 의 다음 응답까지 밀린다 */
+/* NULL, "" 이거나 비어 있지 않은 줄들이 각각 CRLF 로 끝나면 1 (호출 코드의 실수 검사, http_response.h 참고).
+ * 거절하는 것:
+ *   - 빈 줄 ("\r\n" 로 시작, "\r\n\r\n" 포함): 헤더가 거기서 끝난 것으로 읽힌다
+ *   - 짝 없는 '\r' 이나 '\n' ("X: a\n\r\n"): LF 만으로 줄을 끊는 클라이언트·프록시는
+ *     여기서 빈 줄을 본다
+ * 둘 다 Content-Length 와 실제 본문이 어긋나 keep-alive 의 다음 응답까지 밀린다 (응답 분할) */
 static int extra_headers_ok(const char *x)
 {
-    size_t n;
+    size_t i, line = 0;   /* line: 지금 줄이 시작한 위치 */
 
-    if (x == NULL || x[0] == '\0')
+    if (x == NULL)
         return 1;
-    n = strlen(x);
-    return n >= 2 && x[n - 2] == '\r' && x[n - 1] == '\n' &&
-           strncmp(x, "\r\n", 2) != 0 && strstr(x, "\r\n\r\n") == NULL;
+    for (i = 0; x[i] != '\0'; i++) {
+        if (x[i] == '\n')
+            return 0;                       /* '\r' 없이 나온 '\n' */
+        if (x[i] == '\r') {
+            if (x[i + 1] != '\n' || i == line)
+                return 0;                   /* 짝 없는 '\r' 또는 빈 줄 */
+            i++;                            /* '\n' 건너뜀 */
+            line = i + 1;
+        }
+    }
+    return line == i;                       /* 마지막 줄도 CRLF 로 끝났나 */
+}
+
+/* Content-Type 값에 줄바꿈이 있으면 그 뒤가 새 헤더가 된다 */
+static int header_value_ok(const char *v)
+{
+    return v == NULL || strpbrk(v, "\r\n") == NULL;
 }
 
 int http_append_header(buffer *out, const http_response_head *h)
@@ -88,7 +105,7 @@ int http_append_header(buffer *out, const http_response_head *h)
 
     /* 상태 코드는 3자리(100~599)여야 클라이언트가 응답으로 읽는다 */
     if (out == NULL || h == NULL || h->status < 100 || h->status > 599 ||
-        !extra_headers_ok(h->extra_headers))
+        !extra_headers_ok(h->extra_headers) || !header_value_ok(h->content_type))
         return -1;
 
     /* 길이를 모르면 연결 종료가 응답의 끝이므로 keep-alive 를 쓸 수 없다 */

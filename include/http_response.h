@@ -48,14 +48,14 @@ const char *http_reason(int status);
 /* 응답 헤더에 들어갈 값. 인자가 많아서 구조체로 받는다 */
 typedef struct {
     int status;                  /* 100~599. 밖이면 -1 */
-    const char *content_type;    /* NULL 이면 Content-Type 생략 */
+    const char *content_type;    /* NULL 이면 Content-Type 생략. '\r' '\n' 이 있으면 -1 */
     long content_length;         /* < 0 이면 Content-Length 생략. 이때 keep_alive 와 상관없이
                                   * Connection: close (길이를 모르면 클라이언트가 응답 끝을
                                   * 연결 종료로만 알 수 있다) */
     int keep_alive;              /* Connection: keep-alive / close */
     const char *extra_headers;   /* "X-Instance: 8001\r\n" 처럼 CRLF 로 끝나는 줄들. 없으면 NULL 또는 "".
-                                  * CRLF 로 끝나지 않거나 빈 줄("\r\n" 로 시작, "\r\n\r\n" 포함)이
-                                  * 있으면 -1 (호출 코드의 실수를 잡기 위한 검사.
+                                  * CRLF 로 끝나지 않거나, 빈 줄("\r\n" 로 시작, "\r\n\r\n" 포함)이나
+                                  * 짝 없는 '\r'·'\n' 이 있으면 -1 (응답 분할 방지. 호출 코드의 실수를 잡기 위한 검사.
                                   * 우리 코드가 만든 값만 넣는다. 요청에서 온 값을 넣지 않는다) */
 } http_response_head;
 
