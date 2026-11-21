@@ -135,9 +135,9 @@ static void test_pipelined(void)
 /* target / path / query 분리와 퍼센트 디코딩 */
 static void test_target_split(void)
 {
-    REQUIRE(parse("GET /docs/%2E%2E/secret?q=a%20b HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
-    CHECK_STR(req.target, "/docs/%2E%2E/secret?q=a%20b");
-    CHECK_STR(req.path, "/docs/../secret");   /* ".." 차단은 static_open 몫 */
+    REQUIRE(parse("GET /docs/%2E%2Ex/secret?q=a%20b HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/docs/%2E%2Ex/secret?q=a%20b");
+    CHECK_STR(req.path, "/docs/..x/secret");  /* "..x" 는 점 조각이 아니다 (점 조각은 test_dot_segments) */
     CHECK_STR(req.query, "q=a%20b");
 
     REQUIRE(parse("GET /a%20b?x=1&y=%3D HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
@@ -167,6 +167,41 @@ static void test_bad_path_bytes(void)
 
     /* query 는 디코딩하지 않으므로 %00 이 있어도 path 검사 대상이 아니다 */
     CHECK_INT(parse("GET /a?x=%00 HTTP/1.1\r\nHost: x\r\n\r\n"), PARSE_DONE);
+}
+
+/* path 의 "." / ".." 조각 → 400 (PR #26 리뷰: 라우팅 전에 막아 정리 전후 경로가 다른 라우트로 가지 않게) */
+static void test_dot_segments(void)
+{
+    /* 평문 */
+    CHECK_ERROR("GET /.. HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /. HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /../secret HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /public/../admin/x HTTP/1.1\r\nHost: x\r\n\r\n", 400);   /* 혜성 재현 */
+    CHECK_ERROR("GET /a/./b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/.. HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/../ HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a//../b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/..?x=1 HTTP/1.1\r\nHost: x\r\n\r\n", 400);   /* '?' 앞까지가 path */
+
+    /* 인코딩: 디코딩한 뒤에 본다 */
+    CHECK_ERROR("GET /public/%2e%2e/admin/x HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/%2E%2e/b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/.%2E HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a/%2e/b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a%2F..%2Fb HTTP/1.1\r\nHost: x\r\n\r\n", 400);   /* %2F 도 디코딩하면 '/' */
+
+    /* 점 조각이 아닌 이름은 통과 */
+    REQUIRE(parse("GET /.../a. HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.path, "/.../a.");
+    REQUIRE(parse("GET /.well-known/x HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.path, "/.well-known/x");
+    REQUIRE(parse("GET /a..b/..c HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.path, "/a..b/..c");
+    REQUIRE(parse("GET //a HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);   /* 빈 조각은 static_open 이 정리 */
+    CHECK_STR(req.path, "//a");
+    /* query 의 ".." 는 path 가 아니다 */
+    REQUIRE(parse("GET /a?p=../b HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.query, "p=../b");
 }
 
 static void test_request_line_shape(void)
@@ -391,6 +426,7 @@ int main(void)
     RUN(test_pipelined);
     RUN(test_target_split);
     RUN(test_bad_path_bytes);
+    RUN(test_dot_segments);
     RUN(test_request_line_shape);
     RUN(test_leading_empty_lines);
     RUN(test_large_body);

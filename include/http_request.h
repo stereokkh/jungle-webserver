@@ -41,8 +41,9 @@ typedef struct {
     char method_str[16];            /* 원본 메서드 문자열 (501 로그·프록시 전달용) */
     char target[HTTP_MAX_URI + 1];  /* 원본 요청 대상 "/a%20b?x=1" (프록시 전달용, 디코딩 안 함) */
     char path[HTTP_MAX_URI + 1];    /* 퍼센트 디코딩한 경로 "/a b" (정적 파일 접근용).
-                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 를
-                                     * 400 으로 거절하므로 path 에는 이런 바이트가 없다 */
+                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 와
+                                     * "." / ".." 조각을 400 으로 거절하므로 path 에는 이런 바이트와
+                                     * 점 조각이 없다 (원본 target 에도 디코딩 후 점 조각이 없다는 뜻) */
     char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 디코딩 안 함. 없으면 "" */
     int version_minor;              /* HTTP/1.0 → 0, HTTP/1.1 → 1 */
 

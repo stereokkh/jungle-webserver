@@ -16,8 +16,10 @@
  *   - Tiny 는 헤더를 읽고 버린다. 여기서는 Host, Content-Length, Connection 을 해석하고
  *     원본 헤더 블록 위치(headers)를 남긴다 (프록시 전달용, #9).
  *   - Tiny 는 uri 를 그대로 "." 뒤에 붙여 파일을 연다 (재현 ②: ../ 로 classic/ 밖 파일이 열림).
- *     여기서는 원본 target, 디코딩한 path, query 를 나눠 담고, path 에 제어 문자·잘못된 %XX 가
- *     있으면 400. ".." 를 막는 건 static_open 몫이다 (#6, PR #22: 글자 단위 정리 + realpath).
+ *     여기서는 원본 target, 디코딩한 path, query 를 나눠 담고, path 에 제어 문자·잘못된 %XX 나
+ *     "." / ".." 조각(%2e%2e 를 디코딩한 것 포함)이 있으면 400. 라우팅(원본 target)보다 먼저
+ *     막아서, 정리 전과 후의 경로가 서로 다른 라우트에 속하는 요청을 없앤다 (PR #26 리뷰).
+ *     static_open(#22) 의 글자 단위 정리 + realpath 는 두 번째 안전장치로 그대로 둔다.
  *   - Tiny 는 version 을 읽기만 하고 버리고(응답은 항상 1.0), 메서드는 strcasecmp 로 비교한다.
  *     여기서는 HTTP/1.0·1.1 만 받고(그 외 505), 메서드는 대소문자를 구분한다 (RFC 9112 3.1).
  *
@@ -188,12 +190,36 @@ static int parse_request_line(const char *p, size_t n, http_request *req)
     return vstatus;
 }
 
+/* NUL 종료된 path 를 '/' 로 나눈 조각 중 "." 이나 ".." 가 있는가.
+ * "...", ".a", "a..b", "a." 같은 이름은 점 조각이 아니다. 빈 조각("//")은 static_open 이 정리한다 */
+static int has_dot_segment(const char *p)
+{
+    while (*p != '\0') {
+        const char *end;
+        size_t n;
+
+        if (*p == '/') {
+            p++;
+            continue;
+        }
+        end = strchr(p, '/');
+        n = end ? (size_t)(end - p) : strlen(p);
+        if ((n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.'))
+            return 1;
+        p += n;
+    }
+    return 0;
+}
+
 /*
  * req->target(NUL 종료) 을 '?' 에서 나눠 path(퍼센트 디코딩) 와 query(디코딩 안 함) 에 담는다.
  * 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)가 있거나 %XX 가 잘못되면 400.
  *   - %00 을 통과시키면 path 가 C 문자열로는 중간에서 끊겨, 검사한 이름과 연 파일이 달라진다
- *   - "..", "%2E%2E" 는 여기서 막지 않는다. 디코딩만 정확히 하고 static_open 이 막는다
- *     (#22: ".." 는 글자 단위로 정리해 루트 위면 403, 심볼릭 링크 탈출은 realpath 로 403)
+ *   - 디코딩한 path 에 "." 이나 ".." 조각이 있어도 400. 평문 "/a/../b" 와 "/a/%2E%2E/b",
+ *     "%2F" 로 만든 "/a%2F..%2Fb" 가 같은 자리에서 걸린다
+ *   - 라우팅은 원본 target 으로 하고(#18) 정적 파일은 정리한 경로로 열기 때문에, ".." 를 통과시키면
+ *     "/public/../admin/x" 가 "/admin" 프록시 라우트를 건너뛰어 프런트 docroot 의 /admin/x 를 연다
+ *     (PR #26 리뷰, 혜성). curl·브라우저는 보내기 전에 ".." 를 지우므로 (#3 재현 ②) 정상 요청은 영향 없음
  */
 static int split_target(http_request *req)
 {
@@ -226,6 +252,8 @@ static int split_target(http_request *req)
         req->path[o++] = (char)c;
     }
     req->path[o] = '\0';
+    if (has_dot_segment(req->path))
+        return 400;
     return 0;
 }
 
