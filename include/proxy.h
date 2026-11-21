@@ -61,7 +61,12 @@
  *   content_length < 0 인데 body_len > 0 (길이 없는 본문),
  *   backend->name 이 비었거나 NUL 이 없거나 0x21-0x7E 밖의 바이트가 있음, client_ip 가 비었거나
  *   0x21-0x7E 밖의 바이트가 있음 (헤더 주입 차단), content_length >= 0 인데 body_len 과 다름,
- *   body_len > 0 인데 body 가 NULL, headers_len > 0 인데 headers 가 NULL, 헤더 블록 줄이 깨짐 */
+ *   body_len > 0 인데 body 가 NULL, headers_len > 0 인데 headers 가 NULL,
+ *   헤더 블록 줄이 깨짐 (파서가 400 으로 막는 모양: 이름이 토큰 글자가 아님, 값에 제어 문자, CRLF 없음 등.
+ *   http_parse_request 가 만든 블록은 통과한다),
+ *   다시 쓴 머리(1 ~ 6 의 빈 줄까지)가 HTTP_MAX_HEADER 바이트를 넘음 (프런트 한도에 가까운 요청은
+ *   Host 이름 교체와 줄 추가로 길어져 같은 바이너리의 백엔드가 431 로 거절한다. 보내지 않고 실패시키며
+ *   응답 코드는 #9 가 정한다) */
 int proxy_build_request(const http_request *req, const proxy_backend *backend,
                         const char *client_ip, buffer *out);
 

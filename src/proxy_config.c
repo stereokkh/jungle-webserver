@@ -11,6 +11,7 @@
  *   - '#' 는 토큰 맨 앞에 있을 때만 주석이다 ("/a#b" 는 접두사 글자 오류)
  *   - 빈 파일, 주석만 있는 파일은 "no routes" 로 거절한다 (-c 를 줬다면 프록시를 쓰겠다는 뜻이므로)
  *   - 오류는 stderr 에 "파일:줄번호: 이유" 로 한 줄 출력하고 -1, cfg 는 전부 0 으로 되돌린다
+ *     (줄이 없는 파일 전체 오류 - 열기·읽기 실패, 라우트 없음 - 는 "파일: 이유")
  *   - 백엔드 주소는 여기서 getaddrinfo 로 한 번만 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
  * 우리가 Tiny 와 다른 점:
  *   Tiny 의 open_clientfd 는 연결할 때마다 getaddrinfo 를 부른다 (DNS 가 느리면 서버 전체가 멈춘다).
@@ -81,9 +82,12 @@ static int is_host_char(int c)
     return is_alnum(c) || c == '-' || c == '.' || c == '_';
 }
 
-/* 숫자와 '.' 로만 된 호스트가 점 넷의 10진 IPv4 (각 1-3자리, 255 이하) 가 아닌가.
+/* 숫자와 '.' 로만 된 호스트가 점 넷의 10진 IPv4 (각 1-3자리, 255 이하, 앞자리 0 없음) 가 아닌가.
  * glibc getaddrinfo 는 "1" "127.1" "0" 같은 inet_aton 옛 형식도 주소로 받아 주므로
- * 오타("0:8001" 처럼 옥텟이 빠진 것)가 조용히 통과한다. 시작 때 거절하려고 미리 막는다 */
+ * 오타("0:8001" 처럼 옥텟이 빠진 것)가 조용히 통과한다. 시작 때 거절하려고 미리 막는다.
+ * 앞자리 0 도 막는다: inet_aton 은 "010" 을 8진수로 읽어서 "127.0.0.010" 이 127.0.0.8 이 된다
+ * (여기서 10진으로 검사한 값과 getaddrinfo 가 해석한 주소가 달라진다).
+ * 자릿수는 누적하기 전에 센다 (토큰이 63바이트까지라 먼저 곱하면 정수가 넘칠 수 있다) */
 static int is_odd_numeric_host(const char *h, size_t n)
 {
     size_t i, dots = 0, digits = 0;
@@ -101,6 +105,8 @@ static int is_odd_numeric_host(const char *h, size_t n)
             digits = 0;
             v = 0;
         } else {
+            if (digits == 3 || (digits == 1 && v == 0))
+                return 1;               /* 4자리 이상, 앞자리 0 ("00", "010") */
             digits++;
             v = v * 10 + (h[i] - '0');
         }
@@ -321,8 +327,8 @@ int proxy_config_load(const char *path, proxy_config *cfg)
         if (c == EOF && len == 0)
             break;                              /* 마지막 LF 뒤의 빈 끝 */
 
-        if (len > 0 && line[len - 1] == '\r')
-            len--;
+        if (c == '\n' && len > 0 && line[len - 1] == '\r')
+            len--;                              /* CRLF 만 줄 끝. LF 없이 끝난 마지막 줄의 CR 은 글자로 남겨 오류가 된다 */
         if (len > CONF_LINE_MAX) {
             conf_fail(&st, "line too long (max %d bytes)", CONF_LINE_MAX);
             goto fail;

@@ -252,6 +252,17 @@ static void test_expect_dropped_on_post(void)
     buffer_free(&out);
 }
 
+/* R11b: 클라이언트가 보낸 Via 는 원래 바이트 그대로 남고 프록시의 Via 가 그 뒤에 붙는다 */
+static void test_client_via_preserved(void)
+{
+    setup();
+    REQUIRE(parse_str("GET / HTTP/1.1\r\nHost: x\r\nvIa: 1.0 fixture-edge\r\nAccept: */*\r\n\r\n"));
+    CHECK_INT(BUILD(), 0);
+    EXPECT("GET / HTTP/1.1\r\nvIa: 1.0 fixture-edge\r\nAccept: */*\r\n" SUFFIX
+           "Connection: close\r\n\r\n");
+    buffer_free(&out);
+}
+
 /* R12 */
 static void test_verbatim_and_near_miss(void)
 {
@@ -329,8 +340,12 @@ static void test_large_body(void)
     CHECK_INT(parse_bytes(in, n), 1);
     CHECK_INT(BUILD(), 0);
     CHECK_INT(buffer_pending(&out), sizeof exp_head - 1 + HTTP_MAX_BODY);
-    CHECK_MEM(buffer_peek(&out), sizeof exp_head - 1, exp_head, sizeof exp_head - 1);
-    CHECK(memcmp(buffer_peek(&out) + sizeof exp_head - 1, in + sizeof head - 1, HTTP_MAX_BODY) == 0);
+    /* 길이가 맞을 때만 바이트를 비교한다 (실패한 빌드의 빈 출력을 기대 길이로 읽지 않도록) */
+    if (buffer_pending(&out) == sizeof exp_head - 1 + HTTP_MAX_BODY) {
+        CHECK_MEM(buffer_peek(&out), sizeof exp_head - 1, exp_head, sizeof exp_head - 1);
+        CHECK(memcmp(buffer_peek(&out) + sizeof exp_head - 1, in + sizeof head - 1,
+                     HTTP_MAX_BODY) == 0);
+    }
     free(in);
     buffer_free(&out);
 }
@@ -425,6 +440,68 @@ static void test_malformed_header_block(void)
     KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
     hand_req("GET", "/x", "X-A: 1\r\n: v\r\n");
     KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    /* 파서가 400 으로 막는 줄: 이름에 공백, 앞 공백(이어 쓰기 줄), 값에 제어 문자·맨 CR */
+    hand_req("GET", "/x", "Host : x\r\n");
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    hand_req("GET", "/x", "X-A: 1\r\n X-B: 2\r\n");
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    hand_req("GET", "/x", "X-A: a\x01" "b\r\n");
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    hand_req("GET", "/x", "X-A: a\rb\r\n");
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    hand_req("GET", "/x", "X-A: a\x7f\r\n");
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+    hand_req("GET", "/x", "X-A: a\tb\r\n");      /* 값 안의 탭은 허용 */
+    CHECK_INT(BUILD(), 0);
+    buffer_free(&out);
+}
+
+/* R21: 다시 쓴 머리의 크기 한도. "GET / HTTP/1.1\r\nHost: x\r\nX-A: <k 바이트>\r\n\r\n" 를 파서에 넘긴다 */
+static int parse_filler(size_t k)
+{
+    char *s = malloc(64 + k);
+    size_t n;
+    int ok;
+
+    if (s == NULL)
+        exit(2);
+    n = (size_t)sprintf(s, "GET / HTTP/1.1\r\nHost: x\r\nX-A: ");
+    memset(s + n, 'a', k);
+    n += k;
+    memcpy(s + n, "\r\n\r\n", 4);
+    n += 4;
+    ok = parse_bytes(s, n);
+    free(s);
+    return ok;
+}
+
+static void test_rewritten_head_size_limit(void)
+{
+    size_t k0 = 10, r0, k;
+
+    setup();
+    /* 기준: 작은 요청을 다시 쓴 길이 r0 (줄 하나의 바이트 수가 k 와 1:1 이라 r(k) = r0 + k - k0) */
+    REQUIRE(parse_filler(k0));
+    CHECK_INT(BUILD(), 0);
+    r0 = buffer_pending(&out);
+    buffer_free(&out);
+
+    /* 다시 쓴 머리가 정확히 8192 바이트: 통과 */
+    k = k0 + HTTP_MAX_HEADER - r0;
+    REQUIRE(parse_filler(k));
+    CHECK_INT(BUILD(), 0);
+    CHECK_INT(buffer_pending(&out), HTTP_MAX_HEADER);
+    buffer_free(&out);
+
+    /* 1바이트 넘으면 실패하고 out 은 그대로 */
+    REQUIRE(parse_filler(k + 1));
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
+
+    /* 프런트(파서)가 허용하는 가장 큰 머리 8192바이트: 입력이 8192 이므로 다시 쓰면 반드시 넘는다 */
+    k = HTTP_MAX_HEADER - (sizeof "GET / HTTP/1.1\r\nHost: x\r\nX-A: \r\n\r\n" - 1);
+    REQUIRE(parse_filler(k));
+    CHECK_INT(consumed, HTTP_MAX_HEADER);
+    KEEP(); CHECK_INT(BUILD(), -1); EXPECT_KEEP();
     buffer_free(&out);
 }
 
@@ -442,6 +519,7 @@ int main(void)
     RUN(test_connection_cannot_delete_generated_lines);
     RUN(test_client_host_and_xff_replaced);
     RUN(test_expect_dropped_on_post);
+    RUN(test_client_via_preserved);
     RUN(test_verbatim_and_near_miss);
     RUN(test_http10_no_headers);
     RUN(test_head_method);
@@ -451,6 +529,7 @@ int main(void)
     RUN(test_failure_at_size_limit_keeps_out);
     RUN(test_invalid_arguments);
     RUN(test_malformed_header_block);
+    RUN(test_rewritten_head_size_limit);
     free(g_buf);
     return test_report();
 }

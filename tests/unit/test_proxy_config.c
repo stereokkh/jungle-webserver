@@ -5,8 +5,10 @@
  * 로더가 stderr 에 내는 오류 메시지는 dup2 로 임시 파일에 받아서 검사한다
  * (CHECK 가 stderr 에 쓰므로 CHECK 전에 되돌려 놓는다).
  * 이름 해석(DNS)은 어떤 테스트도 하지 않는다: 숫자 주소, 대괄호 IPv6, "localhost"(/etc/hosts) 만 쓴다.
+ * 주소 조회 순서가 중요한 테스트는 이 파일에서 getaddrinfo 를 대신 정의해서(아래 fake_gai)
+ * "fixture-proxy.test" 만 정해진 결과로 돌려주고, 다른 이름은 진짜 getaddrinfo 에 넘긴다.
  */
-#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE                 /* RTLD_NEXT */
 #define _DARWIN_C_SOURCE
 #include "test.h"
 
@@ -15,6 +17,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <dlfcn.h>
 #include <unistd.h>
 
 #include "handler.h"
@@ -22,8 +25,71 @@
 #include "proxy_config.h"
 
 static proxy_config cfg;            /* 27KB 쯤이라 스택에 두지 않는다 */
+static const proxy_config zero_cfg; /* 전부 0 */
 static char g_path[64];
 static char g_msg[1024];
+
+/* ---- getaddrinfo 대체 (실행 파일에 정의하면 proxy_config.o 의 호출이 이쪽으로 온다) ----
+ * g_fake_mode: 0 = 항상 진짜, 1 = "fixture-proxy.test" 를 [::1, 127.0.0.1] 순서로, 2 = [::1] 만 */
+#define FAKE_HOST "fixture-proxy.test"
+static int g_fake_mode;
+static int g_fake_calls;
+static struct sockaddr_in6 g_fake6;
+static struct sockaddr_in g_fake4;
+static struct addrinfo g_fake_ai[2];
+
+typedef int (*gai_fn)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+typedef void (*freeai_fn)(struct addrinfo *);
+
+int getaddrinfo(const char *host, const char *service, const struct addrinfo *hints,
+                struct addrinfo **res)
+{
+    if (g_fake_mode != 0 && host != NULL && strcmp(host, FAKE_HOST) == 0) {
+        int port = service != NULL ? atoi(service) : 0;
+
+        g_fake_calls++;
+        memset(g_fake_ai, 0, sizeof g_fake_ai);
+        memset(&g_fake6, 0, sizeof g_fake6);
+        memset(&g_fake4, 0, sizeof g_fake4);
+        g_fake6.sin6_family = AF_INET6;
+        g_fake6.sin6_port = htons((unsigned short)port);
+        g_fake6.sin6_addr = in6addr_loopback;
+        g_fake4.sin_family = AF_INET;
+        g_fake4.sin_port = htons((unsigned short)port);
+        g_fake4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        g_fake_ai[0].ai_family = AF_INET6;
+        g_fake_ai[0].ai_socktype = SOCK_STREAM;
+        g_fake_ai[0].ai_addr = (struct sockaddr *)&g_fake6;
+        g_fake_ai[0].ai_addrlen = sizeof g_fake6;
+        if (g_fake_mode == 1) {
+            g_fake_ai[0].ai_next = &g_fake_ai[1];
+            g_fake_ai[1].ai_family = AF_INET;
+            g_fake_ai[1].ai_socktype = SOCK_STREAM;
+            g_fake_ai[1].ai_addr = (struct sockaddr *)&g_fake4;
+            g_fake_ai[1].ai_addrlen = sizeof g_fake4;
+        }
+        *res = &g_fake_ai[0];
+        return 0;
+    } else {
+        void *sym = dlsym(RTLD_NEXT, "getaddrinfo");
+        gai_fn real;
+
+        memcpy(&real, &sym, sizeof real);
+        return real(host, service, hints, res);
+    }
+}
+
+void freeaddrinfo(struct addrinfo *res)
+{
+    void *sym;
+    freeai_fn real;
+
+    if (res == &g_fake_ai[0])
+        return;                     /* 정적 배열이라 해제할 것이 없다 */
+    sym = dlsym(RTLD_NEXT, "freeaddrinfo");
+    memcpy(&real, &sym, sizeof real);
+    real(res);
+}
 
 /* 설정 파일 경로를 로드하면서 stderr 를 g_msg 로 받는다 */
 static int load_path(const char *path)
@@ -86,6 +152,7 @@ static void check_zeroed(void)
     CHECK_INT(cfg.nroutes, 0);
     CHECK_INT(cfg.routes[0].nbackends, 0);
     CHECK_INT(cfg.routes[0].prefix[0], 0);
+    CHECK(memcmp(&cfg, &zero_cfg, sizeof cfg) == 0);    /* 일부만 지운 것이 아니라 전부 0 */
 }
 
 /* 줄 번호가 붙은 오류: -1, cfg 전부 0, "<경로>:<줄>: ...<substr>..." */
@@ -233,6 +300,50 @@ static void test_load_name_ipv6_only_fallback(void)
     check_v6(&cfg.routes[0].backends[0], "::1", 8001);
 }
 
+/* C5c: 조회 결과가 [::1, 127.0.0.1] 순서여도 IPv4 를 고른다 (조회는 한 번, 환경과 상관없이 결정적) */
+static void test_load_prefers_ipv4_when_v6_first(void)
+{
+    g_fake_mode = 1;
+    g_fake_calls = 0;
+    CHECK_INT(conf_load("/fixture/ " FAKE_HOST ":8001\n"), 0);
+    g_fake_mode = 0;
+    CHECK_INT(g_fake_calls, 1);
+    CHECK_INT(g_msg[0], 0);
+    REQUIRE(cfg.nroutes == 1 && cfg.routes[0].nbackends == 1);
+    check_v4(&cfg.routes[0].backends[0], "127.0.0.1", 8001);
+    CHECK_STR(cfg.routes[0].backends[0].name, FAKE_HOST ":8001");
+}
+
+/* C5d: 이름이 IPv6 로만 풀리면 그 주소를 쓴다 */
+static void test_load_name_v6_only_fake(void)
+{
+    g_fake_mode = 2;
+    g_fake_calls = 0;
+    CHECK_INT(conf_load("/fixture/ " FAKE_HOST ":8001\n"), 0);
+    g_fake_mode = 0;
+    CHECK_INT(g_fake_calls, 1);
+    REQUIRE(cfg.nroutes == 1 && cfg.routes[0].nbackends == 1);
+    check_v6(&cfg.routes[0].backends[0], "::1", 8001);
+}
+
+/* C13: 명세가 허용하는 접두사 글자를 모두 받고 입력 그대로 저장한다 */
+static void test_load_prefix_all_allowed_chars(void)
+{
+    CHECK_INT(conf_load("/Az09-._~!$&'()*+,;=:@/ 127.0.0.1:1\n"), 0);
+    CHECK_INT(g_msg[0], 0);
+    REQUIRE(cfg.nroutes == 1);
+    CHECK_STR(cfg.routes[0].prefix, "/Az09-._~!$&'()*+,;=:@/");
+}
+
+/* C14: 앞자리 0 이 없으면 0 이나 세 자리 옥텟도 받는다 */
+static void test_load_ipv4_octet_edges(void)
+{
+    CHECK_INT(conf_load("/a/ 0.0.0.0:80 100.200.255.10:80\n"), 0);
+    REQUIRE(cfg.nroutes == 1 && cfg.routes[0].nbackends == 2);
+    check_v4(&cfg.routes[0].backends[0], "0.0.0.0", 80);
+    check_v4(&cfg.routes[0].backends[1], "100.200.255.10", 80);
+}
+
 static void test_load_limits_ok(void)         /* C6 */
 {
     static char text[8192];
@@ -372,6 +483,11 @@ static void test_err_invalid_backend(void)    /* E9 */
         "/a/ a:1:2\n",                 /* 마지막 ':' 에서 나눈다 → 호스트 "a:1" 이 잘못 */
         "/a/ 1:80\n", "/a/ 127.1:81\n", "/a/ 0:83\n", "/a/ 1.2.3:80\n",   /* inet_aton 옛 형식 */
         "/a/ 256.0.0.1:80\n", "/a/ 1.2.3.4.5:80\n", "/a/ 1..2.3:80\n",
+        /* 앞자리 0: getaddrinfo 는 8진수로 읽어 127.0.0.010 을 127.0.0.8 로 푼다 */
+        "/a/ 127.0.0.010:80\n", "/a/ 010.0.0.1:80\n", "/a/ 00.0.0.1:80\n", "/a/ 127.0.0.01:80\n",
+        /* 자릿수가 많은 옥텟 (UBSan: 누적하다 정수가 넘치지 않아야 한다. 토큰 59바이트) */
+        "/a/ 99999999999999999999999999999999999999999999999999.0.0.1:80\n",
+        "/a/ 1.2.3.99999999999999999999999999999999999999999999999999:80\n",
     };
     size_t i;
 
@@ -420,6 +536,27 @@ static void test_err_resolve(void)            /* E12 E13 */
 static void test_err_after_good_line(void)    /* E14 */
 {
     expect_err(conf_load("/a/ 127.0.0.1:1\nbad 127.0.0.1:2\n"), 2, "must start with '/'");
+    CHECK_INT(cfg.routes[0].nbackends, 0);      /* 첫 줄의 라우트까지 전부 지워졌다 (check_zeroed 가 전체 바이트를 본다) */
+}
+
+/* E14b: 오류 메시지는 줄바꿈 하나로 끝나는 한 줄 */
+static void test_err_message_single_line(void)
+{
+    const char *nl;
+
+    expect_err(conf_load("api/ 127.0.0.1:1\n"), 1, "must start with '/'");
+    nl = strchr(g_msg, '\n');
+    REQUIRE(nl != NULL);
+    CHECK_INT(nl[1], 0);
+}
+
+/* E14c: LF 없이 CR 로 끝난 마지막 줄은 줄 끝이 아니다 */
+static void test_err_trailing_lone_cr(void)
+{
+    expect_err(conf_load("/a/ 127.0.0.1:1\r"), 1, "invalid");
+    expect_err(conf_load("/a/ 127.0.0.1:1\n/b/ 127.0.0.1:2\r"), 2, "invalid");
+    CHECK_INT(conf_load("/a/ 127.0.0.1:1\r\n"), 0);      /* CRLF 는 그대로 받는다 */
+    CHECK_INT(cfg.nroutes, 1);
 }
 
 static void test_err_line_too_long(void)      /* E15 */
@@ -632,6 +769,10 @@ int main(void)
     RUN(test_load_ipv6);
     RUN(test_load_localhost_prefers_ipv4);
     RUN(test_load_name_ipv6_only_fallback);
+    RUN(test_load_prefers_ipv4_when_v6_first);
+    RUN(test_load_name_v6_only_fake);
+    RUN(test_load_prefix_all_allowed_chars);
+    RUN(test_load_ipv4_octet_edges);
     RUN(test_load_limits_ok);
     RUN(test_load_port_boundaries);
     RUN(test_load_prefix_127);
@@ -649,6 +790,8 @@ int main(void)
     RUN(test_err_backend_name_length);
     RUN(test_err_resolve);
     RUN(test_err_after_good_line);
+    RUN(test_err_message_single_line);
+    RUN(test_err_trailing_lone_cr);
     RUN(test_err_line_too_long);
     RUN(test_err_nul_byte);
     RUN(test_err_no_routes);

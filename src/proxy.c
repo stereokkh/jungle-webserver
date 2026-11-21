@@ -53,13 +53,22 @@ typedef struct {
     size_t vlen;
 } header_line;
 
+static int is_tchar(unsigned char c)
+{
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+        return 1;
+    return c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL;
+}
+
 /* h[pos] 에서 시작하는 줄을 읽는다. 파서가 만든 블록이면 항상 성공하고,
- * CRLF 가 없거나 ':' 가 없거나 이름이 비면 -1 (방어용) */
+ * 파서(http_request.c parse_header_line)가 400 으로 막는 모양이면 -1:
+ * CRLF 가 없음, ':' 가 없음, 이름이 비었거나 토큰 글자가 아님("Host : x", " x"),
+ * 값에 제어 문자(탭 제외)나 맨 CR·LF 가 있음. 이 함수를 직접 부르는 호출자에게도 같은 기준을 준다 */
 static int read_line(const char *h, size_t hlen, size_t pos, header_line *ln)
 {
     const char *lf = memchr(h + pos, '\n', hlen - pos);
     const char *colon;
-    size_t eol;
+    size_t eol, i;
 
     if (lf == NULL || lf == h + pos || lf[-1] != '\r')
         return -1;
@@ -67,6 +76,15 @@ static int read_line(const char *h, size_t hlen, size_t pos, header_line *ln)
     colon = memchr(h + pos, ':', eol - pos);
     if (colon == NULL || colon == h + pos)
         return -1;
+    for (i = pos; i < (size_t)(colon - h); i++)
+        if (!is_tchar((unsigned char)h[i]))
+            return -1;
+    for (i = (size_t)(colon - h) + 1; i < eol; i++) {
+        unsigned char c = (unsigned char)h[i];
+
+        if ((c < 0x20 && c != '\t') || c == 0x7F)
+            return -1;
+    }
     ln->start = h + pos;
     ln->len = (size_t)(lf - h) + 1 - pos;
     ln->name = h + pos;
@@ -185,6 +203,11 @@ int proxy_build_request(const http_request *req, const proxy_backend *backend,
         && buffer_appendf(out, "Content-Length: %zu\r\n", req->body_len) < 0)
         goto fail;
     if (buffer_append_str(out, "Connection: close\r\n\r\n") < 0)
+        goto fail;
+    /* 다시 쓴 머리(요청 줄 ~ 빈 줄)는 원래보다 길어진다 (Host 이름, X-Forwarded-For, Via, Connection).
+     * 프런트 한도에 꽉 찬 요청은 같은 바이너리인 백엔드의 한도(HTTP_MAX_HEADER)를 넘어 431 을 받으므로
+     * 보내지 않고 여기서 실패시킨다 */
+    if (buffer_pending(out) - mark > HTTP_MAX_HEADER)
         goto fail;
     if (req->body_len > 0 && buffer_append(out, req->body, req->body_len) < 0)
         goto fail;
