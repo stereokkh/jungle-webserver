@@ -53,22 +53,38 @@ wait_exit() {
     [ "$EXIT_CODE" -ne 137 ]   # 137 = 128 + SIGKILL(9): 감시 프로세스가 죽임
 }
 
-# 서버를 백그라운드로 띄우고 응답할 때까지 기다린다 (0.1초 x 50번).
-# 우리 서버가 listen 에 성공했다는 로그가 나온 뒤에만 curl 을 보낸다. 시작에 실패했으면
-# (포트 충돌 등) 바로 실패한다
+# 서버를 백그라운드로 띄우고 응답할 때까지 최대 5초 기다린다.
+# - 우리 서버가 listen 에 성공했다는 로그가 나온 뒤에만 curl 을 보낸다. 시작에 실패했으면
+#   (포트 충돌 등) 바로 실패한다
+# - 시간은 반복 횟수가 아니라 감시 프로세스로 잰다. 횟수로 세면 연결은 받는데 응답이 없는
+#   서버에서 curl 의 1초가 매번 더해진다. 4초에 마감 파일을 만들고, 마감 직전에 시작한
+#   curl 도 -m 1 로 끝나므로 전체는 5초를 넘지 않는다
 start_server() {
     "$BIN" -p "$PORT" -r "$DOCROOT" "$@" >"$LOG" 2>&1 &
     SERVER_PID=$!
-    i=0
-    while [ $i -lt 50 ]; do
-        grep -q '^webserver: cannot' "$LOG" && return 1
-        if grep -q '^webserver: listening' "$LOG"; then
-            curl -s -o /dev/null -m 1 "$URL" && return 0
+    _dl=$TMP/ready.deadline
+    rm -f "$_dl"
+    (
+        trap 'kill $_s 2>/dev/null; exit 0' TERM   # 끝낼 때 sleep 도 같이 (남지 않게)
+        sleep 4 &
+        _s=$!
+        wait $_s
+        : >"$_dl"
+    ) &
+    _wd=$!
+    _rc=1
+    while [ ! -e "$_dl" ]; do
+        grep -q '^webserver: cannot' "$LOG" && break
+        if grep -q '^webserver: listening' "$LOG" &&
+           curl -s -o /dev/null -m 1 "$URL"; then
+            _rc=0
+            break
         fi
         sleep 0.1
-        i=$((i + 1))
     done
-    return 1
+    kill "$_wd" 2>/dev/null
+    wait "$_wd" 2>/dev/null
+    return $_rc
 }
 
 # 시그널을 보내고 5초 안에 exit 0 하는지
