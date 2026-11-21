@@ -50,10 +50,10 @@
 | `static_file` | `serve_static`, `parse_uri` 정적 경로 | C · #6 |
 | `app` | `serve_dynamic` + `adder.c` (CGI 대신 함수) | C · #10 |
 | `proxy_config` | 없음 | B · #8 |
-| `proxy` | 없음 | B · #9 |
+| `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file` 은 구현·테스트 완료). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 첫 PR 에서 구현했다. 지금 서버는 요청 헤더 끝까지 받으면 고정 200 + `Connection: close` 를 보낸다. #7 다음 PR 에서 `server.c` 의 `handle_request()` 를 `docs/interfaces.md` 2~4단계(파서·정적 파일·응답)로 바꾸고, keep-alive, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃을 붙인다
 
