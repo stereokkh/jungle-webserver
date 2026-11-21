@@ -6,7 +6,8 @@
 
 ## 테스트 방법
 ```bash
-make && ./webserver 8080
+make test
+./webserver -p 8080 -r www
 ```
 
 ## 체크리스트

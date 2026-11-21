@@ -8,6 +8,17 @@
 
 ---
 
+## 2026-11-21 · 서버 CLI·listen 소켓·종료 방식 (이슈 #7 첫 PR)
+
+- **결정**:
+  1. CLI 는 `./webserver -p <port> -r <docroot> [-c <proxy.conf>]`. 포트는 1–65535 10진수, docroot 는 존재하는 디렉터리여야 한다. 아니면 서버를 띄우지 않고 exit 1. `-c` 가 있으면 시작할 때 `proxy_config_load` 하고 실패하면 exit 1 (#8 구현 전에는 항상 실패)
+  2. listen 소켓은 **IPv6 소켓 하나에 `IPV6_V6ONLY=0` 을 명시**해서 IPv4 도 받는다. IPv6 를 쓸 수 없으면(커널·컨테이너에서 꺼짐) IPv4 로 물러난다. 단 `EADDRINUSE`·`EACCES` 는 물러나지 않고 실패한다
+  3. `SIGINT`/`SIGTERM` 은 self-pipe 로 poll 을 깨운다. 받으면 listen 소켓 닫기 → 모든 연결 정리 → `server_run` 0 반환 → exit 0. 보내던 응답을 마저 보내지는 않는다
+  4. `accept` 가 fd 고갈(`EMFILE` 등)로 실패하면 종료하지 않고 100ms 동안 listen 소켓 감시를 멈춘다. 연결이 하나 닫히면 바로 재개
+  5. `tests/run.sh` 는 서버를 백그라운드로 띄우고 curl 이 성공할 때까지 최대 5초 기다린다. 종료는 감시 프로세스로 제한 시간을 잰다 (macOS 에 `timeout` 없음)
+- **이유**: 2 `net_listen` 이 fd 하나를 돌려주는 계약을 유지하면서 `localhost` 가 `::1` 로 풀리는 환경도 받기 위해 (Tiny 는 0.0.0.0 하나만 열어 `::1` 접속이 거부됨, #3). `IPV6_V6ONLY` 기본값은 OS 마다 다르다. 포트 충돌일 때 IPv4 로 물러나면 "IPv6 는 다른 프로그램이 쓰는데 IPv4 로 떠 버리는" 상황이 가려진다. 3 플래그만 쓰면 "플래그 검사 → poll 진입" 사이에 온 시그널을 놓친다. 4 그대로 두면 대기열의 연결 때문에 poll 이 계속 깨어나 CPU 를 다 쓴다
+- **영향**: `src/main.c`, `src/net.c`, `src/server.c`, `tests/run.sh`, Makefile `run`, README, PR 템플릿, CLAUDE.md. 이슈 #7 (keep-alive·모듈 연결은 다음 PR), #8 (`-c`)
+
 ## 2026-11-21 · 본문 대기 중인 NEED_MORE 는 필요한 총 길이를 알려 준다 (PR #24)
 
 - **결정**: `http_parse_request` 가 헤더는 다 받고 본문만 덜 받아 `NEED_MORE` 를 돌려줄 때 `*consumed` 에 요청 전체 길이(`head_len + body_len`)를 넣는다. 헤더가 아직이면 지금처럼 0. 서버(#7)는 이 값을 기억해 `in` 이 그만큼 찰 때까지 파서를 다시 부르지 않는다. 시그니처는 그대로
