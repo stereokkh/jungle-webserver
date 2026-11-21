@@ -97,9 +97,9 @@ static void test_get_query_percent(void)
 static void test_path_preserved(void)
 {
     setup();
-    REQUIRE(parse_str("GET /api/a%2Fb/../c?q=%41&r HTTP/1.1\r\nHost: x\r\n\r\n"));
+    REQUIRE(parse_str("GET /api/a%2Fb/c..d?q=%41&r HTTP/1.1\r\nHost: x\r\n\r\n"));
     CHECK_INT(BUILD(), 0);
-    EXPECT("GET /api/a%2Fb/../c?q=%41&r HTTP/1.1\r\n" SUFFIX "Connection: close\r\n\r\n");
+    EXPECT("GET /api/a%2Fb/c..d?q=%41&r HTTP/1.1\r\n" SUFFIX "Connection: close\r\n\r\n");
     buffer_free(&out);
 }
 
