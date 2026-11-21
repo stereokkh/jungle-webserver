@@ -41,8 +41,11 @@ $(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)/unit
 $(BUILD_DIR) $(BUILD_DIR)/unit:
 	mkdir -p $@
 
+# make run [PORT=8080] [DOCROOT=www]
+PORT    ?= 8080
+DOCROOT ?= www
 run: $(TARGET)
-	./$(TARGET) 8080
+	./$(TARGET) -p $(PORT) -r $(DOCROOT)
 
 # make unit → 단위 테스트만, make test → 단위 테스트 + 스모크 테스트 (CI·docker-test 도 이것)
 unit: $(UNIT_BINS)
