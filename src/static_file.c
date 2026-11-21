@@ -17,6 +17,9 @@
  *   5. 일반 파일이 아니면 403 (FIFO 를 open 하면 멈추므로 open 전에 검사)
  *   6. open → fstat 으로 크기, mime_type 으로 Content-Type
  */
+/* realpath 는 XSI 확장이라 musl·clang 에서는 _POSIX_C_SOURCE 만으로 선언이 안 보인다 */
+#define _XOPEN_SOURCE 700
+
 #include "static_file.h"
 #include "mime.h"
 

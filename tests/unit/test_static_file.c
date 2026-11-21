@@ -6,6 +6,10 @@
  *   - 나눠 보내기: non-blocking pipe 를 소켓 대신 써서 EAGAIN·이어 보내기·SIGPIPE
  * 를 확인한다.
  */
+/* mkdtemp·realpath 선언: musl 은 _XOPEN_SOURCE, macOS 는 _DARWIN_C_SOURCE 가 있어야 보인다 */
+#define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE
+
 #include "test.h"
 
 #include "static_file.h"
