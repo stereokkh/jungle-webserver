@@ -102,7 +102,7 @@ scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
-docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), (예정) benchmark.md
+docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), benchmark.md (처리량·Tiny 비교·프록시 경유, #11)
 .claude/    settings.json (팀 공용 훅: 세션 동기화)
 www/        정적 파일 예제
 ```
@@ -203,9 +203,8 @@ Claude의 노션 사용 범위:
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10) 완료. 프록시 중계(#9)는 구현했고 리뷰 대기 중이다 (`server.c` 의 업스트림 상태 변경은 A 트랙 건호님 확인 필요)
+- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10), 프록시 중계(#9, PR #36) 완료. 남은 것은 정적 파일 keep-alive 응답의 약 44ms 지연 (`TCP_NODELAY`, `server.c`, `docs/benchmark.md`)
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
-- `docs/benchmark.md` → 이슈 #11
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)
 - 노션 접근: 2026-11-20 새 주소로 프로젝트 페이지 읽기 확인됨 (claude.ai Notion 커넥터). 저장소 `.mcp.json` 의 Notion MCP 로그인은 팀원별로 확인 필요
