@@ -3,6 +3,7 @@
 #   sh 가 아니라 bash (/dev/tcp 로 연결만 열어 두는 데 씀)
 #   bash scripts/bench.sh            # 우리 서버 + (classic/tiny 가 있으면) Tiny
 #   REPS=5 N=20000 bash scripts/bench.sh
+#   BIN=/다른/빌드/webserver bash scripts/bench.sh   # 이 폴더를 빌드하지 않고 그 바이너리로 잼
 # 측정용이라 CI·make test 에는 넣지 않는다. sanitizer 빌드는 측정하지 않는다 (일반 -O2 빌드만)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,9 +13,10 @@ N=${N:-10000}          # ab 요청 수
 CONCS=${CONCS:-"10 100 1000"}
 P_OURS=18501
 P_TINY=18502
+P_B1=18511 P_B2=18512 P_FRONT=18513   # 프록시: 백엔드 2개 + 프런트
 
 command -v ab >/dev/null || { echo "ab 가 필요함: sudo apt install apache2-utils" >&2; exit 1; }
-make -s webserver
+if [ -z "${BIN:-}" ]; then make -s webserver; BIN=$(pwd)/webserver; fi
 HAVE_TINY=0; [ -x classic/tiny ] && HAVE_TINY=1
 
 W=$(mktemp -d /tmp/bench.XXXXXX)
@@ -23,13 +25,18 @@ stop() {
     if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
     PID=""
 }
-trap 'stop; rm -rf "$W"' EXIT
+PX_PIDS=()
+stop_px() {
+    local p
+    for p in "${PX_PIDS[@]}"; do kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; done
+    PX_PIDS=()
+}
+trap 'stop; stop_px; rm -rf "$W"' EXIT
 
 # 같은 파일을 두 서버가 같은 폴더에서 준다. Tiny 는 현재 폴더 기준으로 파일을 찾음
 yes 'jungle webserver benchmark' | head -c 4096 > "$W/bench.html" || true   # yes 는 SIGPIPE 로 끝남
 head -c 20000000 /dev/zero > "$W/big.bin"
 [ "$HAVE_TINY" = 1 ] && cp classic/tiny "$W/"
-BIN=$(pwd)/webserver
 
 start() {   # start ours|tiny
     stop
@@ -62,7 +69,7 @@ run_ab() {   # run_ab 이름 동시성 [ab 추가 옵션]
     local name=$1 c=$2; shift 2
     local rps=() p50=() p99=() fail=0 non2xx=0 out
     for _ in $(seq "$REPS"); do
-        out=$(ab -r -q -s 30 -n "$N" -c "$c" "$@" "http://127.0.0.1:$PORT/bench.html" 2>&1) || true
+        out=$(ab -r -q -s 30 -n "$N" -c "$c" "$@" "http://127.0.0.1:$PORT${URLPATH:-/bench.html}" 2>&1) || true
         rps+=("$(awk '/^Requests per second/ {print $4}' <<<"$out")")
         p50+=("$(awk '$1=="50%" {print $2}' <<<"$out")")
         p99+=("$(awk '$1=="99%" {print $2}' <<<"$out")")
@@ -136,3 +143,31 @@ for k in garbage long hangup; do
     done
     echo "$row |"
 done
+stop
+echo
+
+# 프록시: 같은 바이너리로 백엔드 2개(-c 없음) + 프런트(/api/ → 두 백엔드). /api/add 는 앱이 답하는 작은 응답
+bg() {   # bg 포트 [서버 인자...]: 띄우고 /api/add 가 200 일 때까지 기다림
+    local port=$1; shift
+    "$BIN" -p "$port" -r "$W" "$@" 2>>"$W/px.log" & PX_PIDS+=($!)
+    for _ in $(seq 50); do
+        [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/add?a=1&b=2")" = 200 ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+echo "## 프록시 (/api/add?a=1&b=2, ab, 연결 재사용 없음, 중앙값)"
+printf '/api/ 127.0.0.1:%s 127.0.0.1:%s\n' "$P_B1" "$P_B2" > "$W/proxy.conf"
+if bg "$P_B1" && bg "$P_B2" && bg "$P_FRONT" -c "$W/proxy.conf" &&
+   [ "$(curl -s "http://127.0.0.1:$P_FRONT/api/add?a=1&b=2")" = 3 ]; then
+    echo "- 본문 일치: 직접 = 경유 = 3"
+    echo "| 경로 | 동시성 | 요청/초 | p50 ms | p99 ms | 실패 / non-2xx / 전체 |"
+    echo "|---|---|---|---|---|---|"
+    for c in $CONCS; do
+        PORT=$P_B1    URLPATH='/api/add?a=1&b=2' run_ab "백엔드 직접" "$c"
+        PORT=$P_FRONT URLPATH='/api/add?a=1&b=2' run_ab "프런트 경유 (백엔드 2개)" "$c"
+    done
+else
+    echo "- 건너뜀: 이 바이너리는 /api/ 를 중계하지 못함 (PR #36 이전 빌드)"
+fi
+stop_px
