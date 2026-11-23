@@ -11,7 +11,8 @@
  * 루프 한 바퀴:
  *   1. 유휴 시간을 넘긴 연결을 닫고, poll 대기 시간을 가장 먼저 만료될 연결 기준으로 정한다
  *   2. pollfd 목록을 새로 만든다: [0] 시그널 파이프, [1] listen 소켓, [2..] 연결
- *      (연결 상태에 따라 POLLIN 또는 POLLOUT 중 하나만 감시)
+ *      (연결 상태에 따라 POLLIN 또는 POLLOUT 중 하나만 감시. 프록시 중인 연결은 클라이언트 fd 와
+ *       업스트림 fd 로 칸을 둘 쓰고, 칸마다 어느 fd 인지(pfd_kind)를 기억한다)
  *   3. poll → 연결 이벤트 처리 → 마지막에 accept
  *      (accept 를 먼저 하면 방금 닫은 칸에 새 연결이 들어가서, 같은 칸을 가리키는
  *       이전 pollfd 의 revents 가 새 연결에 잘못 적용될 수 있다)
@@ -21,12 +22,16 @@
  *     → keep-alive 면 READING (남은 입력에 다음 요청이 있으면 바로 처리 = 파이프라이닝)
  *     → 아니면 LINGERING (송신만 닫고 남은 입력을 읽어 버리다가 닫음)
  *   파서 오류 → 오류 응답 → CLOSING ─다 보냄→ LINGERING
+ *   프록시 경로 (#9): 응답을 만들지 않고 업스트림 연결을 시작한다
+ *     UP_CONNECTING ─연결됨→ UP_SENDING ─요청 다 보냄→ UP_RECEIVING ─응답 끝→ WRITING (남은 out 을 보내고 닫기)
+ *     응답 시작 전 실패는 502/504 를 out 에 쓰고 WRITING, 시작 후 실패는 남은 out 만 보내고 닫는다.
+ *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 pollfd 를 최대 둘 쓴다
  *
  * Tiny 와 다른 점: 요청마다 연결을 닫지 않는다 (keep-alive), 한 연결이 느려도 다른 연결은
  * 계속 처리된다, 요청 하나를 받는 시간에 상한이 있다, 오류 응답이 RST 로 사라지지 않게
  * lingering close 를 한다.
  *
- * 담당: 트랙 A · 이슈 #7
+ * 담당: 트랙 A · 이슈 #7 (프록시 상태 통합은 #9)
  */
 #include "server.h"
 #include "net.h"
@@ -37,10 +42,13 @@
 #include "http_response.h"
 #include "app.h"
 #include "proxy_config.h"
+#include "proxy.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -70,7 +78,9 @@ typedef enum {
     CONN_READING,        /* 요청을 읽는 중 (POLLIN). 파서가 NEED_MORE */
     CONN_WRITING,        /* out 버퍼를 보내는 중 (POLLOUT). EAGAIN 이면 다음 POLLOUT 까지 대기 */
     CONN_SENDING_FILE,   /* 헤더를 다 보내고 파일 조각을 보내는 중 (POLLOUT) */
-    CONN_UPSTREAM,       /* 프록시: 백엔드 연결·송수신 중 (#9 에서 세분화) */
+    CONN_UP_CONNECTING,  /* 프록시: 업스트림 connect 진행 중 (업스트림 POLLOUT) */
+    CONN_UP_SENDING,     /* 프록시: 다시 쓴 요청을 업스트림에 보내는 중 (업스트림 POLLOUT) */
+    CONN_UP_RECEIVING,   /* 프록시: 응답을 읽어 out 으로 중계 중 (업스트림 POLLIN, 시작 후 out 이 있으면 클라이언트 POLLOUT) */
     CONN_CLOSING,        /* 오류 응답을 보내는 중 (POLLOUT). 다 보내면 LINGERING */
     CONN_LINGERING       /* 송신을 닫았다 (POLLIN). 받은 건 버리고 EOF·마감이면 닫는다 */
 } conn_state;
@@ -84,7 +94,11 @@ typedef struct {
     int keep_alive;          /* 이번 응답 후 연결 유지 여부 */
     static_file file;        /* CONN_SENDING_FILE 일 때 */
     int upstream_fd;         /* 프록시 백엔드 소켓, 없으면 -1 (#9) */
-    buffer up_out;           /* 백엔드로 보낼 요청 (#9) */
+    buffer up_out;           /* 백엔드로 보낼 요청 (#9). out 처럼 off 가 송신 진행 상태 */
+    proxy_relay relay;       /* 업스트림 응답 머리 해석·본문 경계 (#9). calloc 0 이어도 free 해도 안전 */
+    int64_t up_start_ms;     /* 요청을 프록시에 넘긴 시각 (응답 시작 전 마감의 기준) */
+    int64_t up_last_ms;      /* 시작 후: 마지막 업스트림 바이트 또는 클라이언트 쓰기 진행 시각 (역압력으로 쉰 시간은 안 센다) */
+    char client_ip[INET6_ADDRSTRLEN];   /* X-Forwarded-For 용. accept 때 채운다 (C7) */
     int64_t last_active_ms;  /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
     int64_t req_start_ms;    /* 지금 요청의 첫 바이트를 받은 시각, 없으면 0 (CLIENT_REQUEST_TIMEOUT_MS) */
     int64_t linger_end_ms;   /* LINGERING 의 마감 (CLIENT_LINGER_TIMEOUT_MS) */
@@ -94,6 +108,13 @@ typedef struct {
 /* pollfd 목록의 고정 위치 */
 enum { PFD_SIGNAL = 0, PFD_LISTEN = 1, PFD_FIRST_CONN = 2 };
 
+/* 프록시 연결은 pollfd 를 둘(클라이언트, 업스트림) 쓴다. 칸 하나가 가리키는 fd 의 종류 */
+enum { PFD_KIND_CLIENT = 0, PFD_KIND_UPSTREAM = 1 };
+#define PFD_MAX (PFD_FIRST_CONN + 2 * SERVER_MAX_CONNS)
+
+/* respond() 의 반환: 응답을 out 에 만들었다 / 응답 대신 업스트림 연결을 시작했다 */
+enum { RESPOND_OUT = 0, RESPOND_PROXY = 1 };
+
 /* 서버 전체 상태. 배열이 커서(수십 KB) 스택이 아니라 힙에 둔다 */
 typedef struct {
     const server_config *cfg;
@@ -101,8 +122,9 @@ typedef struct {
     int64_t accept_resume_ms;                   /* 0 이 아니면 이 시각까지 accept 쉼 */
     conn *conns[SERVER_MAX_CONNS];              /* 빈 칸은 NULL */
     size_t nconns;
-    struct pollfd pfds[PFD_FIRST_CONN + SERVER_MAX_CONNS];
-    size_t pfd_slot[PFD_FIRST_CONN + SERVER_MAX_CONNS];   /* pfds[i] 가 가리키는 conns 칸 */
+    struct pollfd pfds[PFD_MAX];
+    size_t pfd_slot[PFD_MAX];                   /* pfds[i] 가 가리키는 conns 칸 */
+    int pfd_kind[PFD_MAX];                      /* pfds[i] 가 클라이언트 fd 인지 업스트림 fd 인지 */
     proxy_config proxy;                         /* -c 가 있을 때만 (서버 수명 동안 유지) */
     int has_proxy;
     http_parse_options parse_opt;               /* 요청마다 같은 파서 옵션 (#31) */
@@ -197,6 +219,29 @@ static int would_block(int err)
  * 연결 생성·정리
  * --------------------------------------------------------------- */
 
+/* 상대 주소를 숫자 문자열로 (X-Forwarded-For). 얻지 못하면 "unknown".
+ * IPv6 소켓으로 들어온 IPv4 클라이언트("::ffff:1.2.3.4")는 "1.2.3.4" 로 쓴다 (C7) */
+static void fill_client_ip(int fd, char *buf, size_t size)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+
+    memset(&ss, 0, sizeof ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &len) < 0 ||
+        getnameinfo((struct sockaddr *)&ss, len, buf, (socklen_t)size, NULL, 0, NI_NUMERICHOST) != 0) {
+        snprintf(buf, size, "unknown");
+        return;
+    }
+    {
+        char *pct = strchr(buf, '%');               /* 링크 로컬 주소의 "%인터페이스" 꼬리는 헤더 값에 쓰지 않는다 */
+
+        if (pct != NULL)
+            *pct = '\0';
+    }
+    if (strncmp(buf, "::ffff:", 7) == 0 && strchr(buf, '.') != NULL)
+        memmove(buf, buf + 7, strlen(buf + 7) + 1);
+}
+
 static int conn_open(server *s, int fd)
 {
     size_t i;
@@ -213,6 +258,7 @@ static int conn_open(server *s, int fd)
     c->state = CONN_READING;
     c->file.fd = -1;            /* calloc 의 0 은 "fd 0 열림"으로 읽힌다 */
     c->upstream_fd = -1;
+    fill_client_ip(fd, c->client_ip, sizeof c->client_ip);
     c->last_active_ms = now_ms();
     s->conns[i] = c;
     s->nconns++;
@@ -233,6 +279,7 @@ static void conn_close(server *s, size_t slot)
     buffer_free(&c->in);
     buffer_free(&c->out);
     buffer_free(&c->up_out);
+    proxy_relay_free(&c->relay);
     free(c);
     s->conns[slot] = NULL;
     s->nconns--;
@@ -275,9 +322,41 @@ static int respond_static(server *s, conn *c, int head)
     return 0;
 }
 
+/* ROUTE_PROXY: 다시 쓴 요청을 up_out 에 만들고 업스트림 connect 를 시작한다 (#9).
+ * 프록시 응답 뒤에는 항상 연결을 닫으므로 keep_alive 는 0 (백엔드에도 Connection: close 를 보냈다).
+ * proxy_build_request 는 요청이 in 을 가리키는 동안(consume 전) 불러야 한다 */
+static int respond_proxy(conn *c, proxy_route *route, int head)
+{
+    const proxy_backend *backend = proxy_next_backend(route);
+    int64_t now = now_ms();   /* 결정 4a: 요청을 프록시에 넘긴 시각. 재구성·connect 시작 시간도 마감에 든다 */
+    int fd;
+
+    c->keep_alive = 0;
+    if (backend == NULL)
+        return http_append_error(&c->out, 502, 0, head, NULL);
+    if (proxy_build_request(&c->req, backend, c->client_ip, &c->up_out) < 0) {
+        /* 파서·설정 로더가 막아 주므로 남는 실패는 "다시 쓴 머리가 HTTP_MAX_HEADER 초과"와 메모리 부족뿐.
+         * 앞의 것이 현실적인 원인이라 431 로 답한다 */
+        return http_append_error(&c->out, 431, 0, head, NULL);
+    }
+    fd = proxy_connect_start(backend);
+    if (fd < 0) {
+        buffer_free(&c->up_out);
+        return http_append_error(&c->out, 502, 0, head, NULL);
+    }
+    c->upstream_fd = fd;
+    proxy_relay_init(&c->relay, head);
+    c->up_start_ms = now;
+    c->up_last_ms = now;
+    c->last_active_ms = now_ms();
+    c->state = CONN_UP_CONNECTING;
+    return RESPOND_PROXY;
+}
+
 /*
  * 파서가 DONE 을 돌려준 요청 하나의 응답을 out 에 만든다. 처리 순서: 프록시 → 앱 → 정적.
- * 반환 0 (4xx·5xx 응답을 쓴 것도 성공), -1 응답을 못 씀 (메모리 부족 → 연결 닫기)
+ * 반환 RESPOND_OUT (4xx·5xx 응답을 쓴 것도 성공), RESPOND_PROXY (업스트림 연결을 시작함: out 은 비어 있고
+ * 상태는 UP_CONNECTING), -1 응답을 못 씀 (메모리 부족 → 연결 닫기)
  */
 static int respond(server *s, conn *c)
 {
@@ -286,13 +365,10 @@ static int respond(server *s, conn *c)
 
     switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
     case ROUTE_PROXY:
-        /* TODO(#9): proxy_build_request → proxy_connect_start → CONN_UPSTREAM.
-         * #9 전까지는 프록시 경로에 502 로 답하고 닫는다 (#8 설정 로드가 머지되면 -c 로 여기 온다) */
-        c->keep_alive = 0;
-        return http_append_error(&c->out, 502, 0, head, NULL);
+        return respond_proxy(c, route, head);
     case ROUTE_APP:
         if (app_handle(&c->req, s->cfg->port, &c->out) == 0)
-            return 0;
+            return RESPOND_OUT;
         /* TODO(#10): app_handle 은 메모리 부족일 때만 -1 이지만, #10 전까지는 스텁이 항상 -1 이다.
          * 연결을 그냥 끊지 않고 500 으로 답한다 (out 은 app_handle 이 그대로 둠).
          * #10 뒤에도 남겨도 무해하다: 정말 메모리가 없으면 500 도 못 써서 -1 → 연결 닫기 */
@@ -300,7 +376,7 @@ static int respond(server *s, conn *c)
         return http_append_error(&c->out, 500, 0, head, NULL);
     case ROUTE_STATIC:
     default:
-        return respond_static(s, c, head);
+        return respond_static(s, c, head);   /* 0 == RESPOND_OUT */
     }
 }
 
@@ -311,7 +387,7 @@ static int respond(server *s, conn *c)
 static int handle_request(server *s, conn *c)
 {
     size_t pending = buffer_pending(&c->in), consumed = 0;
-    int status = 0;
+    int status = 0, rr;
     parse_result r;
 
     if (pending == 0)
@@ -343,11 +419,13 @@ static int handle_request(server *s, conn *c)
     }
 
     c->keep_alive = c->req.keep_alive;
-    if (respond(s, c) < 0)
+    rr = respond(s, c);
+    if (rr < 0)
         return -1;
     /* 응답을 다 만든 뒤에 consume (req.headers/body 가 in 안을 가리킨다) */
     buffer_consume(&c->in, consumed);
-    c->state = CONN_WRITING;
+    if (rr == RESPOND_OUT)
+        c->state = CONN_WRITING;   /* RESPOND_PROXY 는 respond_proxy 가 UP_CONNECTING 으로 정해 두었다 */
     return 0;
 }
 
@@ -482,6 +560,190 @@ static void conn_on_writable(server *s, size_t slot)
 }
 
 /* ---------------------------------------------------------------
+ * 프록시: 업스트림 연결·송신·중계 (#9)
+ * --------------------------------------------------------------- */
+
+/* 업스트림 fd·요청·중계 상태를 정리한다 (conn_close 와 달리 클라이언트 연결은 둔다) */
+static void up_release(conn *c)
+{
+    if (c->upstream_fd >= 0)
+        close(c->upstream_fd);
+    c->upstream_fd = -1;
+    buffer_free(&c->up_out);
+    proxy_relay_free(&c->relay);
+}
+
+/* 응답 시작 전 실패(결정 2): 업스트림을 닫고 502/504 를 out 에 써서 WRITING 으로. 보낸 뒤 연결을 닫는다 */
+static void up_fail(server *s, size_t slot, int code)
+{
+    conn *c = s->conns[slot];
+    int head = c->relay.request_was_head;
+
+    up_release(c);
+    c->keep_alive = 0;
+    c->last_active_ms = now_ms();   /* 클라이언트 유휴 타이머는 이 응답을 쓰는 시점부터 */
+    if (http_append_error(&c->out, code, 0, head, NULL) < 0) {
+        conn_close(s, slot);
+        return;
+    }
+    c->state = CONN_WRITING;
+}
+
+/* 응답 끝(COMPLETE) 또는 시작 후 업스트림이 일찍 끊김(TRUNCATED): 업스트림을 닫고 out 에 남은 걸
+ * 기존 WRITING 경로로 보낸 뒤 닫는다. out 이 이미 비었으면 바로 닫는 쪽으로 */
+static void up_finish(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+
+    up_release(c);
+    c->keep_alive = 0;
+    c->state = CONN_WRITING;
+    if (buffer_pending(&c->out) == 0)
+        conn_response_done(s, slot);
+}
+
+/* 클라이언트 out 에 더 쌓아도 되는 바이트 (PROXY_RELAY_MAX 까지) */
+static size_t up_room(const conn *c)
+{
+    size_t pending = buffer_pending(&c->out);
+
+    return pending < PROXY_RELAY_MAX ? PROXY_RELAY_MAX - pending : 0;
+}
+
+/* 역압력: relay 가 지금 더 받을 바이트가 0 (out 이 PROXY_RELAY_MAX 까지 찼거나 응답을 끝까지 받음).
+ * 이때는 업스트림을 읽지 않고 업스트림 유휴 시계도 세지 않는다 (결정 4b) */
+static int up_paused(const conn *c)
+{
+    return proxy_relay_want(&c->relay, up_room(c)) == 0;
+}
+
+static int is_up_state(conn_state st)
+{
+    return st == CONN_UP_CONNECTING || st == CONN_UP_SENDING || st == CONN_UP_RECEIVING;
+}
+
+/* UP_SENDING: up_out 을 업스트림으로. write 한 번, EAGAIN 이면 다음 POLLOUT 에 이어서 */
+static void up_send(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+    ssize_t n = write(c->upstream_fd, buffer_peek(&c->up_out), buffer_pending(&c->up_out));
+
+    if (n < 0) {
+        if (!would_block(errno))
+            up_fail(s, slot, 502);   /* EPIPE, ECONNRESET: 백엔드가 요청을 받지 못했다 */
+        return;
+    }
+    buffer_consume(&c->up_out, (size_t)n);
+    if (buffer_pending(&c->up_out) > 0)
+        return;
+    buffer_free(&c->up_out);
+    c->state = CONN_UP_RECEIVING;
+    c->up_last_ms = now_ms();
+}
+
+/* UP_RECEIVING: 업스트림에서 읽어 relay 에 먹인다. read 한 번 (남은 건 poll 이 다시 알려 준다) */
+static void up_receive(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+    char tmp[16384];
+    size_t want = proxy_relay_want(&c->relay, up_room(c));
+    proxy_relay_result r;
+    ssize_t n;
+
+    if (want == 0)
+        return;
+    if (want > sizeof tmp)
+        want = sizeof tmp;
+    n = read(c->upstream_fd, tmp, want);
+    if (n < 0 && would_block(errno))
+        return;
+    if (n > 0) {
+        c->up_last_ms = now_ms();
+        r = proxy_relay_input(&c->relay, tmp, (size_t)n, &c->out);
+    } else {
+        r = proxy_relay_eof(&c->relay);   /* n == 0 (EOF) 또는 read 오류: 둘 다 업스트림이 끝난 것 */
+    }
+    switch (r) {
+    case PROXY_RELAY_MORE:
+        return;
+    case PROXY_RELAY_COMPLETE:
+    case PROXY_RELAY_TRUNCATED:
+        up_finish(s, slot);
+        return;
+    case PROXY_RELAY_NOMEM:
+        if (c->relay.started)
+            up_finish(s, slot);        /* 이미 응답이 나갔다: 대기 중인 out 은 보내고 닫는다 (결정 2) */
+        else
+            up_fail(s, slot, 502);
+        return;
+    case PROXY_RELAY_BAD:
+    default:
+        up_fail(s, slot, 502);
+        return;
+    }
+}
+
+/* 업스트림 fd 의 이벤트. 상태가 바뀌면 이어서 처리한다 (연결됨 → 바로 송신 시도) */
+static void up_on_event(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+
+    /* 같은 poll 배치의 앞 이벤트를 처리하는 동안 마감이 지났을 수 있다. 시작 전이면 늦게 완성된 머리도 504 (결정 4a) */
+    if (!c->relay.started && now_ms() >= c->up_start_ms + UPSTREAM_TIMEOUT_MS) {
+        up_fail(s, slot, 504);
+        return;
+    }
+    /* 시작 후: 읽으려고 기다리던 마감이 이미 지났으면 늦게 온 바이트는 받지 않고 대기분만 보내고 닫는다 (결정 4b) */
+    if (c->relay.started && c->state == CONN_UP_RECEIVING &&
+        !up_paused(c) &&
+        now_ms() >= c->up_last_ms + UPSTREAM_TIMEOUT_MS) {
+        up_finish(s, slot);
+        return;
+    }
+    if (c->state == CONN_UP_CONNECTING) {
+        /* POLLOUT·POLLERR·POLLHUP 어느 쪽이 와도 getsockopt(SO_ERROR) 만으로 판단 (결정 5) */
+        if (proxy_connect_result(c->upstream_fd) != 0) {
+            up_fail(s, slot, 502);
+            return;
+        }
+        c->state = CONN_UP_SENDING;
+    }
+    if (c->state == CONN_UP_SENDING) {
+        up_send(s, slot);
+        return;
+    }
+    if (c->state == CONN_UP_RECEIVING)
+        up_receive(s, slot);   /* HUP 이어도 read 결과(남은 데이터 또는 0)로 판단 */
+}
+
+/* UP_* 상태의 클라이언트 fd 이벤트: 끊김은 모두 닫기, 응답 시작 후 POLLOUT 이면 out 을 보낸다 */
+static void up_on_client_event(server *s, size_t slot, short re)
+{
+    conn *c = s->conns[slot];
+    ssize_t n;
+    int was_paused = up_paused(c);
+
+    if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+        conn_close(s, slot);       /* 업스트림 fd 도 같이 닫힌다 */
+        return;
+    }
+    if (!(re & POLLOUT) || buffer_pending(&c->out) == 0)
+        return;
+    n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
+    if (n < 0) {
+        if (!would_block(errno))
+            conn_close(s, slot);
+        return;
+    }
+    buffer_consume(&c->out, (size_t)n);
+    c->last_active_ms = now_ms();
+    /* 역압력으로 읽기를 쉬던 연결이 다시 읽게 된 순간에만 업스트림 유휴 시계를 새로 시작한다.
+     * 쉬지 않았다면 클라이언트 쓰기는 업스트림 유휴와 상관없다 (결정 4b) */
+    if (was_paused && !up_paused(c))
+        c->up_last_ms = c->last_active_ms;
+}
+
+/* ---------------------------------------------------------------
  * accept
  * --------------------------------------------------------------- */
 
@@ -525,6 +787,18 @@ static int64_t conn_deadline(const conn *c)
     if (c->state == CONN_READING && c->req_start_ms != 0 &&
         c->req_start_ms + CLIENT_REQUEST_TIMEOUT_MS < d)
         d = c->req_start_ms + CLIENT_REQUEST_TIMEOUT_MS;
+    if (is_up_state(c->state)) {
+        /* 시계가 둘이다. 응답 시작 전: 요청을 넘긴 때부터 UPSTREAM_TIMEOUT_MS (넘으면 504).
+         * 시작 후: 업스트림 유휴, 단 우리가 읽으려고 기다릴 때만 (역압력으로 멈춘 동안은 클라이언트 유휴가 맡는다) */
+        int64_t u = -1;
+
+        if (!c->relay.started)
+            u = c->up_start_ms + UPSTREAM_TIMEOUT_MS;
+        else if (!up_paused(c))
+            u = c->up_last_ms + UPSTREAM_TIMEOUT_MS;
+        if (u >= 0 && u < d)
+            d = u;
+    }
     return d;
 }
 
@@ -540,6 +814,21 @@ static int expire_idle(server *s, int64_t now)
 
         if (c == NULL)
             continue;
+        if (is_up_state(c->state) && !c->relay.started &&
+            now >= c->up_start_ms + UPSTREAM_TIMEOUT_MS) {
+            up_fail(s, i, 504);        /* 응답 시작 전 시간 초과: 닫지 않고 504 를 보낸다 */
+            c = s->conns[i];
+            if (c == NULL)
+                continue;
+        }
+        if (is_up_state(c->state) && c->relay.started &&
+            !up_paused(c) &&
+            now >= c->up_last_ms + UPSTREAM_TIMEOUT_MS) {
+            up_finish(s, i);           /* 시작 후 업스트림 유휴: 이미 받아 둔 out 은 보내고 닫는다 (결정 2) */
+            c = s->conns[i];
+            if (c == NULL)
+                continue;
+        }
         left = conn_deadline(c) - now;
         if (left <= 0)
             conn_close(s, i);
@@ -572,9 +861,25 @@ static size_t build_pollfds(server *s)
         if (c == NULL)
             continue;
         s->pfds[n].fd = c->fd;
-        s->pfds[n].events =
-            (c->state == CONN_READING || c->state == CONN_LINGERING) ? POLLIN : POLLOUT;
         s->pfd_slot[n] = i;
+        s->pfd_kind[n] = PFD_KIND_CLIENT;
+        if (!is_up_state(c->state)) {
+            s->pfds[n].events =
+                (c->state == CONN_READING || c->state == CONN_LINGERING) ? POLLIN : POLLOUT;
+            n++;
+            continue;
+        }
+        /* 프록시: 클라이언트 입력은 읽지 않는다 (C6). events 0 이어도 POLLHUP/POLLERR 는 온다.
+         * 응답이 시작돼 out 에 바이트가 있을 때만 POLLOUT */
+        s->pfds[n].events = (c->state == CONN_UP_RECEIVING && buffer_pending(&c->out) > 0) ? POLLOUT : 0;
+        n++;
+        s->pfds[n].fd = c->upstream_fd;
+        s->pfds[n].events = c->state == CONN_UP_RECEIVING ? POLLIN : POLLOUT;
+        /* 받는 중에 out 이 가득 차 읽을 바이트가 0 이면 음수 fd 로 poll 이 무시하게 한다 */
+        if (c->state == CONN_UP_RECEIVING && up_paused(c))
+            s->pfds[n].fd = -1;
+        s->pfd_slot[n] = i;
+        s->pfd_kind[n] = PFD_KIND_UPSTREAM;
         n++;
     }
     for (i = 0; i < n; i++)
@@ -593,7 +898,14 @@ static void dispatch(server *s, size_t npfds)
 
         if (re == 0 || c == NULL)
             continue;
-        if (re & (POLLERR | POLLNVAL)) {
+        if (s->pfd_kind[i] == PFD_KIND_UPSTREAM) {
+            /* 같은 연결의 앞 항목(클라이언트)이 연결을 닫았거나 상태를 바꿨을 수 있다 → 낡은 항목은 건너뜀 */
+            if (c->upstream_fd != s->pfds[i].fd || !is_up_state(c->state))
+                continue;
+            up_on_event(s, slot);
+        } else if (is_up_state(c->state)) {
+            up_on_client_event(s, slot, re);
+        } else if (re & (POLLERR | POLLNVAL)) {
             conn_close(s, slot);
         } else if (c->state == CONN_READING || c->state == CONN_LINGERING) {
             if (re & (POLLIN | POLLHUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */

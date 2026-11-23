@@ -24,7 +24,7 @@ typedef struct {
     char prefix[128];               /* "/api/" */
     proxy_backend backends[PROXY_MAX_BACKENDS];
     size_t nbackends;
-    size_t next;                    /* Round-Robin 다음 순번 (#9) */
+    size_t next;                    /* Round-Robin 다음 순번 (proxy_next_backend 가 돌린다) */
 } proxy_route;
 
 typedef struct {
@@ -76,7 +76,8 @@ int proxy_config_load(const char *path, proxy_config *cfg);
  */
 proxy_route *proxy_match(proxy_config *cfg, const char *target);
 
-/* 라우트의 다음 백엔드 (Round-Robin) */
+/* 라우트의 다음 백엔드 (Round-Robin, #9). 부를 때마다 route->next 를 돌려 0, 1, ..., n-1, 0 ... 순으로
+ * 돌려준다. route 가 NULL 이거나 백엔드가 없으면 NULL. 재시도·페일오버 없음 (죽은 백엔드 차례면 502) */
 const proxy_backend *proxy_next_backend(proxy_route *route);
 
 #endif /* PROXY_CONFIG_H */

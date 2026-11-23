@@ -7,11 +7,14 @@
 #   curl 만 보면 포트를 다른 서버가 쓰고 있을 때 그 서버의 응답을 준비 완료로 착각한다.
 # - 서버를 기다리는 함수는 $(...) 안에서 부르지 않는다. 서브셸은 서버의 부모가 아니라서
 #   wait 로 회수하지 못하고, 끝난 서버가 좀비로 남아 kill -0 이 계속 성공한다 ("안 꺼짐" 오판).
+# - 프록시 검사(맨 아래)는 실제 백엔드 둘(같은 바이너리)과 가짜 백엔드(FAKE, tests/tools/fake_upstream.c)를
+#   띄운다. 깨진 응답·일찍 끊김·무응답은 실제 백엔드로 만들 수 없어서 가짜가 필요하다.
 set -u
 
 BIN=${BIN:-./webserver}
+FAKE=${FAKE:-./build/tools/fake_upstream}
 HOST=127.0.0.1
-PORT=${PORT:-$((20000 + $$ % 20000))}
+PORT=${PORT:-$((20000 + $$ % 12000))}   # 최대 31999+9 (PORT..PORT+9 를 씀). 리눅스 ephemeral 범위(32768~60999) 아래
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/webserver-test.XXXXXX") || exit 1
 DOCROOT=$TMP/www
 LOG=$TMP/server.log
@@ -26,11 +29,12 @@ ln -s ../secret.txt "$DOCROOT/link.txt"            # docroot 밖을 가리키는
 fail=0
 SERVER_PID=
 BG_PIDS=
+UP_PIDS=       # 프록시 검사용 실제 백엔드·가짜 백엔드. 어떻게 끝나든 cleanup 이 죽인다
 STALL_N=0
 EXIT_CODE=
 
 cleanup() {
-    for p in $SERVER_PID $BG_PIDS; do
+    for p in $SERVER_PID $BG_PIDS $UP_PIDS; do
         kill -9 "$p" 2>/dev/null
     done
     rm -rf "$TMP"
@@ -154,6 +158,50 @@ close_stalled_conns() {
     done
     BG_PIDS=
     rm -f "$TMP"/stall.*
+}
+
+# --- 프록시 검사 도우미 (이슈 #9) ---
+
+# 실제 백엔드(같은 바이너리, -c 없음)를 띄우고 응답할 때까지 최대 5초 기다린다: start_backend <port> <docroot>
+start_backend() {
+    _bp=$1 _bl=$TMP/backend.$1.log
+    "$BIN" -p "$_bp" -r "$2" >"$_bl" 2>&1 &
+    UP_PIDS="$UP_PIDS $!"
+    _end=$(( $(date +%s) + 5 ))        # 반복 횟수가 아니라 시계로 5초 (curl -m 1 이 반복마다 더해지지 않게)
+    _n=0                               # 시계가 뒤로 가도 끝나게 반복 횟수 상한도 둔다
+    while [ "$(date +%s)" -lt "$_end" ] && [ $_n -lt 50 ]; do
+        _n=$((_n + 1))
+        grep -q '^webserver: cannot' "$_bl" && break
+        if grep -q '^webserver: listening' "$_bl" &&
+           curl -s -o /dev/null -m 1 "http://$HOST:$_bp/"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat "$_bl"
+    return 1
+}
+
+# 가짜 백엔드를 띄우고 "ready" 가 찍힐 때까지 최대 5초 기다린다: start_fake <port> <mode>
+# 출력은 $TMP/fake.<port>.out (hold 는 여기에 peer-closed 도 찍는다)
+start_fake() {
+    _fo=$TMP/fake.$1.out
+    "$FAKE" "$1" "$2" >"$_fo" 2>&1 &
+    UP_PIDS="$UP_PIDS $!"
+    _i=0
+    while [ $_i -lt 50 ]; do
+        grep -q '^ready' "$_fo" && return 0
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    cat "$_fo"
+    return 1
+}
+
+# 프런트가 살아 있고 중계가 되는지. 502·504 검사마다 짝으로 붙인다: 실패 응답만 확인하면 "프록시 경로는
+# 전부 502" 인 서버(develop 의 스텁)도 통과하기 때문이다. 같은 프런트가 성공 응답도 낸다는 것을 함께 본다
+proxy_alive() {
+    [ "$(curl -s -m 3 "${URL}api/add?a=1&b=2")" = 3 ]
 }
 
 echo "== smoke test ($(uname -s))"
@@ -368,9 +416,236 @@ else
     cat "$LOG"
 fi
 
+# ---------------------------------------------------------------
+# 프록시 (이슈 #9): -c 로 라우트를 읽은 프런트 하나, 실제 백엔드 둘, 가짜 백엔드 여섯.
+#   포트: 프런트 PORT, 백엔드 PORT+1·+2, 가짜 PORT+3..+8, 아무도 안 듣는 포트 PORT+9
+#   라우트 (접두사는 떼지 않고 백엔드로 간다. 백엔드는 같은 바이너리라 /api/... 를 스스로 처리한다):
+#     /api    → 백엔드 1             (앱: add, echo)
+#     /files  → 백엔드 1             (정적 파일. 6 MB 파일)
+#     /rr     → 백엔드 1, 2          (Round-Robin. 두 백엔드의 rr/id 파일 내용이 "1" 과 "2")
+#     /down   → 듣는 이 없는 포트    (연결 거절 → 502)
+#     /f/<모드> → 가짜 백엔드
+#   502·504 검사에는 proxy_alive (같은 프런트의 성공 응답)를 짝으로 붙인다.
+#   시간이 오래 걸리는 검사는 504 하나(약 5초)만 넣는다. 느린 응답(drip)은 아래 주석의 방법으로 손으로 본다.
+# ---------------------------------------------------------------
+proxy_tests() {
+    B1=$((PORT + 1)) B2=$((PORT + 2))
+    DOWN=$((PORT + 9))
+    mkdir -p "$TMP/b1/files" "$TMP/b1/rr" "$TMP/b2/rr"
+    printf 'backend 1\n' >"$TMP/b1/index.html"
+    printf 'backend 2\n' >"$TMP/b2/index.html"
+    printf '1\n' >"$TMP/b1/rr/id"
+    printf '2\n' >"$TMP/b2/rr/id"
+    head -c 6291456 /dev/urandom >"$TMP/b1/files/big6.bin"   # BUFFER_MAX(4 MiB)보다 크다: 모아서 보내면 실패한다
+
+    if [ ! -x "$FAKE" ]; then
+        bad "fake_upstream exists ($FAKE)"
+        return
+    fi
+    start_backend "$B1" "$TMP/b1" && start_backend "$B2" "$TMP/b2" || { bad "backends start"; return; }
+    n=3
+    for m in split early-eof partial-head garbage hold silent; do
+        start_fake $((PORT + n)) "$m" || { bad "fake $m starts"; return; }
+        n=$((n + 1))
+    done
+    cat >"$TMP/proxy.conf" <<EOF
+/api       $HOST:$B1
+/files     $HOST:$B1
+/rr        $HOST:$B1 $HOST:$B2
+/api/rr    $HOST:$B1 $HOST:$B2
+/down      $HOST:$DOWN
+/f/split   $HOST:$((PORT + 3))
+/f/early   $HOST:$((PORT + 4))
+/f/partial $HOST:$((PORT + 5))
+/f/garbage $HOST:$((PORT + 6))
+/f/hold    $HOST:$((PORT + 7))
+/f/silent  $HOST:$((PORT + 8))
+EOF
+
+    : >"$LOG"
+    if ! start_server -c "$TMP/proxy.conf"; then
+        bad "proxy front starts"
+        cat "$LOG"
+        return
+    fi
+
+    # 1. GET: 상태, 본문, 어느 백엔드가 답했는지, 클라이언트 연결은 닫는다 (백엔드에 Connection: close 를 보냈으므로)
+    code=$(curl -s -D "$TMP/p.head" -o "$TMP/p.body" -w '%{http_code}' -m 3 "${URL}api/add?a=1&b=2")
+    tr -d '\r' <"$TMP/p.head" >"$TMP/p.head.lf"
+    if [ "$code" = 200 ] && [ "$(cat "$TMP/p.body")" = 3 ] &&
+       grep -qi "^X-Instance: $B1\$" "$TMP/p.head.lf" && grep -qi '^Connection: close$' "$TMP/p.head.lf"; then
+        ok "proxy GET -> 200, body 3, X-Instance $B1, Connection: close"
+    else
+        bad "proxy GET -> 200, body 3, X-Instance $B1, Connection: close (got $code, $(tr '\n' '|' <"$TMP/p.head.lf"))"
+    fi
+
+    # 2. POST 100 KB: 요청 본문이 백엔드까지 가고 응답이 그대로 돌아온다
+    head -c 102400 /dev/urandom >"$TMP/echo.in"
+    code=$(curl -s -H 'Expect:' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/echo.in" \
+           -o "$TMP/echo.out" -w '%{http_code}' -m 5 "${URL}api/echo")
+    if [ "$code" = 200 ] && cmp -s "$TMP/echo.in" "$TMP/echo.out"; then
+        ok "proxy POST 100 KB echo -> identical"
+    else
+        bad "proxy POST 100 KB echo -> identical (got $code)"
+    fi
+
+    # 3. HEAD: 응답 머리는 Content-Length 가 있어도 본문이 없다. 본문을 기다리지 않고 끝난다 (-m 3)
+    curl -s -I -o /dev/null -D "$TMP/h.head" -m 3 "${URL}api/add?a=1&b=2"
+    rc=$?
+    ( printf 'HEAD /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1 ) |
+        nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' >"$TMP/h.raw"
+    if [ "$rc" -eq 0 ] && grep -q '^HTTP/1.1 200' "$TMP/h.head" &&
+       grep -q '^HTTP/1.1 200' "$TMP/h.raw" && ! grep -qx 3 "$TMP/h.raw"; then
+        ok "proxy HEAD -> 200, no body"
+    else
+        bad "proxy HEAD -> 200, no body (curl rc $rc, raw: $(tr '\n' '|' <"$TMP/h.raw"))"
+    fi
+
+    # 4. 6 MB 파일: 버퍼 상한(4 MiB)보다 크므로 중계가 응답을 한꺼번에 모으지 않고 흘려보내야 통과한다
+    code=$(curl -s -o "$TMP/big6.out" -w '%{http_code}' -m 10 "${URL}files/big6.bin")
+    if [ "$code" = 200 ] && cmp -s "$TMP/b1/files/big6.bin" "$TMP/big6.out"; then
+        ok "proxy 6 MB file -> identical (streamed)"
+    else
+        bad "proxy 6 MB file -> identical (got $code)"
+    fi
+
+    # 5. Round-Robin: 두 백엔드에 번갈아 간다 (rr/id 내용이 1, 2). 시작이 어느 쪽인지는 따지지 않는다
+    rrseq=
+    for _n in 1 2 3 4; do
+        rrseq=$rrseq$(curl -s -m 3 "${URL}rr/id" | tr -d '\n')
+    done
+    case $rrseq in
+        1212|2121) ok "proxy Round-Robin alternates ($rrseq)" ;;
+        *)         bad "proxy Round-Robin alternates (got '$rrseq')" ;;
+    esac
+    # 같은 확인을 X-Instance 로: 두 백엔드 모두 /api 아래 404 에 자기 포트를 단다 (정적 파일은 안 단다)
+    xseq=
+    for _n in 1 2 3 4; do
+        xseq=$xseq$(curl -s -D - -o /dev/null -m 3 "${URL}api/rr/x" | tr -d '\r' |
+                    sed -n 's/^[Xx]-[Ii]nstance: //p')-
+    done
+    case $xseq in
+        "$B1-$B2-$B1-$B2-"|"$B2-$B1-$B2-$B1-") ok "proxy Round-Robin X-Instance alternates ($xseq)" ;;
+        *) bad "proxy Round-Robin X-Instance alternates (got '$xseq')" ;;
+    esac
+
+    # 6. 백엔드가 없으면 502
+    code=$(http_code "${URL}down/x")
+    if [ "$code" = 502 ] && proxy_alive; then
+        ok "backend down -> 502"
+    else
+        bad "backend down -> 502 (got $code)"
+    fi
+
+    # 7. 431: 프런트 한도(HTTP_MAX_HEADER 8192, 빈 줄까지)에는 들어오지만 다시 쓴 머리(Via, X-Forwarded-For,
+    #    Connection: close 가 붙어 약 74바이트 길어진다)가 한도를 넘는 요청. 요청 크기는 curl 이 붙이는
+    #    User-Agent 등에 좌우되지 않게 nc 로 정확히 보낸다 (8185바이트). 정적 경로로 보낸 같은 요청이 200 이어야
+    #    프런트 자체의 한도에 걸린 게 아니라는 뜻이다
+    pad=$(head -c 8120 /dev/zero | tr '\0' a)
+    ( printf 'GET / HTTP/1.1\r\nHost: %s:%s\r\nX-Pad: %s\r\n\r\n' "$HOST" "$PORT" "$pad"; sleep 1 ) |
+        nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/p431.ctl"
+    ( printf 'GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: %s:%s\r\nX-Pad: %s\r\n\r\n' "$HOST" "$PORT" "$pad"; sleep 1 ) |
+        nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/p431"
+    if grep -q '^HTTP/1.1 200' "$TMP/p431.ctl" && grep -q '^HTTP/1.1 431' "$TMP/p431" && proxy_alive; then
+        ok "rewritten head over the limit -> 431"
+    else
+        bad "rewritten head over the limit -> 431 (static control: $(cat "$TMP/p431.ctl"), proxy: $(cat "$TMP/p431"))"
+    fi
+
+    # 8. 응답이 1바이트씩 나뉘어 와도 (머리가 여러 read 에 걸쳐 도착) 그대로
+    code=$(curl -s -o "$TMP/split.out" -w '%{http_code}' -m 5 "${URL}f/split")
+    rc=$?
+    printf 'fake ok\n' >"$TMP/split.want"     # 끝 개행까지 비교한다 ($(...) 는 개행을 지운다)
+    if [ "$rc" -eq 0 ] && [ "$code" = 200 ] && cmp -s "$TMP/split.want" "$TMP/split.out"; then
+        ok "upstream response in 1-byte pieces -> 200, body intact"
+    else
+        bad "upstream response in 1-byte pieces -> 200, body intact (curl rc $rc, got $code, '$(cat "$TMP/split.out")')"
+    fi
+
+    # 9. 응답 시작(머리 전달) 뒤 업스트림이 일찍 끊기면 이미 받은 바이트까지만 주고 연결을 닫는다 (502 로 바꿀 수 없다)
+    curl -s -D "$TMP/eof.head" -o "$TMP/eof.body" -m 3 "${URL}f/early"
+    rc=$?
+    size=$(wc -c <"$TMP/eof.body" | tr -d ' ')
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ] && grep -q '^HTTP/1.1 200' "$TMP/eof.head" && [ "$size" = 40 ]; then
+        ok "upstream cut mid-body -> head + 40 bytes, then connection closed (curl rc $rc)"
+    else
+        bad "upstream cut mid-body -> head + 40 bytes, then connection closed (curl rc $rc, $size bytes)"
+    fi
+
+    # 10, 11. 응답 시작 전 실패: 머리가 반만 오고 EOF, 머리가 HTTP 가 아님 → 502
+    code=$(http_code "${URL}f/partial")
+    if [ "$code" = 502 ] && proxy_alive; then
+        ok "upstream EOF inside the head -> 502"
+    else
+        bad "upstream EOF inside the head -> 502 (got $code)"
+    fi
+    code=$(http_code "${URL}f/garbage")
+    if [ "$code" = 502 ] && proxy_alive; then
+        ok "upstream garbage head -> 502"
+    else
+        bad "upstream garbage head -> 502 (got $code)"
+    fi
+
+    # 12. 업스트림이 본문 10바이트를 보내고 연결을 열어 두어도, Content-Length 로 끝을 알고 5초 제한 한참 전에
+    #     끝낸다. 프록시가 업스트림 연결을 닫았는지는 가짜가 peer-closed 로 알려 준다
+    #     (유휴 만료 5초 뒤에 닫힌 것과 구분하려고, 시작 시각부터 잰 시간이 3초 이하여야 한다. 초 단위 시계라
+    #     5초 만료는 4 이상으로 나온다)
+    t0=$(date +%s)
+    code=$(curl -s -o "$TMP/hold.out" -w '%{http_code}' -m 3 "${URL}f/hold")
+    _i=0
+    while [ $_i -lt 30 ] && ! grep -q '^peer-closed' "$TMP/fake.$((PORT + 7)).out"; do
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    elapsed=$(($(date +%s) - t0))
+    if [ "$code" = 200 ] && [ "$(cat "$TMP/hold.out")" = 0123456789 ] && [ "$elapsed" -le 3 ] &&
+       grep -q '^peer-closed' "$TMP/fake.$((PORT + 7)).out"; then
+        ok "upstream holds the connection after Content-Length bytes -> done, upstream closed"
+    else
+        bad "upstream holds the connection after Content-Length bytes -> done, upstream closed (got $code)"
+    fi
+
+    # 13. 업스트림이 아무 말도 안 하면 UPSTREAM_TIMEOUT_MS(5초) 뒤 504. 시계는 초 단위라 4~7초를 허용한다
+    t0=$(date +%s)
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "${URL}f/silent")
+    elapsed=$(($(date +%s) - t0))
+    if [ "$code" = 504 ] && [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 7 ] && proxy_alive; then
+        ok "silent upstream -> 504 after about 5s (${elapsed}s)"
+    else
+        bad "silent upstream -> 504 after about 5s (got $code after ${elapsed}s)"
+    fi
+
+    # 14. 클라이언트가 큰 응답을 받다가 포기해도 (느리게 받다가 1초 만에 끊음) 프런트는 멀쩡하다.
+    #     업스트림 연결·버퍼가 남지 않았는지는 아래 SIGTERM 종료(asan 이면 누수 검사)가 같이 본다
+    curl -s -o /dev/null --limit-rate 200k -m 1 "${URL}files/big6.bin"
+    rc=$?
+    sleep 0.3
+    if [ "$rc" -eq 28 ] && proxy_alive; then
+        ok "client gives up mid-transfer -> front still serves"
+    else
+        bad "client gives up mid-transfer -> front still serves (curl rc $rc)"
+    fi
+
+    stop_server TERM
+}
+
+# 손으로 하는 확인 (run.sh 에 넣지 않는다: 제한을 줄여 따로 빌드해야 하고 4초 가까이 걸린다).
+# 느린 응답 두 시계: 전체 시간이 UPSTREAM_TIMEOUT_MS 보다 길어도 바이트 사이 간격이 짧으면 끝까지 받아야 한다.
+# fake drip 은 머리를 바로 보내고 본문 6바이트를 700 ms 마다 1바이트씩 (전체 약 3.5초). 제한 1000 ms 로 빌드한다:
+#   make BUILD_DIR=/tmp/jw-drip TARGET=/tmp/jw-drip/webserver CFLAGS='-O2 -g -DUPSTREAM_TIMEOUT_MS=1000' \
+#        /tmp/jw-drip/webserver /tmp/jw-drip/tools/fake_upstream
+#   /tmp/jw-drip/tools/fake_upstream 9301 drip &
+#   echo '/ 127.0.0.1:9301' >/tmp/jw-drip/p.conf
+#   /tmp/jw-drip/webserver -p 9300 -r www -c /tmp/jw-drip/p.conf &
+#   curl -sS -m 10 -w '\n%{http_code} %{time_total}s\n' http://127.0.0.1:9300/x
+# 기대: abcdef, 200, 3.5초 안팎 (제한 1초보다 길다). 실패하면 504 가 아니라 본문이 중간에 끊긴다
+# (응답 시작 뒤라 502 가 아니다). 끝나면 kill %1 %2.
+: >"$LOG"
+proxy_tests
+
 # 경로 정규형 (#31): 라우팅과 정적 파일이 같은 정규형을 본다.
 # 프런트 docroot 에 프록시 접두사와 같은 경로의 파일(admin/x)을 두고, 라우트를 건너뛰어 그 파일이
-# 열리는지 본다. #9 전이라 프록시로 가면 502 (백엔드 127.0.0.1:9 는 쓰지 않는 포트)
+# 열리는지 본다. 프록시로 가면 502 (백엔드 127.0.0.1:9 는 아무도 안 듣는 포트라 연결 거절)
 mkdir -p "$DOCROOT/admin"
 printf 'front file\n' >"$DOCROOT/admin/x"
 printf '/admin 127.0.0.1:9\n' >"$TMP/norm.conf"

@@ -8,6 +8,29 @@
 
 ---
 
+## 2026-11-23 · 업스트림 중계 방식 (이슈 #9)
+
+- **결정** (상철 판단, 11-23 설계 문답):
+  1. 업스트림 응답은 머리(상태 줄 + `Content-Length`)만 해석하고 받은 바이트를 그대로 중계한다 (머리를 고치지 않음). 백엔드에는 늘 `Connection: close` 를 보내므로(#8) 프록시 응답 뒤 클라이언트 연결은 항상 닫는다
+  2. "응답 시작" = 머리 해석이 끝나 상태 줄 검사를 통과하고 첫 업스트림 바이트가 클라이언트 `out` 에 들어간 때. 그 전 실패는 502 (깨진·끊긴 머리, connect 실패, 송신 실패, EOF) 또는 504 (시간 초과), 그 뒤 실패는 `out` 에 있는 것까지 보내고 닫는다. 재시도 없음
+  3. 요청이 `HEAD` 이거나 상태가 1xx·204·304 이면 `Content-Length` 가 있어도 본문이 없다 (우리 `http_response.c` 가 HEAD 응답에 GET 의 길이를 쓴다). 그래서 요청 메서드를 기억한다
+  4. `UPSTREAM_TIMEOUT_MS`(5초) 는 시계가 둘이다. (a) 시작 전: 요청을 프록시에 넘긴 때부터 머리가 다 올 때까지, 넘으면 504. (b) 시작 후: 업스트림을 읽으려고 기다리는 동안 바이트가 5초 안 오면 닫기. 역압력으로 쉰 시간은 세지 않고, 느린 클라이언트는 `CLIENT_IDLE_TIMEOUT_MS`(10초, 클라이언트 쓰기가 진행되면 리셋)가 맡는다
+  5. 업스트림 fd 의 POLLOUT·POLLERR·POLLHUP 는 connect 중에는 `getsockopt(SO_ERROR)` 로만 판단한다 (0 이 아니면 502). 클라이언트 fd 는 기존대로 POLLERR 면 닫는다
+  6. `proxy_build_request` 가 -1 이면 431. `PARSE_DONE` 뒤에는 다른 원인을 파서·설정 로더가 막으므로 현실적인 원인은 "다시 쓴 머리가 `HTTP_MAX_HEADER` 초과"와 메모리 부족이고, 앞의 것에 맞춰 431 로 답한다 (코드 주석에도 적음)
+- **구현 중 정한 것 (11-23 상철 확인)**:
+  - C1. 1xx 는 깨진 머리로 본다 → 502 (요청에서 `Expect`·`Upgrade` 를 빼므로 올 일이 없다). 그래서 결정 3 의 "1xx 는 본문 없음"은 코드에서 이 502 가 먼저 걸린다
+  - C2. `Transfer-Encoding` 이 있으면(값 무관) 업스트림 EOF 까지가 본문이다. `Content-Length` 는 무시하고 바이트는 그대로 넘긴다 (chunked 틀도 그대로 지나감)
+  - C3. 중계 상한 `PROXY_RELAY_MAX` 64KB: 클라이언트 `out` 대기가 이보다 적을 때만 업스트림을 읽는다
+  - C4. 머리 문법은 엄격하게: CRLF 줄 끝(맨 LF·맨 CR 은 502), obs-fold 502, 빈 줄까지 8192바이트 초과 502, 상태 줄 `HTTP/1.` 숫자 + 세 자리 100..599
+  - C5. `Content-Length` 는 앞뒤 SP/TAB 을 뗀 숫자만 (부호·쉼표 목록 불가), 2^53 이나 `size_t` 초과는 502, 줄이 여러 개면 값이 같아야 한다 (아니면 502)
+  - C6. 응답 시작 전에는 클라이언트 fd 를 `events = 0` 으로 두고 (끊김만 감지), 시작 후 `out` 에 바이트가 있을 때만 POLLOUT. 프록시 중에는 클라이언트 입력을 읽지 않는다 (파이프라이닝된 바이트는 lingering close 가 버린다)
+  - C7. `X-Forwarded-For` 값은 accept 때 `getpeername` + `getnameinfo(NI_NUMERICHOST)` 로 `conn.client_ip` 에 저장한다. `::ffff:a.b.c.d` 는 `a.b.c.d` 로, 링크 로컬의 `%인터페이스` 꼬리는 떼고, 주소를 못 얻으면 `unknown`
+  - C8. `UPSTREAM_TIMEOUT_MS` 를 `#ifndef` 로 바꿔 `-D` 로 줄여 빌드할 수 있게 했다 (느린 응답을 손으로 보는 용도, `tests/run.sh` 맨 아래 주석)
+  - C9. Round-Robin: `proxy_next_backend` 가 라우트마다 `next` 를 돌려 0, 1, ..., n-1, 0. 이슈 #9 의 "RR 은 마지막, 늦으면 뺀다" 에 맞춰 이 함수 하나만 되돌리면(항상 `backends[0]`) 빠지게 작은 변경으로 뒀다
+  - 코드가 정한 세부: 시작 후 업스트림 유휴 마감과 업스트림 EOF·오류(`TRUNCATED`)에서도 `out` 에 대기한 바이트는 보낸 뒤 닫는다. 시작 전 마감이 이미 지났으면 늦게 완성된 머리도 504 로 답한다
+- **이유**: 머리를 고쳐 쓰지 않으면 해석할 것이 상태 줄과 길이뿐이라 코드와 검증 범위가 작다. 연결을 항상 닫으면 응답 끝을 길이나 EOF 로만 알면 되고, 다음 요청과 섞이지 않는다. 시작 전에는 클라이언트에게 아직 아무것도 안 나갔으므로 정확한 오류 코드를 줄 수 있고, 시작 뒤에는 이미 나간 응답을 바꿀 수 없어 닫는 것밖에 없다. 시계를 둘로 나눈 것은 전체 전송이 오래 걸려도 바이트 사이가 짧으면 정상이고, 클라이언트가 느린 것은 업스트림 탓이 아니기 때문이다
+- **영향**: `proxy.h/.c`, `proxy_config.h/.c`, `server.h`, `server.c` (A 트랙 건호님 파일: 업스트림 상태 3개, pollfd 둘, 시간 초과 처리. 지역 제안이라 리뷰 필요), `Makefile`, `tests/run.sh`, `tests/tools/fake_upstream.c`, `tests/unit/test_proxy_relay.c`, `tests/unit/test_contract.c`, `docs/interfaces.md`, `docs/api.md`, `CLAUDE.md`, `README.md`. 이슈 #9
+
 ## 2026-11-23 · 경로 정규형 하나로 라우팅·전달, `--merge-slashes` (이슈 #31)
 
 - **결정**:
