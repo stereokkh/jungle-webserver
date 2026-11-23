@@ -37,6 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+cp -R "${WWW:-www}" "$DOCROOT/site" || exit 1      # 저장소 www/ 예제 (html, css, png)
 
 ok()  { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fail=1; }
@@ -193,6 +194,24 @@ fi
 code=$(curl -s -o "$TMP/big" -w '%{http_code}' -m 5 "${URL}big.bin")
 [ "$code" = 200 ] && cmp -s "$TMP/big" "$DOCROOT/big.bin" && ok "GET 1MB file -> identical bytes" \
                                                           || bad "GET 1MB file -> identical bytes (got $code)"
+
+# www/ 예제 파일 (#6): 상태, Content-Type, Content-Length 가 원본 크기, 본문 바이트가 원본과 같음
+expect_file() {
+    path=$1 type=$2 src=$DOCROOT/site/$1
+    size=$(wc -c <"$src" | tr -d ' ')
+    code=$(curl -s -D "$TMP/fh" -o "$TMP/fb" -w '%{http_code}' -m 3 "${URL}site/$path")
+    tr -d '\r' <"$TMP/fh" >"$TMP/fh.lf"
+    if [ "$code" = 200 ] && grep -Fqx "Content-Type: $type" "$TMP/fh.lf" \
+       && grep -Fqx "Content-Length: $size" "$TMP/fh.lf" && cmp -s "$TMP/fb" "$src"; then
+        ok "GET $path -> 200 $type, identical bytes"
+    else
+        bad "GET $path -> 200 $type, identical bytes (got $code)"
+        cat "$TMP/fh.lf"
+    fi
+}
+expect_file index.html   'text/html; charset=utf-8'
+expect_file style.css    'text/css; charset=utf-8'
+expect_file img/logo.png 'image/png'
 
 # 상태 코드: 기대값 설명 curl인자...
 expect_code() {
