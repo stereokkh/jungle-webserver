@@ -22,7 +22,6 @@ printf 'sub file\n' >"$DOCROOT/sub/a.txt"
 head -c 1048576 /dev/urandom >"$DOCROOT/big.bin"   # 여러 POLLOUT 에 나눠 보내지는 크기
 printf 'secret\n' >"$TMP/secret.txt"
 ln -s ../secret.txt "$DOCROOT/link.txt"            # docroot 밖을 가리키는 링크
-cp -R "${WWW:-www}" "$DOCROOT/site" || exit 1      # 저장소 www/ 예제 (html, css, png)
 
 fail=0
 SERVER_PID=
@@ -38,6 +37,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+cp -R "${WWW:-www}" "$DOCROOT/site" || exit 1      # 저장소 www/ 예제 (html, css, png)
 
 ok()  { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fail=1; }
