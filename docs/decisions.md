@@ -30,6 +30,12 @@
   - `//` 는 RFC 상 `/` 와 다른 경로라서 기본은 거절하고, 합칠지는 nginx·Apache 처럼 운영자가 고른다
 - **영향**: PR #18 결정 2(`app_match` 는 원본 `target`), 이슈 #8 결정 3(원본 `target` 그대로 전달), `docs/interfaces.md` "프록시 경로 매칭"·"앱 경로" 를 바꾼다. 구현은 #31: `http_request.h/.c`, `app.h/.c`, `proxy_config.h/.c`, `proxy.c`, `main.c`(`--merge-slashes`), `docs/interfaces.md`, `docs/api.md`, 테스트 (`//a` 기본 400·플래그로 통과, `/api/a%2Fb` 400, `/a\b`·`/a%5Cb` 400, `/%61pi/add` → 앱, `/docs/%2E%2Ex` 통과). 구현 전까지 코드는 원본 `target` 으로 라우팅·전달한다
 
+## 2026-11-21 · 경로의 `.`·`..` 조각은 파서가 400 (PR #26 리뷰)
+
+- **결정**: 파서가 디코딩한 `path` 에 `.` 이나 `..` 조각이 있으면 400. 평문과 `%2E%2E`, `%2F` 로 만든 조각 모두 같은 곳에서 거절한다. `static_open`(#22) 의 글자 정리와 `realpath` 검사는 그대로 둔다
+- **이유**: 라우팅은 원본 `target` 으로 하고(PR #18) 정적 파일은 정리한 경로로 연다. 그래서 `/public/../admin/x` 는 `/admin` 프록시 라우트에 안 걸리고 프런트 docroot 의 `/admin/x` 를 열었다 (혜성 재현). 라우팅 전에 한 곳(파서)에서 막아야 점 조각 때문에 프록시·앱·정적 판정이 갈리지 않는다 (빈 조각·퍼센트 인코딩으로 생기는 차이는 남음, `docs/interfaces.md` "경로의 점 조각", #31). 파서가 path 를 직접 디코딩하므로 `%2e%2e` 도 여기서 같이 잡힌다. curl·브라우저는 `..` 를 보내기 전에 지우므로 (#3 재현 ②) 정상 요청에는 영향이 없다. 검토한 다른 안: 문서로만 금지(설정 실수를 막지 못함), `static_open` 에서 403(프록시로 가는 `/api/../secret` 은 남음)
+- **영향**: `src/http_request.c`, `include/http_request.h`, `tests/unit/test_http_request.c`, `tests/unit/test_proxy.c`(R2 의 대상에서 `..` 조각을 뺌), `docs/interfaces.md`
+
 ## 2026-11-21 · 프록시 설정 형식과 요청 재작성 규칙 (이슈 #8)
 
 - **결정**:
