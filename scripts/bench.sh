@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 이슈 #11: 정적 파일 처리량(ab)과 Tiny 제한 비교. 결과는 docs/benchmark.md 에 옮긴다
 #   sh 가 아니라 bash (/dev/tcp 로 연결만 열어 두는 데 씀)
+#   Linux 전용: /proc/cpuinfo, timeout 을 씀 (macOS 에는 timeout 이 없음)
 #   bash scripts/bench.sh            # 우리 서버 + (classic/tiny 가 있으면) Tiny
 #   REPS=5 N=20000 bash scripts/bench.sh
 #   BIN=/다른/빌드/webserver bash scripts/bench.sh   # 이 폴더를 빌드하지 않고 그 바이너리로 잼
@@ -11,9 +12,9 @@ cd "$(dirname "$0")/.."
 REPS=${REPS:-3}        # 같은 조건 반복 횟수, 표에는 중앙값
 N=${N:-10000}          # ab 요청 수
 CONCS=${CONCS:-"10 100 1000"}
-P_OURS=18501
-P_TINY=18502
-P_B1=18511 P_B2=18512 P_FRONT=18513   # 프록시: 백엔드 2개 + 프런트
+P_OURS=${P_OURS:-18501}   # 포트가 사용 중이면 환경 변수로 바꾼다
+P_TINY=${P_TINY:-18502}
+P_B1=${P_B1:-18511} P_B2=${P_B2:-18512} P_FRONT=${P_FRONT:-18513}   # 프록시: 백엔드 2개 + 프런트
 
 command -v ab >/dev/null || { echo "ab 가 필요함: sudo apt install apache2-utils" >&2; exit 1; }
 if [ -z "${BIN:-}" ]; then make -s webserver; BIN=$(pwd)/webserver; fi
@@ -147,7 +148,7 @@ stop
 echo
 
 # 프록시: 같은 바이너리로 백엔드 2개(-c 없음) + 프런트(/api/ → 두 백엔드). /api/add 는 앱이 답하는 작은 응답
-bg() {   # bg 포트 [서버 인자...]: 띄우고 /api/add 가 200 일 때까지 기다림
+start_bg() {   # start_bg 포트 [서버 인자...]: 띄우고 /api/add 가 200 일 때까지 기다림
     local port=$1; shift
     "$BIN" -p "$port" -r "$W" "$@" 2>>"$W/px.log" & PX_PIDS+=($!)
     for _ in $(seq 50); do
@@ -158,7 +159,7 @@ bg() {   # bg 포트 [서버 인자...]: 띄우고 /api/add 가 200 일 때까�
 }
 echo "## 프록시 (/api/add?a=1&b=2, ab, 연결 재사용 없음, 중앙값)"
 printf '/api/ 127.0.0.1:%s 127.0.0.1:%s\n' "$P_B1" "$P_B2" > "$W/proxy.conf"
-if bg "$P_B1" && bg "$P_B2" && bg "$P_FRONT" -c "$W/proxy.conf" &&
+if start_bg "$P_B1" && start_bg "$P_B2" && start_bg "$P_FRONT" -c "$W/proxy.conf" &&
    [ "$(curl -s "http://127.0.0.1:$P_FRONT/api/add?a=1&b=2")" = 3 ]; then
     echo "- 본문 일치: 직접 = 경유 = 3"
     echo "| 경로 | 동시성 | 요청/초 | p50 ms | p99 ms | 실패 / non-2xx / 전체 |"
