@@ -609,6 +609,13 @@ static size_t up_room(const conn *c)
     return pending < PROXY_RELAY_MAX ? PROXY_RELAY_MAX - pending : 0;
 }
 
+/* 역압력: relay 가 지금 더 받을 바이트가 0 (out 이 PROXY_RELAY_MAX 까지 찼거나 응답을 끝까지 받음).
+ * 이때는 업스트림을 읽지 않고 업스트림 유휴 시계도 세지 않는다 (결정 4b) */
+static int up_paused(const conn *c)
+{
+    return proxy_relay_want(&c->relay, up_room(c)) == 0;
+}
+
 static int is_up_state(conn_state st)
 {
     return st == CONN_UP_CONNECTING || st == CONN_UP_SENDING || st == CONN_UP_RECEIVING;
@@ -687,7 +694,7 @@ static void up_on_event(server *s, size_t slot)
     }
     /* 시작 후: 읽으려고 기다리던 마감이 이미 지났으면 늦게 온 바이트는 받지 않고 대기분만 보내고 닫는다 (결정 4b) */
     if (c->relay.started && c->state == CONN_UP_RECEIVING &&
-        proxy_relay_want(&c->relay, up_room(c)) > 0 &&
+        !up_paused(c) &&
         now_ms() >= c->up_last_ms + UPSTREAM_TIMEOUT_MS) {
         up_finish(s, slot);
         return;
@@ -713,7 +720,7 @@ static void up_on_client_event(server *s, size_t slot, short re)
 {
     conn *c = s->conns[slot];
     ssize_t n;
-    int was_paused = proxy_relay_want(&c->relay, up_room(c)) == 0;
+    int was_paused = up_paused(c);
 
     if (re & (POLLERR | POLLHUP | POLLNVAL)) {
         conn_close(s, slot);       /* 업스트림 fd 도 같이 닫힌다 */
@@ -731,7 +738,7 @@ static void up_on_client_event(server *s, size_t slot, short re)
     c->last_active_ms = now_ms();
     /* 역압력으로 읽기를 쉬던 연결이 다시 읽게 된 순간에만 업스트림 유휴 시계를 새로 시작한다.
      * 쉬지 않았다면 클라이언트 쓰기는 업스트림 유휴와 상관없다 (결정 4b) */
-    if (was_paused && proxy_relay_want(&c->relay, up_room(c)) > 0)
+    if (was_paused && !up_paused(c))
         c->up_last_ms = c->last_active_ms;
 }
 
@@ -786,7 +793,7 @@ static int64_t conn_deadline(const conn *c)
 
         if (!c->relay.started)
             u = c->up_start_ms + UPSTREAM_TIMEOUT_MS;
-        else if (proxy_relay_want(&c->relay, up_room(c)) > 0)
+        else if (!up_paused(c))
             u = c->up_last_ms + UPSTREAM_TIMEOUT_MS;
         if (u >= 0 && u < d)
             d = u;
@@ -814,7 +821,7 @@ static int expire_idle(server *s, int64_t now)
                 continue;
         }
         if (is_up_state(c->state) && c->relay.started &&
-            proxy_relay_want(&c->relay, up_room(c)) > 0 &&
+            !up_paused(c) &&
             now >= c->up_last_ms + UPSTREAM_TIMEOUT_MS) {
             up_finish(s, i);           /* 시작 후 업스트림 유휴: 이미 받아 둔 out 은 보내고 닫는다 (결정 2) */
             c = s->conns[i];
@@ -868,7 +875,7 @@ static size_t build_pollfds(server *s)
         s->pfds[n].fd = c->upstream_fd;
         s->pfds[n].events = c->state == CONN_UP_RECEIVING ? POLLIN : POLLOUT;
         /* 받는 중에 out 이 가득 차 읽을 바이트가 0 이면 음수 fd 로 poll 이 무시하게 한다 */
-        if (c->state == CONN_UP_RECEIVING && proxy_relay_want(&c->relay, up_room(c)) == 0)
+        if (c->state == CONN_UP_RECEIVING && up_paused(c))
             s->pfds[n].fd = -1;
         s->pfd_slot[n] = i;
         s->pfd_kind[n] = PFD_KIND_UPSTREAM;

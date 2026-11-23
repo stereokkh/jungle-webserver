@@ -39,6 +39,11 @@
 #ifndef UPSTREAM_TIMEOUT_MS
 #define UPSTREAM_TIMEOUT_MS     5000
 #endif
+/* 응답 시작 전에는 클라이언트 유휴 시계(CLIENT_IDLE_TIMEOUT_MS)도 같이 돈다. 업스트림 상한이 같거나 길면
+ * 클라이언트 쪽이 먼저 만료돼 504 대신 응답 없이 닫히므로 빌드에서 막는다 */
+#if UPSTREAM_TIMEOUT_MS >= CLIENT_IDLE_TIMEOUT_MS
+#error "UPSTREAM_TIMEOUT_MS must be smaller than CLIENT_IDLE_TIMEOUT_MS"
+#endif
 
 typedef struct {
     const char *port;        /* -p */

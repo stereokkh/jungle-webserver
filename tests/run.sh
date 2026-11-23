@@ -14,7 +14,7 @@ set -u
 BIN=${BIN:-./webserver}
 FAKE=${FAKE:-./build/tools/fake_upstream}
 HOST=127.0.0.1
-PORT=${PORT:-$((20000 + $$ % 20000))}
+PORT=${PORT:-$((20000 + $$ % 12000))}   # 최대 31999+9 (PORT..PORT+9 를 씀). 리눅스 ephemeral 범위(32768~60999) 아래
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/webserver-test.XXXXXX") || exit 1
 DOCROOT=$TMP/www
 LOG=$TMP/server.log
