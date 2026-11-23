@@ -7,6 +7,7 @@
  *                       "더 필요 / 완료 / 오류" + 소비 바이트 수를 돌려준다.
  *                       헤더를 버리지 않고 Host, Content-Length, Connection 을 해석하고,
  *                       원본 헤더 블록은 프록시가 그대로 전달할 수 있게 위치를 남긴다.
+ *                       경로는 정규형(target)과 끝까지 디코딩한 형태(path)를 만든다 (#31).
  */
 #ifndef HTTP_REQUEST_H
 #define HTTP_REQUEST_H
@@ -48,12 +49,20 @@ typedef enum {
 typedef struct {
     http_method method;
     char method_str[16];            /* 원본 메서드 문자열 (501 로그·프록시 전달용) */
-    char target[HTTP_MAX_URI + 1];  /* 원본 요청 대상 "/a%20b?x=1" (프록시 전달용, 디코딩 안 함) */
-    char path[HTTP_MAX_URI + 1];    /* 퍼센트 디코딩한 경로 "/a b" (정적 파일 접근용).
-                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 와
-                                     * "." / ".." 조각을 400 으로 거절하므로 path 에는 이런 바이트와
-                                     * 점 조각이 없다 (원본 target 에도 디코딩 후 점 조각이 없다는 뜻) */
-    char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 디코딩 안 함. 없으면 "" */
+    /* 정규화된 요청 대상 = 정규형 경로 + 원본의 '?' 부분 그대로. 원본 문자열은 남기지 않는다 (#31).
+     *   예: "/%61pi/a%eb?x=%41" → "/api/a%EB?x=%41"
+     * 라우팅(proxy_match, app_match, app_handle)과 백엔드 전달(proxy_build_request)이 모두 이것을 쓴다.
+     * 판정한 문자열과 백엔드가 받는 문자열이 하나뿐이라 서로 다를 수 없다 (docs/decisions.md 2026-11-23).
+     * 정규형 경로에는 다음이 없다 (원본에 있으면 파서가 400):
+     *   인코딩 안 된 '\', 디코딩하면 '/' '\' NUL·제어 문자가 되는 %XX, 빈 조각 "//"
+     *   (merge_slashes 면 합쳐서 없앰), "." / ".." 조각.
+     * 비예약 문자(A-Z a-z 0-9 - . _ ~)의 %XX 는 글자로 디코딩되어 있고, 남은 %XX 는 16진수 대문자다.
+     * 디코딩은 한 번만 한다 ("%252F" 는 정규형에서도 "%252F") */
+    char target[HTTP_MAX_URI + 1];
+    char path[HTTP_MAX_URI + 1];    /* target 의 경로 부분을 끝까지 퍼센트 디코딩한 것 "/a b" (정적 파일 접근용).
+                                     * 위 규칙 때문에 NUL·제어 문자·'\'·점 조각·빈 조각이 없고,
+                                     * '/' 는 원래의 경로 구분자뿐이다 */
+    char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 원본 그대로 (디코딩·정규화 안 함). 없으면 "" */
     int version_minor;              /* HTTP/1.0 → 0, HTTP/1.1 → 1 */
 
     char host[HTTP_MAX_HOST + 1];   /* Host 헤더 값. 없으면 "" (HTTP/1.1 이면 400) */

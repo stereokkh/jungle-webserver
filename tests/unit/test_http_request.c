@@ -15,6 +15,9 @@ static int status;
 /* 마지막 입력 버퍼. req.headers / req.body 가 가리키므로 다음 parse 전까지 살려 둔다 */
 static char *g_buf;
 
+/* 파서 옵션. NULL 이면 기본값. merge_slashes 시험에서만 바꾼다 */
+static const http_parse_options *g_opt;
+
 /* s 의 앞 n 바이트만 넘긴다 (조각으로 도착한 상황) */
 static parse_result parse_n(const char *s, size_t n)
 {
@@ -23,7 +26,7 @@ static parse_result parse_n(const char *s, size_t n)
     if (g_buf == NULL)
         exit(2);
     memcpy(g_buf, s, n);
-    return http_parse_request(g_buf, n, NULL, &req, &consumed, &status);
+    return http_parse_request(g_buf, n, g_opt, &req, &consumed, &status);
 }
 
 static parse_result parse(const char *s)
@@ -132,20 +135,22 @@ static void test_pipelined(void)
     CHECK_INT(consumed, 0);
 }
 
-/* target / path / query 분리와 퍼센트 디코딩 */
+/* target(정규형) / path / query 분리와 퍼센트 디코딩 (#31) */
 static void test_target_split(void)
 {
+    /* '.' 은 비예약 문자라 %2E 는 정규형에서 글자가 된다. query 는 원본 그대로 */
     REQUIRE(parse("GET /docs/%2E%2Ex/secret?q=a%20b HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
-    CHECK_STR(req.target, "/docs/%2E%2Ex/secret?q=a%20b");
+    CHECK_STR(req.target, "/docs/..x/secret?q=a%20b");
     CHECK_STR(req.path, "/docs/..x/secret");  /* "..x" 는 점 조각이 아니다 (점 조각은 test_dot_segments) */
     CHECK_STR(req.query, "q=a%20b");
 
     REQUIRE(parse("GET /a%20b?x=1&y=%3D HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a%20b?x=1&y=%3D");   /* 비예약 문자가 아닌 %XX 는 정규형에 남는다 */
     CHECK_STR(req.path, "/a b");
     CHECK_STR(req.query, "x=1&y=%3D");
 
     REQUIRE(parse("GET /%61pi/add HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
-    CHECK_STR(req.target, "/%61pi/add");      /* 라우팅은 이 원본으로 (decisions 2026-11-20) */
+    CHECK_STR(req.target, "/api/add");        /* 라우팅·전달은 정규형으로 (decisions 2026-11-23) */
     CHECK_STR(req.path, "/api/add");
 
     /* 디코딩은 한 번만: %25 는 '%' 가 되고 거기서 멈춘다. 두 번 풀면 "/../secret" 이 된다.
@@ -153,6 +158,80 @@ static void test_target_split(void)
     REQUIRE(parse("GET /%252e%252e/secret HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
     CHECK_STR(req.target, "/%252e%252e/secret");
     CHECK_STR(req.path, "/%2e%2e/secret");
+    REQUIRE(parse("GET /a%252F HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);   /* %2F 가 아니다 */
+    CHECK_STR(req.target, "/a%252F");
+    CHECK_STR(req.path, "/a%2F");
+
+    /* 빈 query 도 원본의 '?' 부분 그대로 */
+    REQUIRE(parse("GET /a? HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a?");
+    CHECK_STR(req.query, "");
+}
+
+/* 정규형 규칙 2·4 (#31): 구분자로 읽힐 바이트는 400, 비예약 문자만 디코딩, 나머지는 16진수 대문자 */
+static void test_normalize_encoding(void)
+{
+    /* 2. 디코딩하면 '/' 나 '\' 가 되는 %XX, 인코딩 안 된 '\' */
+    CHECK_ERROR("GET /admin%2Fx HTTP/1.1\r\nHost: x\r\n\r\n", 400);    /* #31 재현 */
+    CHECK_ERROR("GET /admin%2fx HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /api/a%2Fb HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a%5Cb HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a%5cb HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a\\b HTTP/1.1\r\nHost: x\r\n\r\n", 400);         /* PR #34 리뷰 */
+    CHECK_ERROR("GET /\\admin/x HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    /* query 는 경로가 아니므로 %2F, '\' 가 있어도 그대로 */
+    REQUIRE(parse("GET /a?p=%2F&q=\\ HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a?p=%2F&q=\\");
+    CHECK_STR(req.query, "p=%2F&q=\\");
+
+    /* 4. 비예약 문자(A-Z a-z 0-9 - . _ ~)만 글자로 */
+    REQUIRE(parse("GET /%61dmin/x HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);   /* #31 재현 */
+    CHECK_STR(req.target, "/admin/x");
+    REQUIRE(parse("GET /%7Euser/%2D%2e%5F%30%41%7a HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/~user/-._0Az");
+    CHECK_STR(req.path, "/~user/-._0Az");
+    /* 나머지 %XX 는 남기고 16진수만 대문자 */
+    REQUIRE(parse("GET /%eb%8b%a4/%3a%40%21%20 HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/%EB%8B%A4/%3A%40%21%20");
+    CHECK_STR(req.path, "/\xeb\x8b\xa4/:@! ");
+    /* 인코딩 안 한 예약 문자는 그대로 (인코딩한 것과는 다른 URI, RFC 3986 2.2) */
+    REQUIRE(parse("GET /a:b@c!$&'()*+,;= HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a:b@c!$&'()*+,;=");
+}
+
+/* 정규형 규칙 3 (#31): 빈 조각 "//" 는 기본 400, merge_slashes 면 하나로 */
+static void test_normalize_empty_segments(void)
+{
+    static const http_parse_options merge = { 1 };
+
+    CHECK_ERROR("GET //a HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET //admin/x HTTP/1.1\r\nHost: x\r\n\r\n", 400);     /* #31 재현 */
+    CHECK_ERROR("GET /a//b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET /a// HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET // HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    /* 끝 '/' 하나는 빈 조각이 아니다 */
+    REQUIRE(parse("GET /a/ HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a/");
+    REQUIRE(parse("GET / HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/");
+    /* query 의 "//" 는 경로가 아니다 */
+    REQUIRE(parse("GET /a?u=http://x HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a?u=http://x");
+
+    g_opt = &merge;
+    REQUIRE(parse("GET /a//b///c HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/a/b/c");
+    CHECK_STR(req.path, "/a/b/c");
+    REQUIRE(parse("GET //admin/x//?q=//y HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/admin/x/?q=//y");
+    CHECK_STR(req.path, "/admin/x/");
+    CHECK_STR(req.query, "q=//y");
+    REQUIRE(parse("GET // HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
+    CHECK_STR(req.target, "/");
+    /* 합쳐도 다른 규칙은 그대로 */
+    CHECK_ERROR("GET /a//../b HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    CHECK_ERROR("GET //a%2Fb HTTP/1.1\r\nHost: x\r\n\r\n", 400);
+    g_opt = NULL;
 }
 
 /* path 의 금지 바이트와 잘못된 %XX → 400 */
@@ -197,8 +276,7 @@ static void test_dot_segments(void)
     CHECK_STR(req.path, "/.well-known/x");
     REQUIRE(parse("GET /a..b/..c HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
     CHECK_STR(req.path, "/a..b/..c");
-    REQUIRE(parse("GET //a HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);   /* 빈 조각은 static_open 이 정리 */
-    CHECK_STR(req.path, "//a");
+    /* 빈 조각 "//a" 는 test_normalize_empty_segments (기본 400, #31) */
     /* query 의 ".." 는 path 가 아니다 */
     REQUIRE(parse("GET /a?p=../b HTTP/1.1\r\nHost: x\r\n\r\n") == PARSE_DONE);
     CHECK_STR(req.query, "p=../b");
@@ -470,6 +548,8 @@ int main(void)
     RUN(test_nul_bytes);
     RUN(test_fragment_in_target);
     RUN(test_content_length);
+    RUN(test_normalize_encoding);
+    RUN(test_normalize_empty_segments);
     RUN(test_connection);
     RUN(test_header_syntax);
     RUN(test_bare_lf_request);

@@ -202,14 +202,25 @@ static void test_method_405(void)
     CHECK_INT((long)n, 0);              /* HEAD 라 오류 본문도 없음 */
 }
 
+/* 파서 정규형으로 라우팅한다 (#31, PR #18 결정 2 를 바꿈): 표기만 바꾼 경로도 같은 라우트 */
+static void test_add_normalized(void)
+{
+    CHECK_INT(call("GET /api/%61dd?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n"), 0);
+    HAS("HTTP/1.1 200 OK\r\n");
+    HAS("\r\n\r\n3\n");
+    CHECK_INT(call("GET /%61pi/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n"), 0);
+    HAS("HTTP/1.1 200 OK\r\n");
+    CHECK_INT(app_match(&req), 1);
+}
+
 static void test_unknown_404(void)
 {
     expect_status("GET /api/ HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
     expect_status("GET /api/addx?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
     expect_status("GET /api/add/ HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
     expect_status("GET /api/ADD?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
-    /* 원본 target 기준이라 인코딩한 경로는 다른 경로다 (app_match 와 같은 기준) */
-    expect_status("GET /api/%61dd?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
+    /* 비예약 문자를 인코딩한 "/api/%61dd" 는 파서 정규형이 "/api/add" 라 404 가 아니다 (#31).
+     * test_add_normalized 참고 */
     LACKS("/api/");                     /* 오류 본문에 요청 경로를 넣지 않음 (#3 XSS) */
 }
 
@@ -263,6 +274,7 @@ int main(void)
     RUN(test_add_head);
     RUN(test_echo);
     RUN(test_method_405);
+    RUN(test_add_normalized);
     RUN(test_unknown_404);
     RUN(test_connection);
     RUN(test_failure_keeps_out);
