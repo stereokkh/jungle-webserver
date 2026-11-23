@@ -249,6 +249,9 @@ static int conn_open(server *s, int fd)
 
     if (s->nconns >= SERVER_MAX_CONNS || net_set_nonblocking(fd) < 0)
         return -1;
+    /* 정적 파일은 머리와 본문을 따로 write 해서, Nagle 이 켜져 있으면 keep-alive 의 다음 응답마다
+     * 상대의 지연 ACK 를 기다려 약 44ms 씩 멈췄다 (docs/benchmark.md). 실패해도 느릴 뿐이라 계속한다 */
+    (void)net_set_nodelay(fd);
     for (i = 0; i < SERVER_MAX_CONNS && s->conns[i] != NULL; i++)
         ;
     c = calloc(1, sizeof *c);   /* in/out/up_out 은 0 으로 채워져 BUFFER_INIT 과 같다 */

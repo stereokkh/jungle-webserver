@@ -15,4 +15,8 @@ int net_listen(const char *port);
 /* fd 를 논블로킹으로 바꾼다 (fcntl O_NONBLOCK). 성공 0, 실패 -1 */
 int net_set_nonblocking(int fd);
 
+/* TCP 연결 fd 에 TCP_NODELAY 를 켠다 (Nagle 끔). 성공 0, 실패 -1.
+ * 응답을 여러 번 write 하는 keep-alive 연결에서 지연 ACK 대기(약 40ms)를 없앤다 */
+int net_set_nodelay(int fd);
+
 #endif /* NET_H */
