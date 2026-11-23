@@ -26,8 +26,8 @@
 #include "proxy_config.h"
 
 /* 백엔드로 보낼 요청 전체를 out 뒤에 덧붙인다. 바이트 순서:
- *   1. "<method_str> <target> HTTP/1.1\r\n"  (클라이언트가 1.0 이어도 1.1. target 은 원본 그대로:
- *      디코딩·접두사 제거·"../" 정리 없음)
+ *   1. "<method_str> <target> HTTP/1.1\r\n"  (클라이언트가 1.0 이어도 1.1. target 은 파서가 만든
+ *      정규화된 요청 대상 그대로: 정규형 경로 + 원본 ?query, 접두사는 떼지 않음. #31, docs/interfaces.md "경로 정규형")
  *   2. req->headers 의 줄 중 아래에 해당하지 않는 것을 원래 순서, 원래 바이트(이름 대소문자, 공백 포함)
  *      그대로
  *   3. "Host: <backend->name>\r\n"

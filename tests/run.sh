@@ -41,6 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+cp -R "${WWW:-www}" "$DOCROOT/site" || exit 1      # 저장소 www/ 예제 (html, css, png)
 
 ok()  { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fail=1; }
@@ -220,6 +221,7 @@ expect_exit1 "docroot missing -> exit 1"     -p "$PORT" -r "$TMP/nope"
 : >"$TMP/afile"
 expect_exit1 "docroot is a file -> exit 1"   -p "$PORT" -r "$TMP/afile"
 expect_exit1 "extra argument -> exit 1"      -p "$PORT" -r "$DOCROOT" extra
+expect_exit1 "unknown long option -> exit 1" -p "$PORT" -r "$DOCROOT" --merge
 
 : >"$LOG"
 if start_server; then
@@ -241,6 +243,24 @@ fi
 code=$(curl -s -o "$TMP/big" -w '%{http_code}' -m 5 "${URL}big.bin")
 [ "$code" = 200 ] && cmp -s "$TMP/big" "$DOCROOT/big.bin" && ok "GET 1MB file -> identical bytes" \
                                                           || bad "GET 1MB file -> identical bytes (got $code)"
+
+# www/ 예제 파일 (#6): 상태, Content-Type, Content-Length 가 원본 크기, 본문 바이트가 원본과 같음
+expect_file() {
+    path=$1 type=$2 src=$DOCROOT/site/$1
+    size=$(wc -c <"$src" | tr -d ' ')
+    code=$(curl -s -D "$TMP/fh" -o "$TMP/fb" -w '%{http_code}' -m 3 "${URL}site/$path")
+    tr -d '\r' <"$TMP/fh" >"$TMP/fh.lf"
+    if [ "$code" = 200 ] && grep -Fqx "Content-Type: $type" "$TMP/fh.lf" \
+       && grep -Fqx "Content-Length: $size" "$TMP/fh.lf" && cmp -s "$TMP/fb" "$src"; then
+        ok "GET $path -> 200 $type, identical bytes"
+    else
+        bad "GET $path -> 200 $type, identical bytes (got $code)"
+        cat "$TMP/fh.lf"
+    fi
+}
+expect_file index.html   'text/html; charset=utf-8'
+expect_file style.css    'text/css; charset=utf-8'
+expect_file img/logo.png 'image/png'
 
 # 상태 코드: 기대값 설명 curl인자...
 expect_code() {
@@ -622,5 +642,41 @@ EOF
 # (응답 시작 뒤라 502 가 아니다). 끝나면 kill %1 %2.
 : >"$LOG"
 proxy_tests
+
+# 경로 정규형 (#31): 라우팅과 정적 파일이 같은 정규형을 본다.
+# 프런트 docroot 에 프록시 접두사와 같은 경로의 파일(admin/x)을 두고, 라우트를 건너뛰어 그 파일이
+# 열리는지 본다. 프록시로 가면 502 (백엔드 127.0.0.1:9 는 아무도 안 듣는 포트라 연결 거절)
+mkdir -p "$DOCROOT/admin"
+printf 'front file\n' >"$DOCROOT/admin/x"
+printf '/admin 127.0.0.1:9\n' >"$TMP/norm.conf"
+: >"$LOG"
+if start_server -c "$TMP/norm.conf"; then
+    expect_code 502 "GET /admin/x (proxy route)"          --path-as-is "${URL}admin/x"
+    expect_code 400 "GET //admin/x (empty segment)"       --path-as-is "${URL}/admin/x"
+    expect_code 502 "GET /%61dmin/x (normalized to proxy)" --path-as-is "${URL}%61dmin/x"
+    expect_code 400 "GET /admin%2Fx"                      --path-as-is "${URL}admin%2Fx"
+    expect_code 400 "GET /admin%5Cx"                      --path-as-is "${URL}admin%5Cx"
+    expect_code 400 'GET /admin\x'                        --path-as-is "${URL}admin\\x"
+    body=$(curl -s -m 3 --path-as-is "${URL}%61pi/add?a=1&b=2")
+    [ "$body" = 3 ] && ok "GET /%61pi/add?a=1&b=2 -> app 3" || bad "GET /%61pi/add?a=1&b=2 -> app 3 (got '$body')"
+    stop_server TERM
+else
+    bad "server starts with proxy config"
+    cat "$LOG"
+fi
+
+# --merge-slashes: "//" 를 합쳐서 프록시로. getopt 에 넘어가면 glibc 가 -r 값을 "ge-slashes" 로
+# 덮어쓰므로(인자 위치와 무관), 로그의 docroot 가 그대로인지 본다
+: >"$LOG"
+if start_server --merge-slashes -c "$TMP/norm.conf"; then
+    grep -q "docroot $DOCROOT, .*merge slashes" "$LOG" && ok "--merge-slashes keeps -r and is logged" \
+                                                     || { bad "--merge-slashes keeps -r and is logged"; cat "$LOG"; }
+    expect_code 502 "--merge-slashes: GET //admin/x -> proxy" --path-as-is "${URL}/admin/x"
+    expect_code 200 "--merge-slashes: GET /sub//a.txt"        --path-as-is "${URL}sub//a.txt"
+    stop_server TERM
+else
+    bad "server starts with --merge-slashes"
+    cat "$LOG"
+fi
 
 exit $fail

@@ -32,7 +32,7 @@
 - 모듈(파서·응답·정적·앱·프록시 정책)은 소켓과 무관한 순수 함수로 두고 단위 테스트한다
 - 파서는 증분 방식: 완료 / 추가 입력 필요 / 오류 + **소비 바이트 수**를 반환하고, 다음 요청의 잔여 바이트를 보존한다 (keep-alive). 본문만 덜 온 추가 입력 필요는 소비 바이트 대신 **필요한 총 길이**를 돌려주고, 서버는 그만큼 모일 때까지 파서를 다시 부르지 않는다 (consume 하지 않음, `docs/interfaces.md`)
 - 원본 요청 대상(프록시 전달용)과 디코딩된 경로(파일 접근용)를 따로 저장한다
-  - **#31 에서 바뀜 (결정됨, 구현 전)**: 라우팅·백엔드 전달은 파서가 만든 경로 정규형 하나를 쓰고, `%2F`, 그냥 `\`·`%5C` 와 빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침, nginx 와 이름은 같고 기본값은 반대). 순서·이유는 `docs/decisions.md` 2026-11-23
+  - **#31 에서 바뀜 (구현됨)**: `target` 은 원본이 아니라 파서가 만든 **정규화된 요청 대상**(정규형 경로 + 원본 `?query`)이다. 라우팅·백엔드 전달은 이것을, 정적 파일은 이를 끝까지 디코딩한 `path` 를 쓴다. `%2F`, 그냥 `\`·`%5C` 와 빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침, nginx 와 이름은 같고 기본값은 반대). 파서 옵션은 `http_parse_options` 구조체로 넘긴다. 순서·이유는 `docs/decisions.md` 2026-11-23
 - 송신은 진행 상태(offset)를 저장하고, 막히면(`EAGAIN`) 이벤트 루프에 제어권을 돌려준다. 루프 안에서 끝날 때까지 `write` 를 반복하지 않는다
 - 백엔드 주소는 설정 로드 시 `getaddrinfo` 로 한 번 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
 - 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
@@ -102,9 +102,9 @@ scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
-docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), (예정) api.md, benchmark.md, classic.md
+docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), (예정) benchmark.md
 .claude/    settings.json (팀 공용 훅: 세션 동기화)
-www/        (예정) 정적 파일 예제
+www/        정적 파일 예제
 ```
 
 ## 명령
@@ -205,7 +205,7 @@ Claude의 노션 사용 범위:
 
 - 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10) 완료. 프록시 중계(#9)는 구현했고 리뷰 대기 중이다 (`server.c` 의 업스트림 상태 변경은 A 트랙 건호님 확인 필요)
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
-- `docs/api.md`, `docs/benchmark.md`, `docs/classic.md` → 이슈 #11, #3
+- `docs/benchmark.md` → 이슈 #11
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)
 - 노션 접근: 2026-11-20 새 주소로 프로젝트 페이지 읽기 확인됨 (claude.ai Notion 커넥터). 저장소 `.mcp.json` 의 Notion MCP 로그인은 팀원별로 확인 필요

@@ -127,6 +127,7 @@ typedef struct {
     int pfd_kind[PFD_MAX];                      /* pfds[i] 가 클라이언트 fd 인지 업스트림 fd 인지 */
     proxy_config proxy;                         /* -c 가 있을 때만 (서버 수명 동안 유지) */
     int has_proxy;
+    http_parse_options parse_opt;               /* 요청마다 같은 파서 옵션 (#31) */
 } server;
 
 /*
@@ -396,7 +397,7 @@ static int handle_request(server *s, conn *c)
     if (c->need_len != 0 && pending < c->need_len)
         return 0;
 
-    r = http_parse_request(buffer_peek(&c->in), pending, &c->req, &consumed, &status);
+    r = http_parse_request(buffer_peek(&c->in), pending, &s->parse_opt, &c->req, &consumed, &status);
     if (r == PARSE_NEED_MORE) {
         c->need_len = consumed;   /* 헤더가 아직이면 0: 다음 read 뒤에 다시 파싱 */
         return 0;
@@ -927,9 +928,10 @@ static void log_listening(const server *s)
 
     memset(&ss, 0, sizeof ss);
     v6 = getsockname(s->listen_fd, (struct sockaddr *)&ss, &len) == 0 && ss.ss_family == AF_INET6;
-    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s\n",
+    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s%s\n",
             s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", s->cfg->docroot,
-            s->has_proxy ? ", proxy config " : "", s->has_proxy ? s->cfg->proxy_conf : "");
+            s->has_proxy ? ", proxy config " : "", s->has_proxy ? s->cfg->proxy_conf : "",
+            s->parse_opt.merge_slashes ? ", merge slashes" : "");
 }
 
 /* 새 연결을 먼저 막고(listen 닫기) → 모든 연결·파일·업스트림 → 시그널 파이프 순으로 정리 */
@@ -957,6 +959,7 @@ int server_run(const server_config *cfg)
     }
     s->cfg = cfg;
     s->listen_fd = -1;
+    s->parse_opt.merge_slashes = cfg->merge_slashes;
     stop_requested = 0;
 
     if (cfg->proxy_conf != NULL) {
