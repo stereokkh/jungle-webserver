@@ -63,7 +63,7 @@ make docker-shell DISTRO=alpine         # 컨테이너 안에서 직접 확인
 ```
 src/        소스 (.c)
 include/    헤더 (.h)
-tests/      unit/ 단위 테스트(make unit), run.sh 스모크 테스트 (make test)
+tests/      unit/ 단위 테스트(make unit), run.sh 스모크 테스트, backends.sh 백엔드 2개 비교 (make test)
 docker/     검증용 Dockerfile (ubuntu, alpine)
 build/      빌드 산출물 (git 무시)
 ```

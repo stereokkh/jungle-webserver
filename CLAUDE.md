@@ -97,7 +97,7 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 ```
 src/        소스 (.c)
 include/    헤더 (.h)
-tests/      테스트 (unit/test_*.c: 모듈 단위 테스트, run.sh: 서버 스모크 테스트)
+tests/      테스트 (unit/test_*.c: 모듈 단위 테스트, run.sh: 서버 스모크 테스트, backends.sh: 같은 바이너리 백엔드 2개 직접 = 프록시 경유 비교 #10)
 scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync.sh: 세션 동기화 훅)
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
@@ -112,7 +112,7 @@ www/        정적 파일 예제
 ```bash
 make                                    # ./webserver 빌드
 make unit                               # 단위 테스트만 (tests/unit/test_*.c)
-make test                               # 빌드 + 단위 테스트 + 스모크 테스트
+make test                               # 빌드 + 단위 테스트 + 스모크 테스트 + 백엔드 2개 비교
 make asan                               # ASan+UBSan 으로 build/asan/ 에 따로 빌드해 make test (Alpine 불가)
 make WERROR=1                           # 경고를 에러로 (CI와 동일)
 make CC=clang                           # 컴파일러 지정
@@ -136,7 +136,7 @@ make classic                            # CS:APP Tiny를 classic/ 에 받아 빌
 - 모듈(파서·응답·정적·앱·프록시 정책)을 구현하면 `tests/unit/test_<모듈>.c` 에 단위 테스트를 추가한다. 매크로는 `tests/unit/test.h` (CHECK, CHECK_INT, CHECK_STR, CHECK_MEM, REQUIRE). 파일만 만들면 `make unit` 이 자동으로 빌드·실행한다
 - 파서 테스트는 `test_bytes()` 로 NUL 종료 없는 정확한 크기 버퍼를 넘긴다 (len 을 넘어 읽으면 `make asan` 이 잡음)
 - `tests/unit/test_contract.c` 는 모든 모듈이 구현 전후로 지킬 공통 계약이다. 깨지면 계약을 바꿀지 팀에서 먼저 정한다
-- 서버 동작은 `tests/run.sh` 에 테스트를 추가한다 (서버를 띄우고 curl로 요청/응답 확인)
+- 서버 동작은 `tests/run.sh` 에 테스트를 추가한다 (서버를 띄우고 curl로 요청/응답 확인). 우리 바이너리를 백엔드로 쓰는 프록시 검사만 `tests/backends.sh` (#10)
 - 작업을 마치면 최소 `make test` 와 `make asan` 을 돌리고, 소켓·헤더 관련 변경이면 `make docker-test DISTRO=alpine` 과 `make CC=clang WERROR=1` 도 확인한다
 
 ## 브랜치 / PR 규칙

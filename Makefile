@@ -56,14 +56,16 @@ DOCROOT ?= www
 run: $(TARGET)
 	./$(TARGET) -p "$(PORT)" -r "$(DOCROOT)"
 
-# make unit → 단위 테스트만, make test → 단위 테스트 + 스모크 테스트 (CI·docker-test 도 이것)
+# make unit → 단위 테스트만, make test → 단위 테스트 + 스모크 테스트 + 백엔드 2개 비교 (CI·docker-test 도 이것)
 # 스모크 테스트는 서버(BIN)와 가짜 백엔드(FAKE)를 환경 변수로 받는다
+# backends.sh 는 같은 바이너리를 백엔드 2개 + 프런트 1개로 띄워 직접 호출 = 프록시 경유를 본다 (#10)
 unit: $(UNIT_BINS)
 	@echo "== unit tests"
 	@fail=0; for t in $(UNIT_BINS); do ./$$t || fail=1; done; exit $$fail
 
 test: unit $(TARGET) $(FAKE)
 	BIN=./$(TARGET) FAKE=./$(FAKE) sh tests/run.sh
+	BIN=./$(TARGET) sh tests/backends.sh
 
 # make asan → AddressSanitizer + UBSan 으로 build/asan/ 에 따로 빌드해서 make test 와 같은 검사
 #   - 일반 빌드 산출물(build/*.o, ./webserver)과 섞이지 않는다
