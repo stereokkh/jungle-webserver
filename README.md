@@ -24,9 +24,12 @@ sudo apt update && sudo apt install -y build-essential git curl
 make                                  # ./webserver 생성
 ./webserver -p 8080 -r www            # Ctrl-C(SIGINT)·SIGTERM 으로 종료
 ./webserver -p 8080 -r www -c proxy.conf   # Reverse Proxy 설정 (지금은 읽기만, 중계는 #9 · 형식은 docs/interfaces.md)
+./webserver -p 8080 -r www --merge-slashes # 경로의 // 를 400 대신 / 로 합침 (#31 에서 구현 예정)
 make run                              # = ./webserver -p 8080 -r www
 make clean
 ```
+
+> `--merge-slashes` 는 nginx 의 `merge_slashes` 지시어와 같은 동작이지만 **기본값이 반대**입니다. nginx 는 기본으로 합치고, 이 서버는 기본으로 `//` 가 든 요청을 400 으로 거절합니다. 이유는 `docs/decisions.md` (2026-11-23).
 
 컴파일 플래그: `-std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic`
 POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef __linux__` 로 분기합니다.
