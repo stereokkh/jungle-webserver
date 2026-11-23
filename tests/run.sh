@@ -172,6 +172,7 @@ expect_exit1 "docroot missing -> exit 1"     -p "$PORT" -r "$TMP/nope"
 : >"$TMP/afile"
 expect_exit1 "docroot is a file -> exit 1"   -p "$PORT" -r "$TMP/afile"
 expect_exit1 "extra argument -> exit 1"      -p "$PORT" -r "$DOCROOT" extra
+expect_exit1 "unknown long option -> exit 1" -p "$PORT" -r "$DOCROOT" --merge
 
 : >"$LOG"
 if start_server; then
@@ -345,6 +346,42 @@ if start_server; then
     close_stalled_conns
 else
     bad "server restarts on the same port"
+    cat "$LOG"
+fi
+
+# 경로 정규형 (#31): 라우팅과 정적 파일이 같은 정규형을 본다.
+# 프런트 docroot 에 프록시 접두사와 같은 경로의 파일(admin/x)을 두고, 라우트를 건너뛰어 그 파일이
+# 열리는지 본다. #9 전이라 프록시로 가면 502 (백엔드 127.0.0.1:9 는 쓰지 않는 포트)
+mkdir -p "$DOCROOT/admin"
+printf 'front file\n' >"$DOCROOT/admin/x"
+printf '/admin 127.0.0.1:9\n' >"$TMP/norm.conf"
+: >"$LOG"
+if start_server -c "$TMP/norm.conf"; then
+    expect_code 502 "GET /admin/x (proxy route)"          --path-as-is "${URL}admin/x"
+    expect_code 400 "GET //admin/x (empty segment)"       --path-as-is "${URL}/admin/x"
+    expect_code 502 "GET /%61dmin/x (normalized to proxy)" --path-as-is "${URL}%61dmin/x"
+    expect_code 400 "GET /admin%2Fx"                      --path-as-is "${URL}admin%2Fx"
+    expect_code 400 "GET /admin%5Cx"                      --path-as-is "${URL}admin%5Cx"
+    expect_code 400 'GET /admin\x'                        --path-as-is "${URL}admin\\x"
+    body=$(curl -s -m 3 --path-as-is "${URL}%61pi/add?a=1&b=2")
+    [ "$body" = 3 ] && ok "GET /%61pi/add?a=1&b=2 -> app 3" || bad "GET /%61pi/add?a=1&b=2 -> app 3 (got '$body')"
+    stop_server TERM
+else
+    bad "server starts with proxy config"
+    cat "$LOG"
+fi
+
+# --merge-slashes: "//" 를 합쳐서 프록시로. getopt 에 넘어가면 glibc 가 -r 값을 "ge-slashes" 로
+# 덮어쓰므로(인자 위치와 무관), 로그의 docroot 가 그대로인지 본다
+: >"$LOG"
+if start_server --merge-slashes -c "$TMP/norm.conf"; then
+    grep -q "docroot $DOCROOT, .*merge slashes" "$LOG" && ok "--merge-slashes keeps -r and is logged" \
+                                                     || { bad "--merge-slashes keeps -r and is logged"; cat "$LOG"; }
+    expect_code 502 "--merge-slashes: GET //admin/x -> proxy" --path-as-is "${URL}/admin/x"
+    expect_code 200 "--merge-slashes: GET /sub//a.txt"        --path-as-is "${URL}sub//a.txt"
+    stop_server TERM
+else
+    bad "server starts with --merge-slashes"
     cat "$LOG"
 fi
 
