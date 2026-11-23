@@ -71,10 +71,33 @@ static int is_hex(int c)
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-/* 접두사 글자: '%', '?', '#', 제어 문자, 비 ASCII 는 없다 (원본 target 과 바이트 그대로 비교하므로) */
+/* 접두사 글자. 접두사는 정규화된 target 의 경로와 바이트 그대로 비교한다 (#31, docs/interfaces.md "경로 정규형").
+ * 접두사 쪽은 정규화하지 않으므로 '%' 는 받지 않는다: 정규형의 %XX 는 16진수 대문자이고 비예약 문자가 아니어야 해서,
+ * 받으려면 접두사도 같은 규칙으로 검사해야 한다 (비 ASCII 경로 라우팅은 지금 필요 없음).
+ * '?' 는 경로와 query 를 나누는 글자, '#'·제어 문자·비 ASCII 는 경로에 쓰려면 %XX 로 인코딩해야 하는 글자다 */
 static int is_prefix_char(int c)
 {
     return is_alnum(c) || (c != '\0' && strchr("-._~!$&'()*+,;=:@/", c) != NULL);
+}
+
+/* 정규형이 아닌 접두사인가: 빈 조각 "//" (끝 '/' 하나는 괜찮다), "."·".." 조각.
+ * 정규화된 target 에는 이것들이 없으므로 (--merge-slashes 여도 "//" 는 합쳐져 사라진다)
+ * 이런 접두사는 어떤 요청에도 안 맞는 죽은 라우트가 된다. 시작할 때 거절한다. p[0] == '/' 가 전제 */
+static int is_noncanonical_prefix(const char *p, size_t n)
+{
+    size_t i = 0, start, len;
+
+    while (i < n) {                     /* 여기서 p[i] 는 언제나 '/' */
+        start = ++i;
+        while (i < n && p[i] != '/')
+            i++;
+        len = i - start;
+        if (len == 0 && i < n)
+            return 1;                   /* "//" */
+        if ((len == 1 && p[start] == '.') || (len == 2 && p[start] == '.' && p[start + 1] == '.'))
+            return 1;                   /* ".", ".." 조각 */
+    }
+    return 0;
 }
 
 static int is_host_char(int c)
@@ -242,6 +265,8 @@ static int parse_line(conf_state *st, const char *line, size_t len, proxy_config
     for (i = 0; i < tl; i++)
         if (!is_prefix_char((unsigned char)t[i]))
             return conf_fail(st, "invalid character in prefix");
+    if (is_noncanonical_prefix(t, tl))
+        return conf_fail(st, "prefix not in canonical form (no '//', '.' or '..' segments)");
 
     /* 2. 중복 (바이트까지 같은 접두사만. "/api" 와 "/api/" 는 다르다) */
     for (i = 0; i < cfg->nroutes; i++)

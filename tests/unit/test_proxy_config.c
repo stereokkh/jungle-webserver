@@ -461,6 +461,31 @@ static void test_err_prefix(void)             /* E3 E4 E5 E6 */
     expect_err(conf_load("/a/\r127.0.0.1:1\n"), 1, "invalid character in prefix");
 }
 
+/* E21: 정규화된 target 에 없는 모양의 접두사 (빈 조각, 점 조각) 는 죽은 라우트라 시작할 때 거절 */
+static void test_err_prefix_not_canonical(void)
+{
+    static const char *const bad[] = {
+        "//", "//api", "/a//b", "/api//",
+        "/.", "/..", "/./api", "/a/../b", "/a/.", "/a/./", "/a/..",
+    };
+    char text[64];
+    size_t i;
+
+    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        snprintf(text, sizeof text, "%s 127.0.0.1:1\n", bad[i]);
+        expect_err(conf_load(text), 1, "not in canonical form");
+    }
+}
+
+/* C15: 점이 들어가도 "."·".." 조각이 아니면 정규형이다 */
+static void test_load_prefix_dots_not_segments(void)
+{
+    CHECK_INT(conf_load("/ 127.0.0.1:1\n/.well-known/ 127.0.0.1:2\n/a./ 127.0.0.1:3\n"
+                        "/.../ 127.0.0.1:4\n/a..b 127.0.0.1:5\n/..a/ 127.0.0.1:6\n"), 0);
+    CHECK_INT(g_msg[0], 0);
+    CHECK_INT(cfg.nroutes, 6);
+}
+
 static void test_err_no_backend(void)         /* E7 */
 {
     expect_err(conf_load("/api/\n"), 1, "no backend");
@@ -783,6 +808,8 @@ int main(void)
     RUN(test_err_too_many_routes);
     RUN(test_err_too_many_backends);
     RUN(test_err_prefix);
+    RUN(test_err_prefix_not_canonical);
+    RUN(test_load_prefix_dots_not_segments);
     RUN(test_err_no_backend);
     RUN(test_err_duplicate_prefix);
     RUN(test_err_invalid_backend);
