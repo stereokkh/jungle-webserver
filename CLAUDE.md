@@ -97,7 +97,7 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 ```
 src/        소스 (.c)
 include/    헤더 (.h)
-tests/      테스트 (unit/test_*.c: 모듈 단위 테스트, run.sh: 서버 스모크 테스트)
+tests/      테스트 (unit/test_*.c: 모듈 단위 테스트, run.sh: 서버 스모크 테스트, backends.sh: 같은 바이너리 백엔드 2개 직접 = 프록시 경유 비교 #10)
 scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync.sh: 세션 동기화 훅)
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
