@@ -2,11 +2,13 @@
  * proxy.c — 업스트림(백엔드) 중계
  *
  * CS:APP 대응: 없음
- * 구현 상태: proxy_build_request (요청 다시 쓰기) 는 #8 에서 구현했다.
- *   연결·중계(proxy_connect_start 와 아래 흐름)는 #9 에서 구현한다.
+ * 구현 상태: proxy_build_request (요청 다시 쓰기) 는 #8, 연결(proxy_connect_start·proxy_connect_result)과
+ *   응답 중계(proxy_relay_*, 머리 해석 + 본문 길이 판단)는 #9 에서 구현했다.
+ *   소켓을 만지는 것은 connect 두 함수뿐이고, proxy_relay_* 는 바이트와 buffer 만 다루는 순수 함수다
+ *   (단위 테스트 tests/unit/test_proxy_relay.c). poll 루프와 read/write 는 server.c 몫이다.
  * 흐름 (#9): handler_route → ROUTE_PROXY → proxy_next_backend → proxy_connect_start
  *   → POLLOUT 에서 SO_ERROR 확인 → 요청 송신 → 응답 수신 → 클라이언트로 중계
- *   - 응답 시작 전 실패: 502 (연결 실패) / 504 (타임아웃)
+ *   - 응답 시작 전 실패: 502 (연결 실패·깨진 응답) / 504 (타임아웃)
  *   - 응답 시작 후 실패: 연결 종료 + 자원 회수
  *   - 자동 재시도 없음
  * 담당: 트랙 B · 이슈 #8 (proxy_build_request), #9 (나머지)
@@ -17,8 +19,11 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "net.h"
 
 /* ---- 헤더 블록 읽기 도우미 ----
  * req->headers 는 입력 버퍼 안을 가리키고 NUL 로 끝나지 않는다.
@@ -220,7 +225,282 @@ fail:
 
 int proxy_connect_start(const proxy_backend *backend)
 {
-    /* TODO(#9): socket → net_set_nonblocking → connect. EINPROGRESS 면 fd 반환 */
-    (void)backend;
+    int fd, saved;
+
+    if (backend == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = socket(((const struct sockaddr *)&backend->addr)->sa_family, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    if (net_set_nonblocking(fd) < 0)
+        goto fail;
+    /* 논블로킹 connect 는 보통 EINPROGRESS 로 돌아오고 결과는 POLLOUT 뒤 SO_ERROR 로 본다.
+     * EINTR 도 연결은 커널이 이어서 하는 중이다 (다시 connect 를 부르면 EALREADY).
+     * 0 이어도 fd 를 돌려줘 서버는 같은 길(POLLOUT → proxy_connect_result)을 탄다 */
+    if (connect(fd, (const struct sockaddr *)&backend->addr, backend->addrlen) < 0
+        && errno != EINPROGRESS && errno != EINTR)
+        goto fail;
+    return fd;
+
+fail:
+    saved = errno;
+    close(fd);
+    errno = saved;
     return -1;
+}
+
+int proxy_connect_result(int fd)
+{
+    int err = 0;
+    socklen_t len = sizeof err;
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0)
+        return errno;
+    return err;
+}
+
+/* ---- 업스트림 응답 중계 ----
+ * 머리만 해석하고 바이트는 그대로 넘긴다 (규칙은 proxy.h). 데이터는 NUL 로 끝나지 않으므로
+ * 여기서도 str* 함수를 쓰지 않는다. 시작 전에는 머리를 r->head 에 모았다가, 해석이 끝나면
+ * (머리 + 이미 받은 본문)을 out 에 한 번에 덧붙인다. 그래서 시작 전 실패는 out 을 건드리지 않아
+ * 서버가 그 자리에 502 를 써 넣을 수 있다 */
+
+#define RELAY_CL_LIMIT ((uint64_t)1 << 53)     /* 이보다 큰 Content-Length 는 거절 (C5) */
+
+void proxy_relay_init(proxy_relay *r, int request_was_head)
+{
+    memset(r, 0, sizeof *r);
+    buffer_init(&r->head);
+    r->request_was_head = request_was_head != 0;
+    r->body_mode = PROXY_BODY_UNTIL_EOF;
+}
+
+void proxy_relay_free(proxy_relay *r)
+{
+    buffer_free(&r->head);
+}
+
+static int is_digit(unsigned char c)
+{
+    return c >= '0' && c <= '9';
+}
+
+/* Content-Length 값 v[0..n) → *out. 앞뒤 SP/TAB 은 뗀다. 숫자만 1자 이상, 2^53·size_t 초과는 -1 */
+static int parse_content_length(const char *v, size_t n, uint64_t *out)
+{
+    uint64_t acc = 0;
+    size_t b = 0, e = n, i;
+
+    while (b < e && (v[b] == ' ' || v[b] == '\t'))
+        b++;
+    while (e > b && (v[e - 1] == ' ' || v[e - 1] == '\t'))
+        e--;
+    if (b == e)
+        return -1;
+    for (i = b; i < e; i++) {
+        unsigned d;
+
+        if (!is_digit((unsigned char)v[i]))
+            return -1;
+        d = (unsigned)(v[i] - '0');
+        if (acc > (RELAY_CL_LIMIT - d) / 10)        /* acc * 10 + d 가 한도를 넘는다 */
+            return -1;
+        acc = acc * 10 + d;
+    }
+    if (acc > (uint64_t)SIZE_MAX)                   /* 32비트 size_t */
+        return -1;
+    *out = acc;
+    return 0;
+}
+
+/* 이유 문구·헤더 값에 올 수 있는 바이트: TAB, 0x20-0x7E, 0x80 이상 (obs-text). 그 밖의 제어 문자는 불가 */
+static int is_text_byte(unsigned char c)
+{
+    return c == '\t' || (c >= 0x20 && c != 0x7F);
+}
+
+/* 상태 줄 h[0..hl) 을 검사하고 줄 끝 다음 위치를 *next 에 준다. 맞으면 0 */
+static int parse_status_line(const char *h, size_t hl, int *status, size_t *next)
+{
+    size_t i;
+
+    if (hl < 14 || memcmp(h, "HTTP/1.", 7) != 0 || !is_digit((unsigned char)h[7]) || h[8] != ' ')
+        return -1;
+    for (i = 9; i < 12; i++)
+        if (!is_digit((unsigned char)h[i]))
+            return -1;
+    *status = (h[9] - '0') * 100 + (h[10] - '0') * 10 + (h[11] - '0');
+    i = 12;
+    if (h[i] == ' ') {                              /* SP 이유 문구 (비어 있어도 된다) */
+        for (i++; i < hl && h[i] != '\r'; i++)
+            if (!is_text_byte((unsigned char)h[i]))
+                return -1;
+    }
+    if (i + 1 >= hl || h[i] != '\r' || h[i + 1] != '\n')    /* 숫자 바로 뒤가 SP·CRLF 가 아니면 여기서 걸린다 */
+        return -1;
+    *next = i + 2;
+    return 0;
+}
+
+/* 머리 h[0..hl) (맨 끝이 빈 줄의 CRLF) 를 해석한다. 성공 0. 결과: 상태, Content-Length, Transfer-Encoding 유무 */
+static int parse_response_head(const char *h, size_t hl, int *status, int *has_cl, uint64_t *cl,
+                               int *has_te)
+{
+    size_t pos, i, colon;
+    uint64_t v;
+    int bad_cl = 0;
+
+    *has_cl = *has_te = 0;
+    if (parse_status_line(h, hl, status, &pos) < 0)
+        return -1;
+    if (*status < 200 || *status > 599)             /* 1xx 는 BAD (C1) */
+        return -1;
+    while (pos < hl) {
+        if (h[pos] == '\r')                         /* 빈 줄 = 머리 끝 */
+        {
+            if (pos + 2 != hl || h[pos + 1] != '\n')
+                return -1;
+            /* Content-Length 가 깨졌어도 Transfer-Encoding 이 있으면 어차피 무시한다 (C2) */
+            return (bad_cl && !*has_te) ? -1 : 0;
+        }
+        if (h[pos] == ' ' || h[pos] == '\t')        /* obs-fold */
+            return -1;
+        for (i = pos; i < hl && h[i] != ':'; i++)
+            if (!is_tchar((unsigned char)h[i]))
+                return -1;                          /* 이름이 토큰 글자가 아니다 ("Foo : x", 줄바꿈) */
+        if (i == hl || i == pos)
+            return -1;                              /* ':' 없음, 빈 이름 */
+        colon = i;
+        for (i++; i < hl && h[i] != '\r'; i++)
+            if (!is_text_byte((unsigned char)h[i]))
+                return -1;                          /* 맨 LF 도 여기서 걸린다 */
+        if (i + 1 >= hl || h[i + 1] != '\n')
+            return -1;
+        if (name_eq(h + pos, colon - pos, "content-length", 14)) {
+            if (parse_content_length(h + colon + 1, i - (colon + 1), &v) < 0) {
+                bad_cl = 1;                         /* TE 가 같이 있는지는 머리 끝에서 본다 */
+            } else {
+                if (*has_cl && v != *cl)            /* 줄이 여럿이면 값이 같아야 한다 (밀수 방지) */
+                    bad_cl = 1;
+                *has_cl = 1;
+                *cl = v;
+            }
+        } else if (name_eq(h + pos, colon - pos, "transfer-encoding", 17)) {
+            *has_te = 1;
+        }
+        pos = i + 2;
+    }
+    return -1;                                      /* 빈 줄 없이 끝남 (호출자가 CRLFCRLF 를 보장하므로 안 온다) */
+}
+
+/* 시작 후: 본문 바이트를 out 에 넘긴다 (끝을 넘는 바이트는 버린다) */
+static proxy_relay_result relay_body(proxy_relay *r, const char *data, size_t n, buffer *out)
+{
+    size_t take = n;
+
+    if (r->body_mode == PROXY_BODY_NONE)
+        return PROXY_RELAY_COMPLETE;
+    if (r->body_mode == PROXY_BODY_LENGTH && take > r->body_left)
+        take = r->body_left;
+    if (take > 0 && buffer_append(out, data, take) < 0)
+        return PROXY_RELAY_NOMEM;
+    if (r->body_mode == PROXY_BODY_LENGTH) {
+        r->body_left -= take;
+        if (r->body_left == 0)
+            return PROXY_RELAY_COMPLETE;
+    }
+    return PROXY_RELAY_MORE;
+}
+
+/* 시작 전: 모은 바이트에 머리가 다 있으면 해석해서 시작한다 */
+static proxy_relay_result relay_try_start(proxy_relay *r, buffer *out)
+{
+    const char *p = buffer_peek(&r->head);
+    size_t have = buffer_pending(&r->head);
+    size_t scan = have < HTTP_MAX_HEADER ? have : HTTP_MAX_HEADER;
+    size_t end = 0, i, take;
+    int status, has_cl, has_te;
+    uint64_t cl = 0;
+
+    /* 빈 줄(CRLFCRLF)을 앞 HTTP_MAX_HEADER 바이트 안에서 찾는다. 맨 LF 는 찾으면서 바로 거절한다
+     * (끝나지 않는 머리를 타임아웃까지 기다리지 않으려고) */
+    for (i = 0; i < scan; i++) {
+        if (p[i] != '\n')
+            continue;
+        if (i == 0 || p[i - 1] != '\r')
+            return PROXY_RELAY_BAD;
+        if (i >= 3 && p[i - 2] == '\n' && p[i - 3] == '\r') {
+            end = i + 1;
+            break;
+        }
+    }
+    if (end == 0)
+        return have > HTTP_MAX_HEADER ? PROXY_RELAY_BAD : PROXY_RELAY_MORE;
+    if (parse_response_head(p, end, &status, &has_cl, &cl, &has_te) < 0)
+        return PROXY_RELAY_BAD;
+
+    /* 본문 길이 규칙: HEAD·204·304 는 없음 (결정 3), TE 는 EOF 까지 (C2), CL 은 그 길이, 아무것도 없으면 EOF 까지 */
+    if (r->request_was_head || status == 204 || status == 304 || (!has_te && has_cl && cl == 0)) {
+        r->body_mode = PROXY_BODY_NONE;
+        r->body_left = 0;
+    } else if (has_te || !has_cl) {
+        r->body_mode = PROXY_BODY_UNTIL_EOF;
+        r->body_left = 0;
+    } else {
+        r->body_mode = PROXY_BODY_LENGTH;
+        r->body_left = (size_t)cl;
+    }
+
+    take = have - end;                              /* 머리와 함께 받은 본문 바이트 */
+    if (r->body_mode == PROXY_BODY_NONE)
+        take = 0;
+    else if (r->body_mode == PROXY_BODY_LENGTH && take > r->body_left)
+        take = r->body_left;
+    /* 머리와 본문은 head 버퍼에 이어져 있어 한 번에 덧붙인다. buffer_append 는 실패하면 out 을 건드리지 않으므로
+     * mark/rollback 이 따로 필요 없다. 실패하면 started 도 head 도 그대로다 */
+    if (buffer_append(out, p, end + take) < 0)
+        return PROXY_RELAY_NOMEM;
+    r->status = status;
+    r->started = 1;
+    if (r->body_mode == PROXY_BODY_LENGTH)
+        r->body_left -= take;
+    buffer_free(&r->head);
+    if (r->body_mode == PROXY_BODY_NONE || (r->body_mode == PROXY_BODY_LENGTH && r->body_left == 0))
+        return PROXY_RELAY_COMPLETE;
+    return PROXY_RELAY_MORE;
+}
+
+proxy_relay_result proxy_relay_input(proxy_relay *r, const char *data, size_t n, buffer *out)
+{
+    if (r->started)
+        return relay_body(r, data, n, out);
+    if (n > 0 && buffer_append(&r->head, data, n) < 0)
+        return PROXY_RELAY_NOMEM;
+    return relay_try_start(r, out);                 /* n == 0 이면 NOMEM 뒤 재시도 */
+}
+
+proxy_relay_result proxy_relay_eof(proxy_relay *r)
+{
+    if (!r->started)
+        return PROXY_RELAY_BAD;
+    if (r->body_mode == PROXY_BODY_LENGTH && r->body_left > 0)
+        return PROXY_RELAY_TRUNCATED;
+    return PROXY_RELAY_COMPLETE;
+}
+
+size_t proxy_relay_want(const proxy_relay *r, size_t room)
+{
+    size_t have;
+
+    if (!r->started) {
+        have = buffer_pending(&r->head);
+        return have > HTTP_MAX_HEADER ? 0 : HTTP_MAX_HEADER + 1 - have;
+    }
+    if (r->body_mode == PROXY_BODY_NONE)
+        return 0;
+    if (r->body_mode == PROXY_BODY_LENGTH && r->body_left < room)
+        return r->body_left;
+    return room;
 }

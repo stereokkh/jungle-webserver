@@ -5,13 +5,18 @@
  * 담당: 트랙 B · 이슈 #8 (proxy_build_request: 요청 다시 쓰기), #9 (connect·중계, 이벤트 루프 통합은 A와 협업)
  *
  * 서버(server.c)에서 쓰는 순서 (#9 에서 A·B 가 함께 확정):
- *   1. handler_route → ROUTE_PROXY, route → proxy_next_backend(route)
- *   2. proxy_build_request(req, backend, client_ip, &up_out)   ← 입력 버퍼 consume 전에
+ *   1. handler_route → ROUTE_PROXY, route → proxy_next_backend(route)   (Round-Robin, C9)
+ *   2. proxy_build_request(req, backend, client_ip, &up_out)   ← 입력 버퍼 consume 전에. 실패면 431 (결정 6)
  *   3. fd = proxy_connect_start(backend) → 실패면 502
- *   4. upstream POLLOUT → getsockopt(SO_ERROR) 확인 → up_out 송신
- *   5. upstream POLLIN → 받은 바이트를 클라이언트 out 버퍼로 중계
- *   - 응답 시작 전 실패 502, UPSTREAM_TIMEOUT_MS 초과 504, 시작 후 실패는 연결 종료
- *   - 업스트림 응답 해석(상태 줄 검사, 응답 끝 판단)은 #9 에서 함수를 추가한다
+ *   4. upstream POLLOUT·POLLERR·POLLHUP → proxy_connect_result(fd) 가 0 이 아니면 502 → up_out 송신
+ *   5. upstream POLLIN → proxy_relay_want 만큼 read → proxy_relay_input 으로 클라이언트 out 버퍼에 중계
+ *      (EOF·read 오류는 proxy_relay_eof)
+ *   - 응답 시작 전 실패 502, UPSTREAM_TIMEOUT_MS 초과 504, 시작 후 실패는 남은 out 을 보내고 연결 종료
+ *   - 자동 재시도 없음
+ *
+ * 결정 1-6 은 상철님이 11-23 설계 문답에서 정했고, C1-C9 는 구현 중 정해 11-23 확인했다.
+ *   C1-C5: 아래 "응답 중계" 블록. C6-C8: server.c 쪽 (docs/decisions.md). C9: proxy_next_backend 가
+ *   라우트마다 next 를 돌려 Round-Robin (proxy_config.c)
  */
 #ifndef PROXY_H
 #define PROXY_H
@@ -66,12 +71,79 @@
  *   http_parse_request 가 만든 블록은 통과한다),
  *   다시 쓴 머리(1 ~ 6 의 빈 줄까지)가 HTTP_MAX_HEADER 바이트를 넘음 (프런트 한도에 가까운 요청은
  *   Host 이름 교체와 줄 추가로 길어져 같은 바이너리의 백엔드가 431 로 거절한다. 보내지 않고 실패시키며
- *   응답 코드는 #9 가 정한다) */
+ *   서버는 431 로 답한다. 결정 6) */
 int proxy_build_request(const http_request *req, const proxy_backend *backend,
                         const char *client_ip, buffer *out);
 
-/* 논블로킹 connect 를 시작한다. 성공(진행 중 포함): fd, 실패: -1.
- * 완료 여부는 POLLOUT 후 getsockopt(SO_ERROR) 로 확인한다. fd 는 서버가 닫는다 */
+/* 논블로킹 connect 시작. 성공(진행 중 포함): fd, 실패: -1 (errno 유지). connect 가 0 이어도 fd 를 돌려주고
+ * 서버는 똑같이 POLLOUT 을 기다린다. EINPROGRESS·EINTR 은 진행 중으로 본다.
+ * (EINTR 뒤에는 connect 를 다시 부르지 않는다. 연결은 커널이 이어서 하고, 다시 부르면 EALREADY 가 난다)
+ * fd 는 서버가 닫는다 */
 int proxy_connect_start(const proxy_backend *backend);
+
+/* connect 결과: getsockopt(SO_ERROR). 연결됨 0, 실패면 그 errno (getsockopt 자체가 실패하면 그 errno).
+ * 업스트림 fd 의 POLLOUT·POLLERR·POLLHUP 어느 쪽이 와도 이 값만으로 판단한다 (결정 5) */
+int proxy_connect_result(int fd);
+
+/* ---- 응답 중계 (소켓 없는 순수 함수. 업스트림에서 읽은 바이트를 먹이면 클라이언트 out 에 덧붙인다) ----
+ *
+ * 결정 (상철, 11-23): 응답은 머리(상태 줄 + Content-Length)만 해석하고 받은 바이트를 그대로 중계한다
+ * (머리를 고쳐 쓰지 않는다). 백엔드에는 늘 "Connection: close" 를 보내므로(#8) 중계한 뒤 클라이언트
+ * 연결은 항상 닫는다. "응답 시작" = 머리 해석이 끝나 상태 줄 검사를 통과하고 머리 바이트를 out 에 넣은 때.
+ * 시작 전 실패는 502, 시작 후 실패는 이미 나간 바이트가 있어 연결 종료뿐이다.
+ *
+ * 본문 없음: 요청이 HEAD 이거나 상태가 204·304 이면 Content-Length 가 있어도 본문이 없다
+ * (우리 http_response.c 는 HEAD 응답에도 GET 의 길이를 쓴다). 그래서 요청 메서드를 기억한다.
+ *
+ * 구현 중 정한 것 (11-23 확인):
+ *   C1. 1xx 는 머리가 깨진 것으로 본다 → BAD (요청에서 Expect·Upgrade 를 빼므로 올 일이 없다)
+ *   C2. Transfer-Encoding 이 있으면(값 무관) 업스트림 EOF 까지가 본문이다. Content-Length 는 무시하고
+ *       바이트는 그대로 중계한다 (chunked 틀도 그대로 지나간다. 어차피 연결은 뒤에 닫는다)
+ *   C3. 중계 상한 PROXY_RELAY_MAX: 클라이언트 out 대기 바이트가 이보다 적을 때만 업스트림을 읽는다
+ *   C4. 머리 문법은 엄격하게: 줄 끝은 CRLF (맨 LF·맨 CR 은 BAD), obs-fold(줄 맨 앞 SP/TAB)는 BAD,
+ *       머리가 HTTP_MAX_HEADER(빈 줄까지 8192바이트)를 넘으면 BAD, 헤더 이름은 토큰 글자, 값에 제어 문자
+ *       (TAB 제외) 없음. 상태 줄: "HTTP/1." 숫자 SP 숫자 세 자리, 그 뒤 CRLF 또는 SP + 이유 문구 + CRLF.
+ *       상태는 100..599
+ *   C5. Content-Length 값: 앞뒤 SP/TAB 을 뗀 뒤 숫자만 1자 이상 (부호·쉼표 목록 불가). 2^53 이나 size_t 를
+ *       넘으면 BAD. 줄이 여러 개면 값이 모두 같아야 한다 (숫자로 비교) */
+#define PROXY_RELAY_MAX ((size_t)64 << 10)   /* 클라이언트 out 에 쌓아 둘 중계 바이트 상한 (역압력) */
+
+typedef enum { PROXY_BODY_NONE, PROXY_BODY_LENGTH, PROXY_BODY_UNTIL_EOF } proxy_body_mode;
+
+typedef enum {
+    PROXY_RELAY_MORE,       /* 업스트림 바이트가 더 필요하다 */
+    PROXY_RELAY_COMPLETE,   /* 응답 전체를 out 에 넣었다 → 업스트림 닫고, out 을 다 보낸 뒤 클라이언트 연결 종료 */
+    PROXY_RELAY_BAD,        /* 응답 시작 전: 머리가 깨졌거나 너무 길거나 EOF·오류 → 502 */
+    PROXY_RELAY_TRUNCATED,  /* 응답 시작 후 업스트림이 일찍 끝났다(EOF·오류) → out 을 다 보내고 연결 종료 */
+    PROXY_RELAY_NOMEM       /* buffer 덧붙이기 실패. 시작 전이면 502, 시작 후면 연결 종료 */
+} proxy_relay_result;
+
+typedef struct {
+    int request_was_head;   /* HEAD 요청이면 본문 없음 */
+    int started;            /* 응답 시작 (머리를 out 에 넣음) */
+    buffer head;            /* 시작 전 머리를 모으는 대기 버퍼 */
+    int status;
+    proxy_body_mode body_mode;
+    size_t body_left;       /* PROXY_BODY_LENGTH 일 때 남은 본문 바이트 */
+} proxy_relay;
+
+void proxy_relay_init(proxy_relay *r, int request_was_head);
+/* head 버퍼를 해제한다. 두 번 불러도 안전 */
+void proxy_relay_free(proxy_relay *r);
+
+/* 업스트림에서 읽은 n(>0) 바이트를 먹인다. 시작 전에는 head 에 모아 머리를 해석하고, 머리가 끝나면 머리 +
+ * 이미 받은 본문을 out 에 덧붙인다(시작). 본문 끝을 넘는 바이트는 버린다.
+ * 시작할 때 out 에 넣는 덧붙이기는 한 번에 롤백되므로, NOMEM 이면 out 은 그대로이고 started 는 0 이다.
+ * 시작과 동시에 본문이 끝나면(본문 없음, Content-Length 0, 이미 다 받음) 바로 COMPLETE */
+proxy_relay_result proxy_relay_input(proxy_relay *r, const char *data, size_t n, buffer *out);
+
+/* 업스트림 EOF 또는 read 오류: 시작 전이면 BAD, UNTIL_EOF 면 COMPLETE, LENGTH 에서 남았으면 TRUNCATED,
+ * 이미 끝났으면(NONE / body_left == 0) COMPLETE */
+proxy_relay_result proxy_relay_eof(proxy_relay *r);
+
+/* 지금 업스트림에서 최대 몇 바이트를 읽을지. 시작 전: HTTP_MAX_HEADER + 1 - 모은 머리 길이 (한도 초과 판정에
+ * 1바이트 여유). 시작 후: room(= 서버가 계산한 PROXY_RELAY_MAX - out 대기 바이트)과 LENGTH 의 body_left 중
+ * 작은 값 (UNTIL_EOF 는 room). 0 이면 지금은 읽지 않는다 (본문이 없는 모드는 읽을 것이 없으므로 0) */
+size_t proxy_relay_want(const proxy_relay *r, size_t room);
 
 #endif /* PROXY_H */

@@ -24,6 +24,12 @@ UNIT_BINS := $(UNIT_SRCS:$(UNIT_DIR)/%.c=$(BUILD_DIR)/unit/%)
 LIB_OBJS  := $(filter-out $(BUILD_DIR)/main.o,$(OBJS))
 DEPS      += $(UNIT_BINS:=.d)
 
+# 테스트 도구: tests/tools/<이름>.c 하나가 실행 파일 하나 (서버 모듈과 링크하지 않는 독립 프로그램).
+# fake_upstream 은 프록시 스모크 테스트가 502·504 를 만들 때 쓰는 가짜 백엔드 (이슈 #9)
+TOOL_DIR  := tests/tools
+FAKE      := $(BUILD_DIR)/tools/fake_upstream
+DEPS      += $(FAKE).d
+
 .PHONY: all clean run test unit asan classic docker-build docker-test docker-test-all docker-shell
 
 all: $(TARGET)
@@ -38,7 +44,10 @@ $(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)/unit
 	$(CC) $(CPPFLAGS) -I$(UNIT_DIR) $(WARN) $(CFLAGS) -MMD -MP -MT $@ -MF $@.d \
 		-o $@ $< $(LIB_OBJS) $(LDFLAGS)
 
-$(BUILD_DIR) $(BUILD_DIR)/unit:
+$(BUILD_DIR)/tools/%: $(TOOL_DIR)/%.c | $(BUILD_DIR)/tools
+	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) -MMD -MP -MT $@ -MF $@.d -o $@ $< $(LDFLAGS)
+
+$(BUILD_DIR) $(BUILD_DIR)/unit $(BUILD_DIR)/tools:
 	mkdir -p $@
 
 # make run [PORT=8080] [DOCROOT=www]
@@ -48,12 +57,13 @@ run: $(TARGET)
 	./$(TARGET) -p "$(PORT)" -r "$(DOCROOT)"
 
 # make unit → 단위 테스트만, make test → 단위 테스트 + 스모크 테스트 (CI·docker-test 도 이것)
+# 스모크 테스트는 서버(BIN)와 가짜 백엔드(FAKE)를 환경 변수로 받는다
 unit: $(UNIT_BINS)
 	@echo "== unit tests"
 	@fail=0; for t in $(UNIT_BINS); do ./$$t || fail=1; done; exit $$fail
 
-test: unit $(TARGET)
-	BIN=./$(TARGET) sh tests/run.sh
+test: unit $(TARGET) $(FAKE)
+	BIN=./$(TARGET) FAKE=./$(FAKE) sh tests/run.sh
 
 # make asan → AddressSanitizer + UBSan 으로 build/asan/ 에 따로 빌드해서 make test 와 같은 검사
 #   - 일반 빌드 산출물(build/*.o, ./webserver)과 섞이지 않는다

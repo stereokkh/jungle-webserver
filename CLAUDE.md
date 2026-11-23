@@ -54,9 +54,9 @@
 | `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 모든 모듈(`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config`, `proxy`)이 구현·테스트 완료됐다 (`proxy` 의 connect·응답 중계는 #9, 리뷰 대기). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
-- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 앱(#10)·프록시(#9)는 모듈이 붙으면 `server.c` 의 `respond()` 에서 스텁 처리(500, 502)만 걷어 내면 된다
+- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 프록시(#9)는 업스트림 상태(`CONN_UP_CONNECTING/SENDING/RECEIVING`)로 중계한다 (구현함, 리뷰 대기: 연결이 pollfd 를 둘 쓰고, 응답은 머리만 해석해 받은 바이트를 그대로 넘기며, 중계가 끝나면 클라이언트 연결을 닫는다. 결정은 `docs/decisions.md` 2026-11-23). 앱(#10)도 연결 완료됐다
 
 CS:APP Tiny (이슈 #3):
 
@@ -203,7 +203,7 @@ Claude의 노션 사용 범위:
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive 는 #7 에서 완료. 남은 것은 앱(#10), 프록시 설정·중계(#8 #9, 업스트림 상태는 A·B 협업)
+- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10) 완료. 프록시 중계(#9)는 구현했고 리뷰 대기 중이다 (`server.c` 의 업스트림 상태 변경은 A 트랙 건호님 확인 필요)
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
 - `docs/api.md`, `docs/benchmark.md`, `docs/classic.md` → 이슈 #11, #3
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖

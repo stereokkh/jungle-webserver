@@ -3,7 +3,7 @@
  *
  * 요청은 실제 http_parse_request 로 만들고 (NUL 종료 없는 정확한 크기의 힙 복사본),
  * 파서가 막는 입력(Transfer-Encoding, 깨진 헤더 블록)만 손으로 만든다.
- * 소켓과 이름 해석은 쓰지 않는다 (connect·중계는 #9).
+ * 소켓과 이름 해석은 쓰지 않는다 (connect 는 서버 스모크 테스트, 응답 중계는 test_proxy_relay.c).
  */
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
