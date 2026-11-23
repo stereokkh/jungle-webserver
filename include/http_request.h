@@ -75,7 +75,10 @@ typedef struct {
  *            값은 HTTP_MAX_HEADER + HTTP_MAX_BODY 이하다
  *   - DONE 이면 buf + *consumed 부터가 다음 요청이다 (keep-alive 파이프라이닝 잔여)
  *   - ERROR 면 *status 만 의미가 있고 *req 는 일부만 채워졌을 수 있다
- *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다)
+ *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다.
+ *      method 도 HEAD 오류 응답의 본문 생략을 위해 약속한다 (PR #29): 요청 라인이 앞 8KB 안에 있고
+ *      공백 둘 + 올바른 메서드 토큰까지 읽혔으면 채운다 (HEAD → HTTP_HEAD). 그 전에 실패하면
+ *      (공백 부족, 빈 메서드, 토큰 아닌 글자, 첫 줄이 8KB 를 넘는 431) 초기값 HTTP_GET)
  *   - Transfer-Encoding 이 있으면 501 (chunked 는 범위 밖)
  *   - Content-Length 가 두 줄 이상이면 값이 같아도 400 (프록시가 원본 헤더를 그대로 넘기므로)
  *   - 요청 라인 앞의 빈 줄(CRLF)은 건너뛴다 (RFC 9112 2.2). 건너뛴 바이트도 아래 8KB 와 consumed 에 들어간다

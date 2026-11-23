@@ -280,6 +280,39 @@ static void test_versions(void)
     CHECK_ERROR("GET / http/1.1\r\nHost: x\r\n\r\n", 400);
 }
 
+/* ERROR 때 method 계약 (헤더 주석, PR #29): 요청 라인을 읽은 뒤의 오류면 HEAD 가 남고,
+ * 그 전의 오류면 초기값 GET. server.c 가 이걸 보고 HEAD 오류 응답의 본문을 뺀다 */
+static void test_method_on_error(void)
+{
+    static char big[HTTP_MAX_HEADER + 64];
+    size_t n;
+
+    CHECK_ERROR("HEAD / HTTP/2.0\r\nHost: x\r\n\r\n", 505);       /* 버전 오류 */
+    CHECK_INT(req.method, HTTP_HEAD);
+    CHECK_ERROR("HEAD /a%zz HTTP/1.1\r\nHost: x\r\n\r\n", 400);   /* 경로 디코딩 오류 */
+    CHECK_INT(req.method, HTTP_HEAD);
+    CHECK_ERROR("HEAD / HTTP/1.1\r\n\r\n", 400);                  /* 헤더 단계 (Host 없음) */
+    CHECK_INT(req.method, HTTP_HEAD);
+
+    CHECK_ERROR("HEAD /x\r\nHost: x\r\n\r\n", 400);               /* 공백 하나: 메서드 모름 */
+    CHECK_INT(req.method, HTTP_GET);
+    CHECK_ERROR("HE@D / HTTP/1.1\r\nHost: x\r\n\r\n", 400);       /* 토큰 아닌 글자 */
+    CHECK_INT(req.method, HTTP_GET);
+
+    /* 431: 첫 줄이 8KB 안에 있으면 HEAD, 첫 줄 자체가 8KB 를 넘으면 GET */
+    n = (size_t)sprintf(big, "HEAD / HTTP/1.1\r\nX: ");
+    memset(big + n, 'a', HTTP_MAX_HEADER);
+    strcpy(big + n + HTTP_MAX_HEADER, "\r\n\r\n");
+    CHECK_ERROR(big, 431);
+    CHECK_INT(req.method, HTTP_HEAD);
+
+    n = (size_t)sprintf(big, "HEAD /");
+    memset(big + n, 'a', HTTP_MAX_HEADER);
+    strcpy(big + n + HTTP_MAX_HEADER, " HTTP/1.1\r\n\r\n");
+    CHECK_ERROR(big, 431);
+    CHECK_INT(req.method, HTTP_GET);
+}
+
 static void test_host(void)
 {
     CHECK_ERROR("GET / HTTP/1.1\r\n\r\n", 400);                         /* 1.1 은 필수 */
@@ -432,6 +465,7 @@ int main(void)
     RUN(test_large_body);
     RUN(test_methods);
     RUN(test_versions);
+    RUN(test_method_on_error);
     RUN(test_host);
     RUN(test_nul_bytes);
     RUN(test_fragment_in_target);
