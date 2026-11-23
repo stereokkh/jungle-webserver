@@ -214,6 +214,19 @@ expect_code 431 "9KB header"              -H "X-Big: $(head -c 9000 /dev/zero | 
 head -c 1100000 /dev/zero >"$TMP/huge"
 expect_code 413 "1.1MB body"              -H 'Expect:' --data-binary @"$TMP/huge" "$URL"
 
+# 내장 앱 (#10): 계산, 400, 405, echo 바이트 그대로, 모든 응답에 X-Instance
+body=$(curl -s -m 3 "${URL}api/add?a=1&b=2")
+[ "$body" = 3 ] && ok "GET /api/add?a=1&b=2 -> 3" || bad "GET /api/add?a=1&b=2 -> 3 (got '$body')"
+expect_code 400 "GET /api/add overflow"   "${URL}api/add?a=9223372036854775807&b=1"
+expect_code 405 "GET /api/echo"           "${URL}api/echo"
+printf 'a\000b\r\nc' >"$TMP/echo_in"
+curl -s -m 3 -H 'Expect:' --data-binary @"$TMP/echo_in" -o "$TMP/echo_out" "${URL}api/echo"
+cmp -s "$TMP/echo_in" "$TMP/echo_out" && ok "POST /api/echo -> identical bytes (NUL, CRLF)" \
+                                      || bad "POST /api/echo -> identical bytes (NUL, CRLF)"
+curl -s -m 3 -D "$TMP/app_head" -o /dev/null "${URL}api/nope"
+tr -d '\r' <"$TMP/app_head" | grep -q "^X-Instance: $PORT\$" && ok "404 under /api/ -> X-Instance: $PORT" \
+                                                     || bad "404 under /api/ -> X-Instance: $PORT"
+
 # HEAD: 헤더는 GET 과 같고(Content-Length 포함) 본문은 없다.
 # curl -X HEAD 는 Content-Length 만큼 본문을 기다려 멈추므로 원시 요청으로 본다
 ( printf 'HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1 ) |
