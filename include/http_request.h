@@ -7,6 +7,7 @@
  *                       "더 필요 / 완료 / 오류" + 소비 바이트 수를 돌려준다.
  *                       헤더를 버리지 않고 Host, Content-Length, Connection 을 해석하고,
  *                       원본 헤더 블록은 프록시가 그대로 전달할 수 있게 위치를 남긴다.
+ *                       경로는 정규형(target)과 끝까지 디코딩한 형태(path)를 만든다 (#31).
  */
 #ifndef HTTP_REQUEST_H
 #define HTTP_REQUEST_H
@@ -19,6 +20,15 @@
 #define HTTP_MAX_HOST     255
 
 typedef enum { HTTP_GET, HTTP_POST, HTTP_HEAD, HTTP_METHOD_OTHER } http_method;
+
+/*
+ * 파서 옵션 (#31, docs/decisions.md 2026-11-23 결정 4). 서버가 시작할 때 한 번 채우고 요청마다 같은 것을 넘긴다.
+ * 옵션이 늘면 인자를 추가하지 않고 이 구조체에 필드를 더한다 (예정: #35 백슬래시 처리 방식).
+ * 모든 필드가 0 인 구조체가 기본값이고, http_parse_request 에 NULL 을 넘겨도 기본값이다
+ */
+typedef struct {
+    int merge_slashes;   /* 0: 경로에 빈 조각 "//" 가 있으면 400 (기본). 1: "/" 하나로 합친다 (--merge-slashes) */
+} http_parse_options;
 
 typedef enum {
     PARSE_DONE,       /* 요청 하나 완성. *consumed = 요청 라인 + 헤더 + 본문 길이 */
@@ -39,12 +49,20 @@ typedef enum {
 typedef struct {
     http_method method;
     char method_str[16];            /* 원본 메서드 문자열 (501 로그·프록시 전달용) */
-    char target[HTTP_MAX_URI + 1];  /* 원본 요청 대상 "/a%20b?x=1" (프록시 전달용, 디코딩 안 함) */
-    char path[HTTP_MAX_URI + 1];    /* 퍼센트 디코딩한 경로 "/a b" (정적 파일 접근용).
-                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 와
-                                     * "." / ".." 조각을 400 으로 거절하므로 path 에는 이런 바이트와
-                                     * 점 조각이 없다 (원본 target 에도 디코딩 후 점 조각이 없다는 뜻) */
-    char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 디코딩 안 함. 없으면 "" */
+    /* 정규화된 요청 대상 = 정규형 경로 + 원본의 '?' 부분 그대로. 원본 문자열은 남기지 않는다 (#31).
+     *   예: "/%61pi/a%eb?x=%41" → "/api/a%EB?x=%41"
+     * 라우팅(proxy_match, app_match, app_handle)과 백엔드 전달(proxy_build_request)이 모두 이것을 쓴다.
+     * 판정한 문자열과 백엔드가 받는 문자열이 하나뿐이라 서로 다를 수 없다 (docs/decisions.md 2026-11-23).
+     * 정규형 경로에는 다음이 없다 (원본에 있으면 파서가 400):
+     *   인코딩 안 된 '\', 디코딩하면 '/' '\' NUL·제어 문자가 되는 %XX, 빈 조각 "//"
+     *   (merge_slashes 면 합쳐서 없앰), "." / ".." 조각.
+     * 비예약 문자(A-Z a-z 0-9 - . _ ~)의 %XX 는 글자로 디코딩되어 있고, 남은 %XX 는 16진수 대문자다.
+     * 디코딩은 한 번만 한다 ("%252F" 는 정규형에서도 "%252F") */
+    char target[HTTP_MAX_URI + 1];
+    char path[HTTP_MAX_URI + 1];    /* target 의 경로 부분을 끝까지 퍼센트 디코딩한 것 "/a b" (정적 파일 접근용).
+                                     * 위 규칙 때문에 NUL·제어 문자·'\'·점 조각·빈 조각이 없고,
+                                     * '/' 는 원래의 경로 구분자뿐이다 */
+    char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 원본 그대로 (디코딩·정규화 안 함). 없으면 "" */
     int version_minor;              /* HTTP/1.0 → 0, HTTP/1.1 → 1 */
 
     char host[HTTP_MAX_HOST + 1];   /* Host 헤더 값. 없으면 "" (HTTP/1.1 이면 400) */
@@ -61,7 +79,7 @@ typedef struct {
 } http_request;
 
 /*
- * buf[0..len) 에서 요청 하나를 파싱한다.
+ * buf[0..len) 에서 요청 하나를 파싱한다. opt 가 NULL 이면 기본값 (http_parse_options 주석).
  *   - buf 는 NUL 로 끝나지 않는다. len 을 넘어 읽지 않는다 (make asan 이 검사)
  *   - 상태를 저장하지 않는다. NEED_MORE 면 *consumed 를 보고 언제 다시 부를지 정한다:
  *       0  → 헤더가 아직 덜 옴. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다
@@ -88,7 +106,7 @@ typedef struct {
  *     그 뒤에 요청 라인(501, 414, 505), 경로(400), 헤더(400, 501), 본문(413, NEED_MORE) 순서
  *     (예: 대상 9000 바이트 GET 은 한 번에 오든 나눠 오든 항상 431)
  */
-parse_result http_parse_request(const char *buf, size_t len,
+parse_result http_parse_request(const char *buf, size_t len, const http_parse_options *opt,
                                 http_request *req, size_t *consumed, int *status);
 
 #endif /* HTTP_REQUEST_H */

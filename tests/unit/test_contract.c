@@ -90,10 +90,9 @@ static void test_app_match_prefix_only(void)
     set_get(&req, "/api");
     CHECK_INT(app_match(&req), 0);
 
-    /* 원본 target 기준: 표기만 바꾼 요청은 앱이 아니다 (proxy_match 와 같은 기준) */
-    set_get(&req, "/%61pi/add");
-    strcpy(req.path, "/api/add");
-    CHECK_INT(app_match(&req), 0);
+    /* app_match 는 target(파서가 만든 정규형)을 바이트 그대로 본다. "/%61pi/add" 같은 표기는
+     * 파서가 "/api/add" 로 바꿔서 넘기므로 app_match 가 디코딩하지 않는다 (#31).
+     * 파서를 거친 동작은 test_app.c test_add_normalized */
     set_get(&req, "/api/add");
     strcpy(req.target, "/api/add?a=1&b=2");
     CHECK_INT(app_match(&req), 1);

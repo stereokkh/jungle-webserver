@@ -16,10 +16,9 @@
  *   - Tiny 는 헤더를 읽고 버린다. 여기서는 Host, Content-Length, Connection 을 해석하고
  *     원본 헤더 블록 위치(headers)를 남긴다 (프록시 전달용, #9).
  *   - Tiny 는 uri 를 그대로 "." 뒤에 붙여 파일을 연다 (재현 ②: ../ 로 classic/ 밖 파일이 열림).
- *     여기서는 원본 target, 디코딩한 path, query 를 나눠 담고, path 에 제어 문자·잘못된 %XX 나
- *     "." / ".." 조각(%2e%2e 를 디코딩한 것 포함)이 있으면 400. 라우팅(원본 target)보다 먼저
- *     막아서, 점 조각 때문에 정리 전과 후의 경로가 서로 다른 라우트에 속하는 요청을 없앤다 (PR #26 리뷰).
- *     빈 조각·퍼센트 인코딩으로 생기는 차이는 남아 있다 (#31).
+ *     여기서는 정규화된 target, 끝까지 디코딩한 path, 원본 query 를 나눠 담는다 (normalize_target).
+ *     라우팅·백엔드 전달·정적 파일이 모두 한 정규형에서 나오므로 점 조각·빈 조각·퍼센트 인코딩으로
+ *     프록시 라우트를 건너뛰는 요청이 없다 (PR #26 리뷰, #31).
  *     static_open(#22) 의 글자 단위 정리 + realpath 는 두 번째 안전장치로 그대로 둔다.
  *   - Tiny 는 version 을 읽기만 하고 버리고(응답은 항상 1.0), 메서드는 strcasecmp 로 비교한다.
  *     여기서는 HTTP/1.0·1.1 만 받고(그 외 505), 메서드는 대소문자를 구분한다 (RFC 9112 3.1).
@@ -192,7 +191,7 @@ static int parse_request_line(const char *p, size_t n, http_request *req)
 }
 
 /* NUL 종료된 path 를 '/' 로 나눈 조각 중 "." 이나 ".." 가 있는가.
- * "...", ".a", "a..b", "a." 같은 이름은 점 조각이 아니다. 빈 조각("//")은 static_open 이 정리한다 */
+ * "...", ".a", "a..b", "a." 같은 이름은 점 조각이 아니다. 빈 조각은 normalize_target 이 먼저 처리한다 */
 static int has_dot_segment(const char *p)
 {
     while (*p != '\0') {
@@ -212,20 +211,46 @@ static int has_dot_segment(const char *p)
     return 0;
 }
 
-/*
- * req->target(NUL 종료) 을 '?' 에서 나눠 path(퍼센트 디코딩) 와 query(디코딩 안 함) 에 담는다.
- * 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)가 있거나 %XX 가 잘못되면 400.
- *   - %00 을 통과시키면 path 가 C 문자열로는 중간에서 끊겨, 검사한 이름과 연 파일이 달라진다
- *   - 디코딩한 path 에 "." 이나 ".." 조각이 있어도 400. 평문 "/a/../b" 와 "/a/%2E%2E/b",
- *     "%2F" 로 만든 "/a%2F..%2Fb" 가 같은 자리에서 걸린다
- *   - 라우팅은 원본 target 으로 하고(#18) 정적 파일은 정리한 경로로 열기 때문에, ".." 를 통과시키면
- *     "/public/../admin/x" 가 "/admin" 프록시 라우트를 건너뛰어 프런트 docroot 의 /admin/x 를 연다
- *     (PR #26 리뷰, 혜성). curl·브라우저는 보내기 전에 ".." 를 지우므로 (#3 재현 ②) 정상 요청은 영향 없음
- */
-static int split_target(http_request *req)
+/* RFC 3986 2.3 비예약 문자: 인코딩하든 안 하든 같은 URI 다 */
+static int is_unreserved(unsigned char c)
 {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+/*
+ * req->target(원본, NUL 종료) 을 정규화된 요청 대상으로 바꾸고 path·query 를 채운다.
+ * 성공 0, 실패 400. (#31, docs/decisions.md 2026-11-23)
+ *
+ * '?' 앞 경로를 한 번 훑어 정규형을 만든다. 하나라도 걸리면 400:
+ *   1. %XX 문법 오류 ("%G1", 끝이 잘린 "%2")
+ *   2. 인코딩 안 된 '\', 그리고 디코딩하면 '/', '\', NUL·제어 문자(0x01-0x1F, 0x7F) 가 되는 %XX
+ *        - %2F: 서버마다 구분자인지 데이터인지 해석이 갈린다 (Tomcat 400, Apache 404 기본값)
+ *        - '\': IIS·nginx Windows 빌드·Envoy 정규화는 '/' 로 읽는다. %5C 만 막으면 같은 우회가
+ *          인코딩만 빼고 들어온다. RFC 3986 pchar 에 없는 글자라 정상 클라이언트는 보내지 않는다
+ *          (Tomcat ALLOW_BACKSLASH=false 와 같음, PR #34 리뷰. '/' 로 바꾸는 선택지는 #35)
+ *        - %00: 통과시키면 path 가 C 문자열로는 중간에서 끊겨 검사한 이름과 연 파일이 달라진다
+ *   3. 빈 조각 "//": 기본 400, opt->merge_slashes 면 '/' 하나로 합친다.
+ *      끝 '/' 하나("/a/")는 허용, "/a//" 는 빈 조각이다
+ *   4. 비예약 문자의 %XX 만 글자로 디코딩한다 ("%61" → "a", "%7E" → "~"). 나머지 %XX 는 두고
+ *      16진수만 대문자로 ("%eb" → "%EB")
+ *   5. 디코딩한 path 에 "." / ".." 조각 (PR #27). '.' 은 비예약 문자라 "%2E%2E" 도 4 에서 ".." 가 된다.
+ *      curl·브라우저는 보내기 전에 ".." 를 지우므로 (#3 재현 ②) 정상 요청은 영향 없음
+ * 정규형은 원본보다 길어지지 않으므로 HTTP_MAX_URI 안에 들어간다.
+ *
+ * 그다음 target = 정규형 경로 + 원본의 '?' 부분 (빈 query "/a?" 도 그대로),
+ * path = 정규형 경로를 한 번 끝까지 디코딩한 것. 디코딩은 한 번만이라 "%252F" 는 path 에서 글자 "%2F" 다.
+ *
+ * Tiny 와 이전 코드는 라우팅을 원본 target, 파일을 디코딩·정리한 경로로 해서 같은 요청을 두 가지로
+ * 읽었다 ("//admin/x", "/%61dmin/x", "/admin%2Fx" 가 프록시 라우트를 건너뜀, #31 재현).
+ * 이제 라우팅·백엔드 전달·정적 파일이 모두 이 한 정규형에서 나온다.
+ */
+static int normalize_target(http_request *req, const http_parse_options *opt)
+{
+    static const char hex[] = "0123456789ABCDEF";
     const char *q = strchr(req->target, '?');
     size_t raw_len = q ? (size_t)(q - req->target) : strlen(req->target);
+    char *norm = req->path;           /* 정규형 경로를 잠시 여기에 만든다 (원본보다 길어지지 않음) */
     size_t i, o = 0;
 
     if (q)
@@ -240,21 +265,58 @@ static int split_target(http_request *req)
             int hi, lo;
 
             if (i + 2 >= raw_len)
-                return 400;
+                return 400;                                       /* 1 */
             hi = hex_value((unsigned char)req->target[i + 1]);
             lo = hex_value((unsigned char)req->target[i + 2]);
             if (hi < 0 || lo < 0)
-                return 400;
+                return 400;                                       /* 1 */
             c = (unsigned char)(hi * 16 + lo);
             i += 2;
+            if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F)
+                return 400;                                       /* 2 */
+            if (is_unreserved(c)) {
+                norm[o++] = (char)c;                              /* 4 */
+            } else {
+                norm[o++] = '%';
+                norm[o++] = hex[hi];
+                norm[o++] = hex[lo];
+            }
+            continue;
         }
-        if (c < 0x20 || c == 0x7F)
-            return 400;
+        if (c == '\\')
+            return 400;                                           /* 2 */
+        if (c == '/' && o > 0 && norm[o - 1] == '/') {            /* 3 */
+            if (opt == NULL || !opt->merge_slashes)
+                return 400;
+            continue;
+        }
+        norm[o++] = (char)c;
+    }
+
+    /* target = 정규형 경로 + 원본의 '?' 부분. query 는 위에서 따로 복사해 두었다 */
+    memcpy(req->target, norm, o);
+    if (q) {
+        req->target[o] = '?';
+        strcpy(req->target + o + 1, req->query);
+    } else {
+        req->target[o] = '\0';
+    }
+
+    /* path = 정규형 경로를 끝까지 디코딩. 남은 %XX 는 위에서 검사해서 금지 바이트가 나오지 않는다 */
+    for (i = 0, o = 0; req->target[i] != '\0' && req->target[i] != '?'; i++) {
+        unsigned char c = (unsigned char)req->target[i];
+
+        if (c == '%') {
+            c = (unsigned char)(hex_value((unsigned char)req->target[i + 1]) * 16
+                                + hex_value((unsigned char)req->target[i + 2]));
+            i += 2;
+        }
         req->path[o++] = (char)c;
     }
     req->path[o] = '\0';
+
     if (has_dot_segment(req->path))
-        return 400;
+        return 400;                                               /* 5 */
     return 0;
 }
 
@@ -395,7 +457,7 @@ static int parse_headers(const char *p, size_t n, http_request *req)
     return 0;
 }
 
-parse_result http_parse_request(const char *buf, size_t len,
+parse_result http_parse_request(const char *buf, size_t len, const http_parse_options *opt,
                                 http_request *req, size_t *consumed, int *status)
 {
     size_t window = len < HTTP_MAX_HEADER ? len : HTTP_MAX_HEADER;
@@ -436,7 +498,7 @@ parse_result http_parse_request(const char *buf, size_t len,
     st = parse_request_line(start, line_len, req);
     if (st != 0)
         return fail(status, st);
-    st = split_target(req);
+    st = normalize_target(req, opt);
     if (st != 0)
         return fail(status, st);
 

@@ -13,10 +13,9 @@
 
 #define APP_PREFIX "/api/"
 
-/* req->target(디코딩 전 원본)이 APP_PREFIX 로 시작하면 1, 아니면 0. handler_route 가 부른다.
- * proxy_match 와 같은 기준(원본 target)을 본다. path(디코딩 후)를 보면
- * "/%61pi/add" 가 프록시 설정을 건너뛰고 이 서버의 앱으로 간다 (PR #18 리뷰).
- * 그런 요청은 앱·프록시 둘 다 안 맞아 정적 파일(404)로 간다 */
+/* req->target(파서가 만든 정규형)이 APP_PREFIX 로 시작하면 1, 아니면 0. handler_route 가 부른다.
+ * proxy_match 와 같은 문자열을 본다 (PR #18 리뷰: 라우팅 판정은 한 표현으로).
+ * 표기만 바꾼 "/%61pi/add" 는 파서가 "/api/add" 로 바꿔 오므로 앱(또는 /api 프록시 라우트)으로 간다 (#31) */
 int app_match(const http_request *req);
 
 /*
