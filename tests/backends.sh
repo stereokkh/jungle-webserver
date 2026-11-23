@@ -13,7 +13,7 @@ echo "== backends (#10): direct = proxy"
 BIN=${BIN:-./webserver}
 DOCROOT=${WWW:-www}
 HOST=127.0.0.1
-BASE=${PORT:-$((20000 + $$ % 20000))}
+BASE=${PORT:-$((20000 + $$ % 12000))}   # run.sh 와 같은 범위: 리눅스 ephemeral(32768~) 아래
 P1=$BASE
 P2=$((BASE + 1))
 PF=$((BASE + 2))
