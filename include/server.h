@@ -30,13 +30,26 @@
  * 클라이언트가 아직 읽지 않은 응답(413, 431 등)까지 버려질 수 있다 */
 #define CLIENT_LINGER_TIMEOUT_MS  2000
 
-/* 업스트림 연결·응답 대기 상한. 응답 시작 전에 넘으면 504 */
+/* 업스트림 시간 상한. 시계가 둘이다:
+ *   응답 시작 전: 요청을 프록시에 넘긴 때부터 머리가 다 올 때까지. 넘으면 504
+ *   응답 시작 후: 업스트림에서 읽으려고 기다리는 동안 바이트가 이만큼 안 오면 연결을 닫는다.
+ *                 느린 클라이언트 때문에 읽기를 멈춘 시간은 세지 않는다 (그건 CLIENT_IDLE_TIMEOUT_MS)
+ * 그래서 전체 전송 시간이 이보다 길어도 바이트 사이 간격이 짧으면 끝까지 중계된다.
+ * #ifndef 는 수동 검증(느리게 찔끔찔끔 보내는 업스트림) 때 -D 로 줄여 빌드하기 위한 것 */
+#ifndef UPSTREAM_TIMEOUT_MS
 #define UPSTREAM_TIMEOUT_MS     5000
+#endif
+/* 응답 시작 전에는 클라이언트 유휴 시계(CLIENT_IDLE_TIMEOUT_MS)도 같이 돈다. 업스트림 상한이 같거나 길면
+ * 클라이언트 쪽이 먼저 만료돼 504 대신 응답 없이 닫히므로 빌드에서 막는다 */
+#if UPSTREAM_TIMEOUT_MS >= CLIENT_IDLE_TIMEOUT_MS
+#error "UPSTREAM_TIMEOUT_MS must be smaller than CLIENT_IDLE_TIMEOUT_MS"
+#endif
 
 typedef struct {
     const char *port;        /* -p */
     const char *docroot;     /* -r */
     const char *proxy_conf;  /* -c (없으면 NULL → 프록시 없는 백엔드 인스턴스) */
+    int merge_slashes;       /* --merge-slashes: 경로의 빈 조각 "//" 를 400 대신 "/" 로 합친다 (#31) */
 } server_config;
 
 /* 이벤트 루프를 돌린다. 시그널로 정상 종료하면 0, 초기화 실패 시 -1 */

@@ -41,7 +41,8 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 | 클라이언트 소켓, `conn` 구조체 | A `server.c` | `conn_close` 하나에서만 |
 | `conn.in`, `conn.out`, `conn.up_out` 버퍼 | A `conn` | `conn_close` 의 `buffer_free` |
 | 열린 정적 파일 (`static_file.fd`) | `conn.file` | `static_close` (`conn_close` 가 호출) |
-| 업스트림 소켓 | `conn.upstream_fd` | `conn_close` 가 `close` |
+| 업스트림 소켓 | `conn.upstream_fd` | 응답 끝·실패 때 `up_release`, 아니면 `conn_close` 가 `close` |
+| `conn.relay` (`proxy_relay`, 머리 대기 버퍼 포함) | A `conn` | `proxy_relay_free` (`up_release`, `conn_close`). 두 번 불러도 안전 |
 | `proxy_config` | `server_run` 지역 변수 (서버 수명) | 프로그램 종료 시 (힙 할당 없음) |
 
 규칙:
@@ -64,8 +65,9 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 | `int` 0 / -1 | 성공 / 실패 (결과는 인자로 받은 buffer·구조체에) | `buffer_append`, `http_append_*`, `app_handle`, `proxy_build_request`, `static_open` |
 | `int` 1 / 0 | 예 / 아니오 | `app_match` |
 | `int` 1 / 0 / -1 | 끝남 / 아직 남음 (EAGAIN 포함) / 오류 | `static_send_some` |
-| `enum` | 세 가지 이상 결과 | `http_parse_request` → `parse_result`, `handler_route` → `route_kind` |
+| `enum` | 세 가지 이상 결과 | `http_parse_request` → `parse_result`, `handler_route` → `route_kind`, `proxy_relay_input`·`proxy_relay_eof` → `proxy_relay_result` |
 | fd 또는 -1 | 연 소켓 / 실패 (`errno` 유지) | `net_listen`, `proxy_connect_start` |
+| `int` 0 / errno | 성공 / 실패한 errno | `proxy_connect_result` |
 
 4xx·5xx 응답을 **쓴 것**은 성공(0)이다. -1 은 응답조차 쓰지 못했을 때(메모리 부족)만 쓰고, 그때 서버는 연결을 닫는다.
 
@@ -76,7 +78,9 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 | `CONN_READING` | 클라이언트 POLLIN | 요청 완성 → 응답 준비 후 `CONN_WRITING` |
 | `CONN_WRITING` | 클라이언트 POLLOUT | out 다 보냄 → 파일 있으면 `CONN_SENDING_FILE`, 아니면 keep-alive 면 `CONN_READING` / 아니면 `CONN_LINGERING` |
 | `CONN_SENDING_FILE` | 클라이언트 POLLOUT | `static_send_some` 이 1 → `static_close` → keep-alive 판단 |
-| `CONN_UPSTREAM` | 업스트림 POLLOUT/POLLIN | #9 에서 세분화 (연결 중 / 요청 송신 / 응답 중계) |
+| `CONN_UP_CONNECTING` | 업스트림 POLLOUT | `proxy_connect_result`(SO_ERROR) 가 0 이면 `CONN_UP_SENDING`, 아니면 502 |
+| `CONN_UP_SENDING` | 업스트림 POLLOUT | `up_out`(다시 쓴 요청)을 다 보내면 `CONN_UP_RECEIVING`. 쓰기 오류는 502 |
+| `CONN_UP_RECEIVING` | 업스트림 POLLIN, 응답 시작 후 out 에 바이트가 있으면 클라이언트 POLLOUT | 응답 끝·업스트림 조기 종료 → `CONN_WRITING` (남은 out 을 보내고 닫기). 시작 전 실패는 502/504 |
 | `CONN_CLOSING` | 클라이언트 POLLOUT | out 다 보내면 `CONN_LINGERING` (파서 오류 응답 후, `Connection: close`) |
 | `CONN_LINGERING` | 클라이언트 POLLIN | `shutdown(SHUT_WR)` 뒤 받은 바이트는 버림. EOF·오류·마감이면 `conn_close` |
 
@@ -85,25 +89,39 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 | `CLIENT_IDLE_TIMEOUT_MS` | 10초 | 연결 닫기 (요청을 덜 보낸 느린 클라이언트, keep-alive 유휴) |
 | `CLIENT_REQUEST_TIMEOUT_MS` | 30초 | 요청 하나의 첫 바이트부터 완성까지. 넘으면 응답 없이 닫기 (1바이트씩 보내 유휴 타이머를 계속 리셋하는 slow loris) |
 | `CLIENT_LINGER_TIMEOUT_MS` | 2초 | `CONN_LINGERING` 의 상한. 넘으면 닫기 |
-| `UPSTREAM_TIMEOUT_MS` | 5초 | 응답 시작 전이면 504, 시작 후면 연결 닫기 |
+| `UPSTREAM_TIMEOUT_MS` | 5초 | 시계가 둘이다. 응답 시작 전: 요청을 프록시에 넘긴 때부터 머리가 다 올 때까지, 넘으면 504. 시작 후: 업스트림을 읽으려고 기다리는 동안 바이트가 안 오는 시간, 넘으면 이미 받은 out 을 보내고 닫기. 느린 클라이언트 때문에 읽기를 멈춘 시간은 세지 않는다 (그건 `CLIENT_IDLE_TIMEOUT_MS`) |
 
 - 같은 연결의 다음 요청(파이프라이닝)은 현재 응답을 다 보낸 뒤 `in` 에 남은 바이트로 처리한다. 응답을 보내는 동안에는 클라이언트 소켓을 읽지 않는다 (POLLOUT 만 감시)
 - 연결을 닫는 응답(`keep_alive == 0`, 오류 응답)은 바로 `close` 하지 않고 lingering close 한다. 읽지 않은 입력이 남은 채 `close` 하면 커널이 RST 를 보내 클라이언트가 아직 읽지 않은 응답까지 버려질 수 있다
-- 아직 스텁인 경로: `ROUTE_APP` 은 `app_handle` 이 -1 이면 500 + 닫기 (#10 전까지), `ROUTE_PROXY` 는 502 + 닫기 (#9 전까지. #8 전에는 `-c` 가 실패해 여기로 오지 않음)
+- 아직 스텁인 경로: `ROUTE_APP` 은 `app_handle` 이 -1 이면 500 + 닫기 (#10 전까지). `ROUTE_PROXY` 는 스텁이 아니다 (#9)
+- 프록시 경로 (#9): `respond()` 는 `RESPOND_PROXY` 를 돌려주고 out 을 비워 둔 채 `CONN_UP_CONNECTING` 으로 간다. 오류 코드는 다시 쓴 요청 실패 431, `proxy_connect_start` 실패 502, 시작 전 깨진·끊긴 머리 502, 시작 전 시간 초과 504
+  - 응답은 머리(상태 줄과 `Content-Length`)만 해석하고 받은 바이트를 그대로 `out` 에 넣는다. 백엔드에는 늘 `Connection: close` 를 보내므로 프록시 응답 뒤 클라이언트 연결은 항상 닫는다 (`keep_alive = 0`)
+  - 중계 상한: 클라이언트 `out` 에 대기한 바이트가 `PROXY_RELAY_MAX`(64KB) 이상이면 업스트림을 읽지 않는다 (역압력). 그래서 `BUFFER_MAX` 보다 큰 응답도 모으지 않고 흘려보낸다
+  - 응답 시작 = 머리 해석이 끝나 상태 줄 검사를 통과하고 머리 바이트를 `out` 에 넣은 때. 그 전 실패는 502/504, 그 뒤는 `out` 에 있는 것까지 보내고 닫는다 (재시도 없음)
+  - 본문 없음: 요청이 `HEAD` 이거나 상태가 204·304 이면 `Content-Length` 가 있어도 본문이 없다. `Transfer-Encoding` 이 있으면 업스트림 EOF 까지가 본문이다
+  - 한 연결이 pollfd 를 최대 둘 쓴다 (클라이언트, 업스트림). 프록시 중에는 클라이언트 입력을 읽지 않고 (`events` 0, 끊김만 감지), 응답이 시작돼 `out` 에 바이트가 있을 때만 클라이언트 POLLOUT 을 본다
+  - 업스트림 fd 는 `conn_close` 뿐 아니라 응답 끝·실패 때 `up_release` 가 닫는다 (`upstream_fd = -1` 로 두 번 닫기를 막는다)
 - `SIGINT`/`SIGTERM`: 새 연결을 받지 않고 모든 `conn` 을 `conn_close` 한 뒤 `server_run` 이 0 을 반환한다
 
 ## 정한 세부 규칙
 
-> **#31 에서 바뀔 규칙 (결정됨, 구현 전)**: 아래 "프록시 경로 매칭"·"앱 경로" 의 "디코딩 전 원본 `target`" 은 파서가 만든 경로 정규형으로 바뀌고, 백엔드에도 정규형을 전달한다. `%2F`, 그냥 `\`·`%5C`·빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침). 정규형 순서는 `docs/decisions.md` 2026-11-23
-
 - **요청 크기**: 헤더 8KB(431), URI 2KB(414), 본문 1MB(413). `Transfer-Encoding` 은 501
 - **431 우선**: 요청 시작부터 빈 줄까지가 8KB 를 넘으면 다른 오류보다 먼저 431. TCP 분할과 상관없이 같은 요청은 같은 코드
-- **경로의 금지 바이트**: 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)가 있거나 `%XX` 가 잘못되면 파서가 400. `static_open` 은 이를 전제로 한다
-- **경로의 점 조각**: 디코딩한 `path` 를 `/` 로 나눈 조각 중 `.` 이나 `..` 가 있으면 파서가 400 (`/a/../b`, `/a/%2E%2E/b`, `/a%2F..%2Fb` 모두). 라우팅(원본 `target`, `proxy_match`·`app_match`)보다 먼저 막혀서, **점 조각 때문에** 라우트가 갈리는 요청은 없다. `static_open` 의 `..` 정리·403 은 두 번째 안전장치로 남는다.
-  남은 차이 (PR #27 건호 재현, 설정 `/admin 127.0.0.1:9` + docroot `admin/x`): 라우팅은 원본 `target`, 정적 파일은 디코딩·정리한 `path` 를 봐서 빈 조각(`//admin/x`), 퍼센트 인코딩(`/%61dmin/x`, `/admin%2Fx`)은 프록시 라우트에 안 걸리고 docroot 파일을 연다 (200). 프런트 docroot 에 프록시 접두사와 같은 경로의 파일을 두지 않으면 드러나지 않는다. 코드 수정은 #31
-- **프록시 경로 매칭**: 디코딩 전 `target` 의 `?` 앞 경로로, 경로 경계에서만 (`/api` 는 `/apix` 에 안 맞음). 가장 긴 접두사가 이긴다. 경로·쿼리는 원본 `target` 그대로 전달한다 (접두사를 떼지 않음)
-- **앱 경로**: 디코딩 전 `target` 이 `/api/` 로 시작 (프록시 매칭과 같은 기준). 프록시 경로가 먼저라서 프록시 인스턴스에서는 백엔드로 가고, 백엔드 인스턴스(`-c` 없음)에서는 앱이 처리한다. `/%61pi/add` 처럼 표기를 바꾼 요청은 둘 다 안 맞아 정적 파일(404)로 간다. 정적 파일만 디코딩한 `path` 를 쓴다
-- **프록시 헤더**: hop-by-hop 헤더, `Connection` 값에 적힌 이름, `Expect` 는 빼고 전달한다. `Host`(백엔드 이름)·`X-Forwarded-For`(실제 클라이언트 IP)·`Content-Length`(원래 있었을 때만, 본문 길이로)·`Connection: close` 는 프록시가 새로 쓰고 클라이언트 값은 버린다. 요청마다 `Via: 1.1 jungle-webserver` 도 붙인다 (RFC 9110 7.6.3). `Connection` 에 적힌 이름이 이 줄들을 지우지는 못한다. 다시 쓴 머리가 `HTTP_MAX_HEADER`(8192)를 넘거나 헤더 줄이 파서 기준으로 깨졌으면 `proxy_build_request` 는 -1 이다 (같은 바이너리 백엔드가 어차피 431 로 거절할 길이)
+- **경로의 금지 바이트**: 디코딩 결과에 NUL·제어 문자(0x01-0x1F, 0x7F)·`/`(`%2F`)·`\` 가 있거나 `%XX` 가 잘못되면 파서가 400 (아래 "경로 정규형"). `static_open` 은 이를 전제로 한다
+- **경로 정규형 (#31)**: 파서가 `target` 을 **정규화된 요청 대상**(정규형 경로 + 원본의 `?` 부분)으로 채운다. 원본 문자열은 남기지 않는다. 라우팅(`proxy_match`·`app_match`·`app_handle`)과 백엔드 전달(`proxy_build_request`)이 모두 이 `target` 을, 정적 파일은 이를 끝까지 디코딩한 `path` 를 쓰므로 표기만 바꿔 라우트를 건너뛸 수 없다. 만드는 순서 (하나라도 걸리면 400):
+  1. `%XX` 문법 오류
+  2. 인코딩 안 된 `\`, 디코딩하면 `/` `\` NUL·제어 문자(0x01-0x1F, 0x7F)가 되는 `%XX`
+  3. 빈 조각 `//` (`--merge-slashes` = `http_parse_options.merge_slashes` 면 하나로 합침. 끝 `/` 하나는 허용)
+  4. 비예약 문자(`A-Z a-z 0-9 - . _ ~`)의 `%XX` 만 글자로, 나머지 `%XX` 는 16진수 대문자 (`%eb` → `%EB`)
+  5. 디코딩한 `path` 의 `.`·`..` 조각 (`/a/../b`, `/a/%2E%2E/b` 모두)
+
+  디코딩은 한 번만 (`%252F` 는 `path` 에서 글자 `%2F`). `query` 는 원본 그대로. `static_open` 의 `..` 정리·403 은 두 번째 안전장치로 남는다. 순서·이유는 `docs/decisions.md` 2026-11-23
+- **파서 옵션**: `http_parse_request(buf, len, opt, ...)` 의 `opt` 는 `http_parse_options` (NULL = 기본값). 서버는 시작할 때 `server_config` 에서 한 번 채워 요청마다 같은 것을 넘긴다. 옵션이 늘면 인자 대신 필드를 추가한다 (#35)
+- **프록시 경로 매칭**: 정규화된 `target` 의 `?` 앞 경로로, 경로 경계에서만 (`/api` 는 `/apix` 에 안 맞음). 가장 긴 접두사가 이긴다. 경로·쿼리는 정규화된 `target` 그대로 전달한다 (접두사를 떼지 않음)
+- **앱 경로**: 정규화된 `target` 이 `/api/` 로 시작 (프록시 매칭과 같은 문자열). 프록시 경로가 먼저라서 프록시 인스턴스에서는 백엔드로 가고, 백엔드 인스턴스(`-c` 없음)에서는 앱이 처리한다. `/%61pi/add` 는 정규형이 `/api/add` 라 같은 곳으로 간다
+- **프록시 헤더**: hop-by-hop 헤더, `Connection` 값에 적힌 이름, `Expect` 는 빼고 전달한다. `Host`(백엔드 이름)·`X-Forwarded-For`(실제 클라이언트 IP)·`Content-Length`(원래 있었을 때만, 본문 길이로)·`Connection: close` 는 프록시가 새로 쓰고 클라이언트 값은 버린다. 요청마다 `Via: 1.1 jungle-webserver` 도 붙인다 (RFC 9110 7.6.3). `Connection` 에 적힌 이름이 이 줄들을 지우지는 못한다. 다시 쓴 머리가 `HTTP_MAX_HEADER`(8192)를 넘거나 헤더 줄이 파서 기준으로 깨졌으면 `proxy_build_request` 는 -1 이다 (같은 바이너리 백엔드가 어차피 431 로 거절할 길이). 서버는 이 -1 을 431 로 답한다 (파서·설정 로더가 막아 주므로 현실적인 원인은 머리 길이 초과, 그 밖에 메모리 부족)
+- **프록시 응답 해석** (`proxy_relay_*`, #9): 상태 줄은 `HTTP/1.` 숫자 + 세 자리 상태(100..599)여야 하고 1xx 는 깨진 머리로 본다 (요청에서 `Expect`·`Upgrade` 를 뺐으므로). 머리는 CRLF 줄, obs-fold 없음, 빈 줄까지 8192바이트 이하. `Content-Length` 는 숫자만 (2^53 이하), 여러 줄이면 값이 같아야 한다. 어기면 시작 전 502
+- **Round-Robin** (`proxy_next_backend`): 라우트마다 `next` 를 돌려 0, 1, ..., n-1, 0 순. 재시도·페일오버 없음
 - **프록시 설정 파일 (`proxy_config_load`)**: 한 줄에 `접두사 host:port...` (IPv6 는 `[::1]:8001`), `#` 주석, 빈 파일은 오류. 한도: 줄 1024바이트, 접두사 127, 백엔드 토큰 63, 라우트 16, 라우트당 백엔드 8, 포트 1-65535 (앞자리 0 없는 10진수, 숫자 호스트도 앞자리 0 없는 점 넷 IPv4). 이름은 시작할 때 한 번 해석하고 IPv4 를 먼저 고른다 (`localhost` 가 `::1` 로 풀려 연결이 거절되는 것을 피함. 백엔드 인스턴스는 IPv4 loopback 을 받아야 한다). 오류는 -1 과 stderr `파일:줄: 이유` (줄이 없는 파일 전체 오류는 `파일: 이유`) 이고 서버는 시작하지 않는다
 - **오류 응답의 추가 헤더**: `http_append_error` 의 `extra_headers` 로 넣는다. 405 `Allow` 는 호출자가 넣고(정적 `GET, HEAD`, echo `POST`), 앱의 오류에도 `X-Instance` 를 붙인다
 - **HEAD**: 헤더는 GET 과 같게(Content-Length 포함), 본문은 보내지 않는다

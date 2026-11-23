@@ -32,7 +32,7 @@
 - 모듈(파서·응답·정적·앱·프록시 정책)은 소켓과 무관한 순수 함수로 두고 단위 테스트한다
 - 파서는 증분 방식: 완료 / 추가 입력 필요 / 오류 + **소비 바이트 수**를 반환하고, 다음 요청의 잔여 바이트를 보존한다 (keep-alive). 본문만 덜 온 추가 입력 필요는 소비 바이트 대신 **필요한 총 길이**를 돌려주고, 서버는 그만큼 모일 때까지 파서를 다시 부르지 않는다 (consume 하지 않음, `docs/interfaces.md`)
 - 원본 요청 대상(프록시 전달용)과 디코딩된 경로(파일 접근용)를 따로 저장한다
-  - **#31 에서 바뀜 (결정됨, 구현 전)**: 라우팅·백엔드 전달은 파서가 만든 경로 정규형 하나를 쓰고, `%2F`, 그냥 `\`·`%5C` 와 빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침, nginx 와 이름은 같고 기본값은 반대). 순서·이유는 `docs/decisions.md` 2026-11-23
+  - **#31 에서 바뀜 (구현됨)**: `target` 은 원본이 아니라 파서가 만든 **정규화된 요청 대상**(정규형 경로 + 원본 `?query`)이다. 라우팅·백엔드 전달은 이것을, 정적 파일은 이를 끝까지 디코딩한 `path` 를 쓴다. `%2F`, 그냥 `\`·`%5C` 와 빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침, nginx 와 이름은 같고 기본값은 반대). 파서 옵션은 `http_parse_options` 구조체로 넘긴다. 순서·이유는 `docs/decisions.md` 2026-11-23
 - 송신은 진행 상태(offset)를 저장하고, 막히면(`EAGAIN`) 이벤트 루프에 제어권을 돌려준다. 루프 안에서 끝날 때까지 `write` 를 반복하지 않는다
 - 백엔드 주소는 설정 로드 시 `getaddrinfo` 로 한 번 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
 - 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
@@ -54,9 +54,9 @@
 | `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 모든 모듈(`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config`, `proxy`)이 구현·테스트 완료됐다 (`proxy` 의 connect·응답 중계는 #9, 리뷰 대기). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
-- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 앱(#10)·프록시(#9)는 모듈이 붙으면 `server.c` 의 `respond()` 에서 스텁 처리(500, 502)만 걷어 내면 된다
+- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 프록시(#9)는 업스트림 상태(`CONN_UP_CONNECTING/SENDING/RECEIVING`)로 중계한다 (구현함, 리뷰 대기: 연결이 pollfd 를 둘 쓰고, 응답은 머리만 해석해 받은 바이트를 그대로 넘기며, 중계가 끝나면 클라이언트 연결을 닫는다. 결정은 `docs/decisions.md` 2026-11-23). 앱(#10)도 연결 완료됐다
 
 CS:APP Tiny (이슈 #3):
 
@@ -203,7 +203,7 @@ Claude의 노션 사용 범위:
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 앱(#10), 프록시 설정·중계(#8 #9, PR #36) 완료. 남은 것은 정적 파일 keep-alive 응답의 약 44ms 지연 (`TCP_NODELAY`, `server.c`, `docs/benchmark.md`)
+- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10), 프록시 중계(#9, PR #36) 완료. 남은 것은 정적 파일 keep-alive 응답의 약 44ms 지연 (`TCP_NODELAY`, `server.c`, `docs/benchmark.md`)
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)

@@ -90,10 +90,9 @@ static void test_app_match_prefix_only(void)
     set_get(&req, "/api");
     CHECK_INT(app_match(&req), 0);
 
-    /* 원본 target 기준: 표기만 바꾼 요청은 앱이 아니다 (proxy_match 와 같은 기준) */
-    set_get(&req, "/%61pi/add");
-    strcpy(req.path, "/api/add");
-    CHECK_INT(app_match(&req), 0);
+    /* app_match 는 target(파서가 만든 정규형)을 바이트 그대로 본다. "/%61pi/add" 같은 표기는
+     * 파서가 "/api/add" 로 바꿔서 넘기므로 app_match 가 디코딩하지 않는다 (#31).
+     * 파서를 거친 동작은 test_app.c test_add_normalized */
     set_get(&req, "/api/add");
     strcpy(req.target, "/api/add?a=1&b=2");
     CHECK_INT(app_match(&req), 1);
@@ -116,6 +115,35 @@ static void test_next_backend_null_safe(void)
     CHECK(proxy_next_backend(&route) == NULL);
 }
 
+/* Round-Robin (#9): 백엔드 셋이면 0, 1, 2, 0 ...  하나면 늘 0. 라우트마다 순번이 따로다 */
+static void test_next_backend_round_robin(void)
+{
+    static proxy_route a, b;                    /* 수 KB 라서 스택에 두지 않는다 */
+    size_t i;
+
+    memset(&a, 0, sizeof a);
+    memset(&b, 0, sizeof b);
+    a.nbackends = 3;
+    for (i = 0; i < 7; i++)
+        CHECK(proxy_next_backend(&a) == &a.backends[i % 3]);
+    CHECK_INT(a.next, 7 % 3);
+
+    b.nbackends = 1;
+    for (i = 0; i < 4; i++)
+        CHECK(proxy_next_backend(&b) == &b.backends[0]);
+    CHECK_INT(b.next, 0);
+
+    b.nbackends = 2;                            /* 다른 라우트의 호출이 a 의 순번을 건드리지 않는다 */
+    CHECK(proxy_next_backend(&b) == &b.backends[0]);
+    CHECK(proxy_next_backend(&b) == &b.backends[1]);
+    CHECK(proxy_next_backend(&a) == &a.backends[1]);
+
+    a.next = 99;                                /* 범위 밖 순번도 나머지로 맞춘다 */
+    CHECK(proxy_next_backend(&a) == &a.backends[99 % 3]);
+    a.nbackends = 0;
+    CHECK(proxy_next_backend(&a) == NULL);
+}
+
 int main(void)
 {
     RUN(test_mime_never_null);
@@ -125,5 +153,6 @@ int main(void)
     RUN(test_app_match_prefix_only);
     RUN(test_static_close_idempotent);
     RUN(test_next_backend_null_safe);
+    RUN(test_next_backend_round_robin);
     return test_report();
 }

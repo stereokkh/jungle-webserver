@@ -380,8 +380,14 @@ proxy_route *proxy_match(proxy_config *cfg, const char *target)
 
 const proxy_backend *proxy_next_backend(proxy_route *route)
 {
-    /* TODO(#9): 처음엔 backends[0] 만, 중계가 안정되면 next 를 돌려 Round-Robin */
+    size_t i;
+
+    /* Round-Robin (#9, C9): 부를 때마다 next 를 한 칸 민다. 백엔드가 하나면 늘 0 번.
+     * 서버가 단일 스레드 루프라 락이 없다. next 가 범위 밖이어도(손으로 채운 route) 나머지 연산으로 맞춘다.
+     * 이 함수 하나만 되돌리면(항상 backends[0]) 이슈 #9 의 "RR 은 마지막, 늦으면 뺀다" 가 된다 */
     if (route == NULL || route->nbackends == 0)
         return NULL;
-    return &route->backends[0];
+    i = route->next % route->nbackends;
+    route->next = (i + 1) % route->nbackends;
+    return &route->backends[i];
 }

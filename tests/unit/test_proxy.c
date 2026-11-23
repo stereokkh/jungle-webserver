@@ -3,7 +3,7 @@
  *
  * 요청은 실제 http_parse_request 로 만들고 (NUL 종료 없는 정확한 크기의 힙 복사본),
  * 파서가 막는 입력(Transfer-Encoding, 깨진 헤더 블록)만 손으로 만든다.
- * 소켓과 이름 해석은 쓰지 않는다 (connect·중계는 #9).
+ * 소켓과 이름 해석은 쓰지 않는다 (connect 는 서버 스모크 테스트, 응답 중계는 test_proxy_relay.c).
  */
 #define _XOPEN_SOURCE 700
 #define _DARWIN_C_SOURCE
@@ -40,7 +40,7 @@ static int parse_bytes(const char *s, size_t n)
     if (g_buf == NULL)
         exit(2);
     memcpy(g_buf, s, n);
-    r = http_parse_request(g_buf, n, &req, &consumed, &status);
+    r = http_parse_request(g_buf, n, NULL, &req, &consumed, &status);
     CHECK_INT(r, PARSE_DONE);
     return r == PARSE_DONE;
 }
@@ -93,13 +93,15 @@ static void test_get_query_percent(void)
     buffer_free(&out);
 }
 
-/* R2 */
+/* R2: 파서가 만든 정규형 target 을 그대로 보낸다 (#31). 접두사 제거·추가 디코딩·"../" 정리 없음.
+ * %7E 는 정규형에서 '~', %eb 는 %EB. query 는 원본 그대로 (%41 을 풀지 않는다).
+ * %2F 는 파서가 400 으로 거절하므로 여기까지 오지 않는다 (test_http_request) */
 static void test_path_preserved(void)
 {
     setup();
-    REQUIRE(parse_str("GET /api/a%2Fb/c..d?q=%41&r HTTP/1.1\r\nHost: x\r\n\r\n"));
+    REQUIRE(parse_str("GET /api/%7Ea%eb/c..d?q=%41&r HTTP/1.1\r\nHost: x\r\n\r\n"));
     CHECK_INT(BUILD(), 0);
-    EXPECT("GET /api/a%2Fb/c..d?q=%41&r HTTP/1.1\r\n" SUFFIX "Connection: close\r\n\r\n");
+    EXPECT("GET /api/~a%EB/c..d?q=%41&r HTTP/1.1\r\n" SUFFIX "Connection: close\r\n\r\n");
     buffer_free(&out);
 }
 
