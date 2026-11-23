@@ -12,6 +12,9 @@
  *   - IPv6 를 쓸 수 없는 환경(커널·컨테이너에서 꺼짐)이면 IPv4 로 물러난다.
  *     단 포트 충돌(EADDRINUSE)·권한(EACCES)은 IPv4 로 해도 같은 문제라 그대로 실패한다.
  *     (물러나면 "IPv6 는 다른 프로그램이 쓰고 있는데 IPv4 로 떠 버리는" 혼란이 생긴다)
+ *   - 받은 연결에는 TCP_NODELAY 를 켠다 (net_set_nodelay). Tiny 는 연결마다 응답을 다 쓰고
+ *     바로 닫아서 상관없지만, keep-alive 에서는 정적 파일 응답(머리 write → 본문 write)의
+ *     두 번째 작은 write 가 Nagle 때문에 상대의 지연 ACK(약 40ms)를 기다린다 (docs/benchmark.md).
  *   - listen 소켓도 논블로킹으로 만든다. poll 이 읽기 가능이라고 알려 줘도 그 사이
  *     클라이언트가 연결을 취소하면 블로킹 accept 는 다음 연결이 올 때까지 멈춘다.
  * 담당: 트랙 A · 이슈 #7
@@ -21,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
@@ -101,4 +105,12 @@ int net_set_nonblocking(int fd)
     if (flags & O_NONBLOCK)
         return 0;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ? -1 : 0;
+}
+
+int net_set_nodelay(int fd)
+{
+    /* TCP_NODELAY 는 POSIX <netinet/tcp.h> 에 있다 (Linux·macOS·musl 공통) */
+    int one = 1;
+
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one) < 0 ? -1 : 0;
 }

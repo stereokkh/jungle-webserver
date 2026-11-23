@@ -314,6 +314,19 @@ conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' -m 3 "$URL" "${U
 [ "$conns" = "1 0 " ] && ok "keep-alive: second request reuses the connection" \
                       || bad "keep-alive: second request reuses the connection (new connects: $conns)"
 
+# keep-alive 정적 파일이 요청마다 멈추지 않는지 (TCP_NODELAY). 끄면 2번째부터 약 44ms 씩이라
+# 이어 보낸 9개 합이 0.4초쯤 된다. 느린 CI 를 생각해 0.2초를 기준으로 둔다 (켜면 1ms 안팎)
+set --
+for _i in 1 2 3 4 5 6 7 8 9 10; do set -- "$@" -o /dev/null "$URL"; done
+times=$(curl -s -m 5 -w '%{num_connects}:%{time_total} ' "$@")
+if echo "$times" | awk '{ s = 0; n = 0
+        for (i = 2; i <= NF; i++) { split($i, a, ":"); if (a[1] != 0) exit 1; s += a[2]; n++ }
+        exit !(n == 9 && s < 0.2) }'; then
+    ok "keep-alive static: no per-request stall"
+else
+    bad "keep-alive static: no per-request stall (connects:seconds = $times)"
+fi
+
 # 연결 유지 기본값: HTTP/1.1 은 keep-alive, HTTP/1.0 은 close (요청에 Connection 이 없을 때)
 h11=$(curl -s -D - -o /dev/null -m 3 "$URL" | tr -d '\r' | grep -i '^Connection:')
 h10=$(curl -0 -s -D - -o /dev/null -m 3 "$URL" | tr -d '\r' | grep -i '^Connection:')
