@@ -103,7 +103,7 @@ docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
 docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), (예정) benchmark.md
 .claude/    settings.json (팀 공용 훅: 세션 동기화)
-www/        (예정) 정적 파일 예제
+www/        정적 파일 예제
 ```
 
 ## 명령
