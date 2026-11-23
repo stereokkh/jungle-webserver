@@ -740,13 +740,13 @@ static void test_handler_route_integration(void)   /* M7 */
     set_routes(routes, 1);
 
     buf = test_bytes("GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", &len);
-    REQUIRE(http_parse_request(buf, len, &req, &used, &st) == PARSE_DONE);
+    REQUIRE(http_parse_request(buf, len, NULL, &req, &used, &st) == PARSE_DONE);
     CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_PROXY);
     CHECK(route == &cfg.routes[0]);
     free(buf);
 
     buf = test_bytes("GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n", &len);
-    REQUIRE(http_parse_request(buf, len, &req, &used, &st) == PARSE_DONE);
+    REQUIRE(http_parse_request(buf, len, NULL, &req, &used, &st) == PARSE_DONE);
     route = &cfg.routes[0];
     CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_STATIC);
     CHECK(route == NULL);
@@ -754,7 +754,7 @@ static void test_handler_route_integration(void)   /* M7 */
 
     /* 표기만 바꾼 "/%61pi/" 는 프록시도 앱도 아니다 (결정 9e4e39a) */
     buf = test_bytes("GET /%61pi/add HTTP/1.1\r\nHost: x\r\n\r\n", &len);
-    REQUIRE(http_parse_request(buf, len, &req, &used, &st) == PARSE_DONE);
+    REQUIRE(http_parse_request(buf, len, NULL, &req, &used, &st) == PARSE_DONE);
     route = &cfg.routes[0];
     CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_STATIC);
     CHECK(route == NULL);

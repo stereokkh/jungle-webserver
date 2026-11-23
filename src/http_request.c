@@ -395,7 +395,7 @@ static int parse_headers(const char *p, size_t n, http_request *req)
     return 0;
 }
 
-parse_result http_parse_request(const char *buf, size_t len,
+parse_result http_parse_request(const char *buf, size_t len, const http_parse_options *opt,
                                 http_request *req, size_t *consumed, int *status)
 {
     size_t window = len < HTTP_MAX_HEADER ? len : HTTP_MAX_HEADER;
@@ -404,6 +404,7 @@ parse_result http_parse_request(const char *buf, size_t len,
     size_t head_len, line_len, body_len;
     int st;
 
+    (void)opt;                        /* 다음 커밋(정규화)에서 쓴다 */
     memset(req, 0, sizeof *req);
     req->content_length = -1;
     *consumed = 0;                    /* DONE: 소비한 길이, 본문 대기 NEED_MORE: 필요한 총 길이, 나머지 0 */

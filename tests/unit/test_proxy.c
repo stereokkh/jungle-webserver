@@ -40,7 +40,7 @@ static int parse_bytes(const char *s, size_t n)
     if (g_buf == NULL)
         exit(2);
     memcpy(g_buf, s, n);
-    r = http_parse_request(g_buf, n, &req, &consumed, &status);
+    r = http_parse_request(g_buf, n, NULL, &req, &consumed, &status);
     CHECK_INT(r, PARSE_DONE);
     return r == PARSE_DONE;
 }

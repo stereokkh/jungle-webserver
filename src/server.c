@@ -320,7 +320,7 @@ static int handle_request(server *s, conn *c)
     if (c->need_len != 0 && pending < c->need_len)
         return 0;
 
-    r = http_parse_request(buffer_peek(&c->in), pending, &c->req, &consumed, &status);
+    r = http_parse_request(buffer_peek(&c->in), pending, NULL, &c->req, &consumed, &status);
     if (r == PARSE_NEED_MORE) {
         c->need_len = consumed;   /* 헤더가 아직이면 0: 다음 read 뒤에 다시 파싱 */
         return 0;

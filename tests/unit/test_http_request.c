@@ -23,7 +23,7 @@ static parse_result parse_n(const char *s, size_t n)
     if (g_buf == NULL)
         exit(2);
     memcpy(g_buf, s, n);
-    return http_parse_request(g_buf, n, &req, &consumed, &status);
+    return http_parse_request(g_buf, n, NULL, &req, &consumed, &status);
 }
 
 static parse_result parse(const char *s)

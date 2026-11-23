@@ -20,7 +20,7 @@ static int call_n(const char *raw, size_t n)
 
     buffer_free(&out);
     buffer_init(&out);
-    if (http_parse_request(raw, n, &req, &consumed, &status) != PARSE_DONE)
+    if (http_parse_request(raw, n, NULL, &req, &consumed, &status) != PARSE_DONE)
         return -2;
     return app_handle(&req, "8001", &out);
 }

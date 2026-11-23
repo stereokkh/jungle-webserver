@@ -20,6 +20,15 @@
 
 typedef enum { HTTP_GET, HTTP_POST, HTTP_HEAD, HTTP_METHOD_OTHER } http_method;
 
+/*
+ * 파서 옵션 (#31, docs/decisions.md 2026-11-23 결정 4). 서버가 시작할 때 한 번 채우고 요청마다 같은 것을 넘긴다.
+ * 옵션이 늘면 인자를 추가하지 않고 이 구조체에 필드를 더한다 (예정: #35 백슬래시 처리 방식).
+ * 모든 필드가 0 인 구조체가 기본값이고, http_parse_request 에 NULL 을 넘겨도 기본값이다
+ */
+typedef struct {
+    int merge_slashes;   /* 0: 경로에 빈 조각 "//" 가 있으면 400 (기본). 1: "/" 하나로 합친다 (--merge-slashes) */
+} http_parse_options;
+
 typedef enum {
     PARSE_DONE,       /* 요청 하나 완성. *consumed = 요청 라인 + 헤더 + 본문 길이 */
     PARSE_NEED_MORE,  /* 아직 덜 왔다. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다.
@@ -61,7 +70,7 @@ typedef struct {
 } http_request;
 
 /*
- * buf[0..len) 에서 요청 하나를 파싱한다.
+ * buf[0..len) 에서 요청 하나를 파싱한다. opt 가 NULL 이면 기본값 (http_parse_options 주석).
  *   - buf 는 NUL 로 끝나지 않는다. len 을 넘어 읽지 않는다 (make asan 이 검사)
  *   - 상태를 저장하지 않는다. NEED_MORE 면 *consumed 를 보고 언제 다시 부를지 정한다:
  *       0  → 헤더가 아직 덜 옴. 더 읽은 뒤 같은 버퍼 처음부터 다시 부른다
@@ -88,7 +97,7 @@ typedef struct {
  *     그 뒤에 요청 라인(501, 414, 505), 경로(400), 헤더(400, 501), 본문(413, NEED_MORE) 순서
  *     (예: 대상 9000 바이트 GET 은 한 번에 오든 나눠 오든 항상 431)
  */
-parse_result http_parse_request(const char *buf, size_t len,
+parse_result http_parse_request(const char *buf, size_t len, const http_parse_options *opt,
                                 http_request *req, size_t *consumed, int *status);
 
 #endif /* HTTP_REQUEST_H */
