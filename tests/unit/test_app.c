@@ -107,6 +107,10 @@ static void test_add_values(void)
     REQUIRE(call("GET /api/add?a=-9223372036854775808&b=0 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
     b = body_of(&n);
     CHECK_MEM(b, n, "-9223372036854775808\n", 21);
+    /* 합이 정확히 LLONG_MIN (아래로 넘침 검사의 '<' 를 '<=' 로 바꾸면 400 이 됨) */
+    REQUIRE(call("GET /api/add?a=-9223372036854775807&b=-1 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    b = body_of(&n);
+    CHECK_MEM(b, n, "-9223372036854775808\n", 21);
 }
 
 static void test_add_bad_400(void)
@@ -187,6 +191,7 @@ static void test_method_405(void)
     expect_status("POST /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
                   "HTTP/1.1 405 Method Not Allowed\r\n");
     HAS("Allow: GET, HEAD\r\n");
+    HAS("Connection: keep-alive\r\n");  /* 405 뒤에도 연결 유지 */
 
     expect_status("GET /api/echo HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 405 Method Not Allowed\r\n");
     HAS("Allow: POST\r\n");
@@ -233,6 +238,22 @@ static void test_failure_keeps_out(void)
     CHECK_INT((long)buffer_pending(&out), (long)before);
 }
 
+/* 헤더는 들어가고 본문에서 실패해도 out 은 그대로 (append_ok 의 rollback).
+ * rollback 이 없으면 200 헤더만 남고 서버가 500 을 덧붙여 응답이 깨진다 */
+static void test_body_failure_rolls_back(void)
+{
+    static char raw[2100], fill[BUFFER_MAX - 1024];
+    int n = snprintf(raw, sizeof raw,
+                     "POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n");
+
+    memset(raw + n, 'x', 2000);
+    REQUIRE(call_n(raw, (size_t)n + 2000) == 0);
+    buffer_clear(&out);
+    REQUIRE(buffer_append(&out, fill, sizeof fill) == 0);   /* 헤더는 들어가고 본문은 안 들어갈 만큼만 남김 */
+    CHECK_INT(app_handle(&req, "8001", &out), -1);
+    CHECK_INT((long)buffer_pending(&out), (long)sizeof fill);
+}
+
 int main(void)
 {
     buffer_init(&out);
@@ -245,6 +266,7 @@ int main(void)
     RUN(test_unknown_404);
     RUN(test_connection);
     RUN(test_failure_keeps_out);
+    RUN(test_body_failure_rolls_back);
     buffer_free(&out);
     return test_report();
 }
