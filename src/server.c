@@ -16,9 +16,15 @@
  *      (accept 를 먼저 하면 방금 닫은 칸에 새 연결이 들어가서, 같은 칸을 가리키는
  *       이전 pollfd 의 revents 가 새 연결에 잘못 적용될 수 있다)
  *
- * 지금(#7 첫 PR)은 요청 헤더 끝(\r\n\r\n)까지 받으면 고정 200 응답을 보내고 닫는다.
- * 파서(#5)·응답(#6)이 머지되면 handle_request() 를 docs/interfaces.md 2~4단계로 바꾸고
- * keep-alive 를 붙인다 (#7 다음 PR).
+ * 요청 하나의 흐름 (docs/interfaces.md 1~6단계):
+ *   READING ─파서 DONE→ 응답을 out 에 만듦 → WRITING ─out 다 보냄→ (정적 파일이면) SENDING_FILE
+ *     → keep-alive 면 READING (남은 입력에 다음 요청이 있으면 바로 처리 = 파이프라이닝)
+ *     → 아니면 LINGERING (송신만 닫고 남은 입력을 읽어 버리다가 닫음)
+ *   파서 오류 → 오류 응답 → CLOSING ─다 보냄→ LINGERING
+ *
+ * Tiny 와 다른 점: 요청마다 연결을 닫지 않는다 (keep-alive), 한 연결이 느려도 다른 연결은
+ * 계속 처리된다, 요청 하나를 받는 시간에 상한이 있다, 오류 응답이 RST 로 사라지지 않게
+ * lingering close 를 한다.
  *
  * 담당: 트랙 A · 이슈 #7
  */
@@ -28,12 +34,15 @@
 #include "handler.h"
 #include "buffer.h"
 #include "static_file.h"
+#include "http_response.h"
+#include "app.h"
 #include "proxy_config.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stddef.h>
@@ -62,7 +71,8 @@ typedef enum {
     CONN_WRITING,        /* out 버퍼를 보내는 중 (POLLOUT). EAGAIN 이면 다음 POLLOUT 까지 대기 */
     CONN_SENDING_FILE,   /* 헤더를 다 보내고 파일 조각을 보내는 중 (POLLOUT) */
     CONN_UPSTREAM,       /* 프록시: 백엔드 연결·송수신 중 (#9 에서 세분화) */
-    CONN_CLOSING         /* 다 보내면 닫는다 (keep_alive == 0 또는 오류 응답 후) */
+    CONN_CLOSING,        /* 오류 응답을 보내는 중 (POLLOUT). 다 보내면 LINGERING */
+    CONN_LINGERING       /* 송신을 닫았다 (POLLIN). 받은 건 버리고 EOF·마감이면 닫는다 */
 } conn_state;
 
 typedef struct {
@@ -75,8 +85,10 @@ typedef struct {
     static_file file;        /* CONN_SENDING_FILE 일 때 */
     int upstream_fd;         /* 프록시 백엔드 소켓, 없으면 -1 (#9) */
     buffer up_out;           /* 백엔드로 보낼 요청 (#9) */
-    int64_t last_active_ms;     /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
-    size_t hdr_scanned;      /* 임시(handle_request): 헤더 끝을 이미 찾아본 바이트 수 */
+    int64_t last_active_ms;  /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
+    int64_t req_start_ms;    /* 지금 요청의 첫 바이트를 받은 시각, 없으면 0 (CLIENT_REQUEST_TIMEOUT_MS) */
+    int64_t linger_end_ms;   /* LINGERING 의 마감 (CLIENT_LINGER_TIMEOUT_MS) */
+    size_t need_len;         /* 파서 NEED_MORE 의 consumed: 이만큼 모이기 전엔 파서를 부르지 않음 */
 } conn;
 
 /* pollfd 목록의 고정 위치 */
@@ -227,68 +239,113 @@ static void conn_close(server *s, size_t slot)
 }
 
 /* ---------------------------------------------------------------
- * 요청 처리 (임시)
+ * 요청 처리 (docs/interfaces.md 2~4단계)
  * --------------------------------------------------------------- */
 
-/* p[0..n) 에서 \r\n\r\n 바로 뒤를 가리킨다. 없으면 NULL (memmem 은 POSIX 가 아니라 직접 찾는다).
- * from 이전 위치는 지난번에 이미 찾아봤으므로 건너뛴다 (조금씩 오는 요청마다 처음부터 다시 훑지 않게) */
-static const char *find_header_end(const char *p, size_t n, size_t from)
+/* ROUTE_STATIC: GET/HEAD 만, 파일을 열고 200 헤더를 out 에. 본문은 SENDING_FILE 에서 보낸다.
+ * 반환 0 (오류 응답 포함), -1 응답을 못 씀 */
+static int respond_static(server *s, conn *c, int head)
 {
-    size_t i;
+    http_response_head h;
+    int status;
 
-    for (i = from > 3 ? from : 3; i < n; i++)
-        if (p[i] == '\n' && p[i - 1] == '\r' && p[i - 2] == '\n' && p[i - 3] == '\r')
-            return p + i + 1;
-    return NULL;
+    if (c->req.method != HTTP_GET && c->req.method != HTTP_HEAD)
+        return http_append_error(&c->out, 405, c->keep_alive, head, "Allow: GET, HEAD\r\n");
+    if (static_open(s->cfg->docroot, c->req.path, &c->file, &status) < 0)
+        return http_append_error(&c->out, status, c->keep_alive, head, NULL);
+    /* Content-Length 는 long (http_response_head). long 이 32비트인 환경에서 2GB 넘는 파일은
+     * 길이가 잘려 응답 경계가 어긋나므로 500 으로 답한다 (CI 는 모두 64비트라 지금은 안 걸림) */
+    if (c->file.size > (off_t)LONG_MAX) {
+        static_close(&c->file);
+        return http_append_error(&c->out, 500, c->keep_alive, head, NULL);
+    }
+
+    memset(&h, 0, sizeof h);
+    h.status = 200;
+    h.content_type = c->file.content_type;
+    h.content_length = (long)c->file.size;
+    h.keep_alive = c->keep_alive;
+    if (http_append_header(&c->out, &h) < 0) {
+        static_close(&c->file);
+        return -1;
+    }
+    if (head)
+        static_close(&c->file);   /* HEAD: 헤더(Content-Length 포함)만, 본문은 보내지 않는다 */
+    return 0;
 }
 
 /*
- * 받은 바이트로 응답을 만들 수 있으면 out 에 쓰고 상태를 바꾼다.
- * 반환: 0 계속, -1 연결을 닫아야 함 (메모리 부족)
- *
- * TODO(#7 다음 PR): http_parse_request → handler_route → 각 모듈로 바꾼다 (#5·#6 머지됨).
- *   - NEED_MORE 의 *consumed 가 0 이 아니면 conn 에 기억하고, buffer_pending(&in) 이 그 값에
- *     찰 때까지 파서를 다시 부르지 않는다. DONE·ERROR 에서 지운다 (docs/interfaces.md, PR #24)
- *   - 요청 타임아웃: 본문을 1바이트씩 보내면 유휴 타이머가 계속 리셋되므로 따로 마감을 둔다
- *   - 오류 응답 후 닫을 때 읽지 않은 입력이 남아 있으면 lingering close (RST 로 응답 유실 방지)
- *   지금은 헤더 끝까지 받으면 요청 내용(메서드, 요청 라인 형식, 본문)과 상관없이
- *   고정 200 + Connection: close 를 보낸다. HEAD 에도 본문을 붙이는 것도 임시.
+ * 파서가 DONE 을 돌려준 요청 하나의 응답을 out 에 만든다. 처리 순서: 프록시 → 앱 → 정적.
+ * 반환 0 (4xx·5xx 응답을 쓴 것도 성공), -1 응답을 못 씀 (메모리 부족 → 연결 닫기)
  */
-static int handle_request(conn *c)
+static int respond(server *s, conn *c)
 {
-    static const char body[] = "webserver: ok\n";
-    const char *start = buffer_peek(&c->in);
-    size_t pending = buffer_pending(&c->in);
-    /* 431 우선 (docs/interfaces.md): 앞 HTTP_MAX_HEADER 바이트 안에서만 찾는다.
-     * 받은 만큼 다 찾으면 read 한 번에 들어온 양(TCP 분할)에 따라 431/200 이 갈린다 */
-    size_t limit = pending < HTTP_MAX_HEADER ? pending : HTTP_MAX_HEADER;
-    const char *end = find_header_end(start, limit, c->hdr_scanned);
-    size_t m = buffer_mark(&c->out);
+    proxy_route *route;
+    int head = c->req.method == HTTP_HEAD;
 
-    if (end == NULL) {
-        if (pending < HTTP_MAX_HEADER) {
-            c->hdr_scanned = limit;   /* 다음엔 새로 온 바이트만 본다 */
-            return 0;                 /* 더 받아야 한다 */
-        }
-        if (buffer_append_str(&c->out, "HTTP/1.1 431 Request Header Fields Too Large\r\n"
-                                       "Content-Length: 0\r\n"
-                                       "Connection: close\r\n\r\n") < 0)
+    switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
+    case ROUTE_PROXY:
+        /* TODO(#9): proxy_build_request → proxy_connect_start → CONN_UPSTREAM.
+         * #9 전까지는 프록시 경로에 502 로 답하고 닫는다 (#8 설정 로드가 머지되면 -c 로 여기 온다) */
+        c->keep_alive = 0;
+        return http_append_error(&c->out, 502, 0, head, NULL);
+    case ROUTE_APP:
+        if (app_handle(&c->req, s->cfg->port, &c->out) == 0)
+            return 0;
+        /* TODO(#10): app_handle 은 메모리 부족일 때만 -1 이지만, #10 전까지는 스텁이 항상 -1 이다.
+         * 연결을 그냥 끊지 않고 500 으로 답한다 (out 은 app_handle 이 그대로 둠).
+         * #10 뒤에도 남겨도 무해하다: 정말 메모리가 없으면 500 도 못 써서 -1 → 연결 닫기 */
+        c->keep_alive = 0;
+        return http_append_error(&c->out, 500, 0, head, NULL);
+    case ROUTE_STATIC:
+    default:
+        return respond_static(s, c, head);
+    }
+}
+
+/*
+ * in 에 쌓인 바이트로 요청 하나를 처리해 본다 (READING 상태에서만 부른다).
+ * 응답을 만들었으면 WRITING/CLOSING 으로 바뀐다. 반환 0 계속, -1 연결을 닫아야 함
+ */
+static int handle_request(server *s, conn *c)
+{
+    size_t pending = buffer_pending(&c->in), consumed = 0;
+    int status = 0;
+    parse_result r;
+
+    if (pending == 0)
+        return 0;
+    /* 본문만 덜 온 요청: 다 모일 때까지 파서를 다시 부르지 않는다 (PR #24).
+     * 바이트마다 헤더를 다시 파싱하지 않게. 소켓 읽기·타임아웃은 그대로 진행된다 */
+    if (c->need_len != 0 && pending < c->need_len)
+        return 0;
+
+    r = http_parse_request(buffer_peek(&c->in), pending, &c->req, &consumed, &status);
+    if (r == PARSE_NEED_MORE) {
+        c->need_len = consumed;   /* 헤더가 아직이면 0: 다음 read 뒤에 다시 파싱 */
+        return 0;
+    }
+    c->need_len = 0;              /* DONE·ERROR: 다음 요청에 남기지 않는다 */
+    c->req_start_ms = 0;
+
+    if (r == PARSE_ERROR) {
+        /* 요청이 깨져 다음 요청이 어디서 시작하는지 모른다 → 오류 응답 후 닫는다.
+         * HEAD 면 본문을 쓰지 않는다 (RFC 9110 9.3.2). 파서는 req 를 0(= HTTP_GET)으로 지우고
+         * 요청 라인에서 "HEAD" 를 읽었을 때만 HTTP_HEAD 로 바꾸므로, 요청 라인 전에 난 오류(431 등)는
+         * GET 으로 남아 본문까지 쓴다. 어차피 닫으므로 그래도 다음 응답과 섞이지 않는다.
+         * (ERROR 때 method 는 http_request.h 계약에 아직 없다. PR #29 에서 상철님께 확인 중) */
+        c->keep_alive = 0;
+        if (http_append_error(&c->out, status, 0, c->req.method == HTTP_HEAD, NULL) < 0)
             return -1;
         c->state = CONN_CLOSING;
         return 0;
     }
 
-    if (buffer_appendf(&c->out, "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: text/plain\r\n"
-                                "Content-Length: %zu\r\n"
-                                "Connection: close\r\n\r\n", sizeof body - 1) < 0 ||
-        buffer_append(&c->out, body, sizeof body - 1) < 0) {
-        buffer_rollback(&c->out, m);
+    c->keep_alive = c->req.keep_alive;
+    if (respond(s, c) < 0)
         return -1;
-    }
-    buffer_consume(&c->in, (size_t)(end - start));   /* 응답을 다 만든 뒤에 consume */
-    c->hdr_scanned = 0;                              /* 다음 요청은 남은 바이트 처음부터 */
-    c->keep_alive = 0;
+    /* 응답을 다 만든 뒤에 consume (req.headers/body 가 in 안을 가리킨다) */
+    buffer_consume(&c->in, consumed);
     c->state = CONN_WRITING;
     return 0;
 }
@@ -297,11 +354,64 @@ static int handle_request(conn *c)
  * 읽기·쓰기 (한 번 부를 때 시스템 콜 한 번. 막히면 바로 루프로 돌아간다)
  * --------------------------------------------------------------- */
 
+/* 응답을 끝까지 보낸 뒤 연결을 닫는다: 바로 close 하지 않고 송신만 닫는다 (lingering close).
+ * 클라이언트가 보낸 것을 다 읽지 않은 채 close 하면 커널이 RST 를 보내서, 클라이언트가 아직
+ * 읽지 않은 응답(431, 413 등)까지 버려질 수 있다. FIN 을 보내 응답이 끝났음을 알리고,
+ * 들어오는 건 읽어 버리다가 클라이언트가 닫거나(EOF) 마감이 되면 닫는다 */
+static void conn_linger(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+
+    if (shutdown(c->fd, SHUT_WR) < 0) {
+        conn_close(s, slot);          /* 이미 끊긴 연결 등 */
+        return;
+    }
+    buffer_free(&c->in);              /* 더는 요청을 처리하지 않는다 */
+    buffer_free(&c->out);
+    c->state = CONN_LINGERING;
+    c->linger_end_ms = now_ms() + CLIENT_LINGER_TIMEOUT_MS;
+}
+
+/* 응답 하나를 끝까지 보냈다 (out + 파일). keep-alive 면 다음 요청으로, 아니면 닫기 */
+static void conn_response_done(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+
+    if (c->state == CONN_CLOSING || !c->keep_alive) {
+        conn_linger(s, slot);
+        return;
+    }
+    c->state = CONN_READING;
+    /* 파이프라이닝: 클라이언트가 응답을 기다리지 않고 보낸 다음 요청이 in 에 이미 있으면
+     * 새 바이트를 기다리지 않고 바로 처리한다 (안 그러면 poll 이 깨워 주지 않아 멈춘다) */
+    if (buffer_pending(&c->in) > 0) {
+        c->req_start_ms = now_ms();
+        if (handle_request(s, c) < 0)
+            conn_close(s, slot);
+    }
+}
+
+/* LINGERING: 받은 바이트는 버린다. EOF·오류면 닫는다 */
+static void conn_drain(server *s, size_t slot)
+{
+    char tmp[4096];
+    ssize_t n = read(s->conns[slot]->fd, tmp, sizeof tmp);
+
+    if (n == 0 || (n < 0 && !would_block(errno)))
+        conn_close(s, slot);
+}
+
 static void conn_on_readable(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
     ssize_t n;
 
+    if (c->state == CONN_LINGERING) {
+        conn_drain(s, slot);
+        return;
+    }
+    /* reserve 가 compact 로 데이터를 옮길 수 있지만, 여기 올 때는 in 을 가리키는 req 포인터를
+     * 쓰는 중이 아니다 (응답을 만들고 consume 한 뒤에만 다시 읽는다) */
     if (buffer_reserve(&c->in, READ_CHUNK) < 0) {
         conn_close(s, slot);
         return;
@@ -318,8 +428,29 @@ static void conn_on_readable(server *s, size_t slot)
     }
     c->in.len += (size_t)n;
     c->last_active_ms = now_ms();
-    if (handle_request(c) < 0)
+    if (c->req_start_ms == 0)
+        c->req_start_ms = c->last_active_ms;   /* 새 요청의 첫 바이트 */
+    if (handle_request(s, c) < 0)
         conn_close(s, slot);
+}
+
+/* SENDING_FILE: 파일 조각 하나 (static_send_some 이 pread + write 한 번) */
+static void conn_send_file(server *s, size_t slot)
+{
+    conn *c = s->conns[slot];
+    int r = static_send_some(&c->file, c->fd);
+
+    if (r < 0) {
+        conn_close(s, slot);       /* 응답 도중 실패: 이미 헤더를 보냈으니 닫는 수밖에 없다 */
+        return;
+    }
+    c->last_active_ms = now_ms();
+    if (r == 0)
+        return;                    /* 남은 건 다음 POLLOUT 에 */
+    /* 다 보냈으면 바로 닫는다. keep-alive 로 다음 요청의 static_open 이 덮어쓰면 fd 가 샌다
+     * (PR #25 리뷰). conn_close 의 static_close 와 겹쳐도 안전하다 */
+    static_close(&c->file);
+    conn_response_done(s, slot);
 }
 
 static void conn_on_writable(server *s, size_t slot)
@@ -327,6 +458,10 @@ static void conn_on_writable(server *s, size_t slot)
     conn *c = s->conns[slot];
     ssize_t n;
 
+    if (c->state == CONN_SENDING_FILE) {
+        conn_send_file(s, slot);
+        return;
+    }
     n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
     if (n < 0) {
         if (!would_block(errno))
@@ -338,14 +473,11 @@ static void conn_on_writable(server *s, size_t slot)
     if (buffer_pending(&c->out) > 0)
         return;                    /* 남은 건 다음 POLLOUT 에 */
 
-    if (c->state == CONN_CLOSING || !c->keep_alive) {
-        conn_close(s, slot);
+    if (c->file.fd >= 0) {         /* 헤더를 다 보냈다. 본문은 파일에서 */
+        c->state = CONN_SENDING_FILE;
         return;
     }
-    /* keep-alive (#7 다음 PR 에서 남은 입력 바이트 처리).
-     * TODO(#7 다음 PR): CONN_SENDING_FILE 이 끝나면(static_send_some == 1) 여기로 오기 전에
-     * static_close(&c->file). 안 닫으면 다음 요청의 static_open 이 fd 를 덮어써 새어 나간다 */
-    c->state = CONN_READING;
+    conn_response_done(s, slot);
 }
 
 /* ---------------------------------------------------------------
@@ -381,7 +513,22 @@ static void accept_ready(server *s)
  * 이벤트 루프
  * --------------------------------------------------------------- */
 
-/* 유휴 시간을 넘긴 연결을 닫고, 다음 poll 대기 시간(ms, 없으면 -1)을 돌려준다 */
+/* 연결 하나가 닫혀야 하는 시각 (상태에 따라 가장 이른 마감) */
+static int64_t conn_deadline(const conn *c)
+{
+    int64_t d;
+
+    if (c->state == CONN_LINGERING)
+        return c->linger_end_ms;
+    d = c->last_active_ms + CLIENT_IDLE_TIMEOUT_MS;
+    if (c->state == CONN_READING && c->req_start_ms != 0 &&
+        c->req_start_ms + CLIENT_REQUEST_TIMEOUT_MS < d)
+        d = c->req_start_ms + CLIENT_REQUEST_TIMEOUT_MS;
+    return d;
+}
+
+/* 마감을 넘긴 연결을 닫고, 다음 poll 대기 시간(ms, 없으면 -1)을 돌려준다.
+ * 마감: 유휴(바이트가 오가지 않음), 요청 하나를 받는 시간(slow loris), lingering */
 static int expire_idle(server *s, int64_t now)
 {
     int64_t next = -1, left;
@@ -392,7 +539,7 @@ static int expire_idle(server *s, int64_t now)
 
         if (c == NULL)
             continue;
-        left = c->last_active_ms + CLIENT_IDLE_TIMEOUT_MS - now;
+        left = conn_deadline(c) - now;
         if (left <= 0)
             conn_close(s, i);
         else if (next < 0 || left < next)
@@ -424,7 +571,8 @@ static size_t build_pollfds(server *s)
         if (c == NULL)
             continue;
         s->pfds[n].fd = c->fd;
-        s->pfds[n].events = c->state == CONN_READING ? POLLIN : POLLOUT;
+        s->pfds[n].events =
+            (c->state == CONN_READING || c->state == CONN_LINGERING) ? POLLIN : POLLOUT;
         s->pfd_slot[n] = i;
         n++;
     }
@@ -446,7 +594,7 @@ static void dispatch(server *s, size_t npfds)
             continue;
         if (re & (POLLERR | POLLNVAL)) {
             conn_close(s, slot);
-        } else if (c->state == CONN_READING) {
+        } else if (c->state == CONN_READING || c->state == CONN_LINGERING) {
             if (re & (POLLIN | POLLHUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */
                 conn_on_readable(s, slot);
         } else if (re & (POLLOUT | POLLHUP)) {
