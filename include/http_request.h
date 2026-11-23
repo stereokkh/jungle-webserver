@@ -41,8 +41,9 @@ typedef struct {
     char method_str[16];            /* 원본 메서드 문자열 (501 로그·프록시 전달용) */
     char target[HTTP_MAX_URI + 1];  /* 원본 요청 대상 "/a%20b?x=1" (프록시 전달용, 디코딩 안 함) */
     char path[HTTP_MAX_URI + 1];    /* 퍼센트 디코딩한 경로 "/a b" (정적 파일 접근용).
-                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 를
-                                     * 400 으로 거절하므로 path 에는 이런 바이트가 없다 */
+                                     * 파서가 NUL·제어 문자(0x01-0x1F, 0x7F)·잘못된 %XX 와
+                                     * "." / ".." 조각을 400 으로 거절하므로 path 에는 이런 바이트와
+                                     * 점 조각이 없다 (원본 target 에도 디코딩 후 점 조각이 없다는 뜻) */
     char query[HTTP_MAX_URI + 1];   /* '?' 뒤 "x=1", 디코딩 안 함. 없으면 "" */
     int version_minor;              /* HTTP/1.0 → 0, HTTP/1.1 → 1 */
 
@@ -74,7 +75,10 @@ typedef struct {
  *            값은 HTTP_MAX_HEADER + HTTP_MAX_BODY 이하다
  *   - DONE 이면 buf + *consumed 부터가 다음 요청이다 (keep-alive 파이프라이닝 잔여)
  *   - ERROR 면 *status 만 의미가 있고 *req 는 일부만 채워졌을 수 있다
- *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다)
+ *     (단, 응답의 Connection 결정을 위해 version_minor 는 가능하면 채운다.
+ *      method 도 HEAD 오류 응답의 본문 생략을 위해 약속한다 (PR #29): 요청 라인이 앞 8KB 안에 있고
+ *      공백 둘 + 올바른 메서드 토큰까지 읽혔으면 채운다 (HEAD → HTTP_HEAD). 그 전에 실패하면
+ *      (공백 부족, 빈 메서드, 토큰 아닌 글자, 첫 줄이 8KB 를 넘는 431) 초기값 HTTP_GET)
  *   - Transfer-Encoding 이 있으면 501 (chunked 는 범위 밖)
  *   - Content-Length 가 두 줄 이상이면 값이 같아도 400 (프록시가 원본 헤더를 그대로 넘기므로)
  *   - 요청 라인 앞의 빈 줄(CRLF)은 건너뛴다 (RFC 9112 2.2). 건너뛴 바이트도 아래 8KB 와 consumed 에 들어간다
