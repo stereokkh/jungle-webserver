@@ -82,7 +82,7 @@ run_ab() {   # run_ab 이름 동시성 [ab 추가 옵션]
 }
 
 echo "## 환경"
-echo "- $(uname -sr), $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //'), 논리 코어 $(nproc)"
+echo "- $(uname -sr), $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //'), 논리 코어 $(nproc), ulimit -n $(ulimit -n)"
 echo "- $(cc --version | head -1), $(ab -V | head -1)"
 echo "- REPS=$REPS N=$N, 파일 bench.html 4096 바이트"
 echo

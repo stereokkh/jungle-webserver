@@ -203,7 +203,7 @@ Claude의 노션 사용 범위:
 
 ## 아직 하지 않은 것 (나중에 할 일)
 
-- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive 는 #7 에서 완료. 남은 것은 앱(#10), 프록시 설정·중계(#8 #9, 업스트림 상태는 A·B 협업)
+- 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 앱(#10), 프록시 설정·중계(#8 #9, PR #36) 완료. 남은 것은 정적 파일 keep-alive 응답의 약 44ms 지연 (`TCP_NODELAY`, `server.c`, `docs/benchmark.md`)
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)
