@@ -256,7 +256,7 @@ int main(int argc, char **argv)
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0 || listen(lfd, 16) < 0) {
         perror("bind/listen");
         return 1;
