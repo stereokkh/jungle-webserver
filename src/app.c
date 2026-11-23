@@ -11,8 +11,8 @@
  *   - 헤더는 adder 가 printf 로 직접 쓰지 않고 http_append_header 로 만든다
  * 담당: 트랙 C · 이슈 #10
  *
- * 라우트는 원본 target 의 '?' 앞 경로와 바이트 그대로 비교한다 (app_match 와 같은 기준).
- * "/api/%61dd" 처럼 인코딩한 경로는 404.
+ * 라우트는 파서가 만든 정규형 target 의 '?' 앞 경로와 바이트 그대로 비교한다 (app_match 와 같은 기준, #31).
+ * "/api/%61dd" 처럼 비예약 문자를 인코딩한 경로는 파서가 "/api/add" 로 바꿔 오므로 200.
  *   경로        메서드       응답
  *   /api/add    GET, HEAD    200 "<a+b>\n" text/plain. 그 외 메서드 405 "Allow: GET, HEAD"
  *   /api/echo   POST         200 본문 그대로 application/octet-stream. 그 외 405 "Allow: POST"
