@@ -32,6 +32,7 @@
 - 모듈(파서·응답·정적·앱·프록시 정책)은 소켓과 무관한 순수 함수로 두고 단위 테스트한다
 - 파서는 증분 방식: 완료 / 추가 입력 필요 / 오류 + **소비 바이트 수**를 반환하고, 다음 요청의 잔여 바이트를 보존한다 (keep-alive). 본문만 덜 온 추가 입력 필요는 소비 바이트 대신 **필요한 총 길이**를 돌려주고, 서버는 그만큼 모일 때까지 파서를 다시 부르지 않는다 (consume 하지 않음, `docs/interfaces.md`)
 - 원본 요청 대상(프록시 전달용)과 디코딩된 경로(파일 접근용)를 따로 저장한다
+  - **#31 에서 바뀜 (결정됨, 구현 전)**: 라우팅·백엔드 전달은 파서가 만든 경로 정규형 하나를 쓰고, `%2F`, 그냥 `\`·`%5C` 와 빈 조각 `//` 는 400 (`--merge-slashes` 면 `//` 를 합침, nginx 와 이름은 같고 기본값은 반대). 순서·이유는 `docs/decisions.md` 2026-11-23
 - 송신은 진행 상태(offset)를 저장하고, 막히면(`EAGAIN`) 이벤트 루프에 제어권을 돌려준다. 루프 안에서 끝날 때까지 `write` 를 반복하지 않는다
 - 백엔드 주소는 설정 로드 시 `getaddrinfo` 로 한 번 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
 - 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
@@ -53,7 +54,7 @@
 | `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 앱(#10)·프록시(#9)는 모듈이 붙으면 `server.c` 의 `respond()` 에서 스텁 처리(500, 502)만 걷어 내면 된다
 
