@@ -53,7 +53,7 @@
 | `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 지금은 선언과 `TODO(#이슈)` 스텁만 있다 (`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config` 는 구현·테스트 완료, `proxy` 는 `proxy_build_request` 만). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 앱(#10)·프록시(#9)는 모듈이 붙으면 `server.c` 의 `respond()` 에서 스텁 처리(500, 502)만 걷어 내면 된다
 
