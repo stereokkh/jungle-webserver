@@ -281,6 +281,8 @@ expect_code 405 "POST static file"        -d x "$URL"
 expect_code 431 "9KB header"              -H "X-Big: $(head -c 9000 /dev/zero | tr '\0' a)" "$URL"
 head -c 1100000 /dev/zero >"$TMP/huge"
 expect_code 413 "1.1MB body"              -H 'Expect:' --data-binary @"$TMP/huge" "$URL"
+expect_code 501 "unknown method BREW"     -X BREW "$URL"
+expect_code 414 "3000-byte target"        "${URL}$(head -c 3000 /dev/zero | tr '\0' a)"
 
 # 내장 앱 (#10): 계산, 400, 405, echo 바이트 그대로, 모든 응답에 X-Instance
 body=$(curl -s -m 3 "${URL}api/add?a=1&b=2")
@@ -345,6 +347,10 @@ fi
 # 깨진 요청 -> 400
 ( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/bad"
 grep -q '^HTTP/1.1 400' "$TMP/bad" && ok "malformed request -> 400" || bad "malformed request -> 400 (got $(cat "$TMP/bad"))"
+
+# 모양은 맞는데 모르는 버전 -> 505 (curl 은 HTTP/9.9 를 보낼 수 없어 원시 요청)
+( printf 'GET / HTTP/9.9\r\nHost: x\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/ver"
+grep -q '^HTTP/1.1 505' "$TMP/ver" && ok "GET / HTTP/9.9 -> 505" || bad "GET / HTTP/9.9 -> 505 (got $(cat "$TMP/ver"))"
 
 # 파서 오류도 HEAD 면 본문 없이 (Transfer-Encoding 은 501)
 ( printf 'HEAD / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'; sleep 1 ) |
