@@ -16,7 +16,12 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/webserver-test.XXXXXX") || exit 1
 DOCROOT=$TMP/www
 LOG=$TMP/server.log
 URL=http://$HOST:$PORT/
-mkdir -p "$DOCROOT"
+mkdir -p "$DOCROOT/sub"
+printf '<h1>smoke</h1>\n' >"$DOCROOT/index.html"
+printf 'sub file\n' >"$DOCROOT/sub/a.txt"
+head -c 1048576 /dev/urandom >"$DOCROOT/big.bin"   # 여러 POLLOUT 에 나눠 보내지는 크기
+printf 'secret\n' >"$TMP/secret.txt"
+ln -s ../secret.txt "$DOCROOT/link.txt"            # docroot 밖을 가리키는 링크
 
 fail=0
 SERVER_PID=
@@ -153,7 +158,7 @@ close_stalled_conns() {
 echo "== smoke test ($(uname -s))"
 
 [ -x "$BIN" ] && ok "binary exists" || { bad "binary exists"; exit 1; }
-for tool in curl nc mkfifo; do
+for tool in curl nc mkfifo cmp; do
     command -v "$tool" >/dev/null 2>&1 || { bad "$tool is required"; exit 1; }
 done
 
@@ -177,12 +182,96 @@ else
     exit 1
 fi
 
-# 고정 응답 (#7 첫 PR. 파서·정적 파일이 붙으면 실제 응답 검사로 바꾼다)
+# 정적 파일 (docroot/index.html)
 code=$(curl -s -o "$TMP/body" -w '%{http_code}' -m 3 "$URL")
-if [ "$code" = 200 ] && grep -q 'webserver: ok' "$TMP/body"; then
-    ok "GET / -> 200"
+if [ "$code" = 200 ] && grep -q '<h1>smoke</h1>' "$TMP/body"; then
+    ok "GET / -> 200 index.html"
 else
-    bad "GET / -> 200 (got $code)"
+    bad "GET / -> 200 index.html (got $code)"
+fi
+
+code=$(curl -s -o "$TMP/big" -w '%{http_code}' -m 5 "${URL}big.bin")
+[ "$code" = 200 ] && cmp -s "$TMP/big" "$DOCROOT/big.bin" && ok "GET 1MB file -> identical bytes" \
+                                                          || bad "GET 1MB file -> identical bytes (got $code)"
+
+# 상태 코드: 기대값 설명 curl인자...
+expect_code() {
+    want=$1 desc=$2
+    shift 2
+    got=$(http_code "$@")
+    [ "$got" = "$want" ] && ok "$desc -> $want" || bad "$desc -> $want (got $got)"
+}
+expect_code 404 "GET missing file"        "${URL}nope.html"
+expect_code 403 "GET symlink to outside docroot" "${URL}link.txt"
+# .. 조각: 지금은 static_open 이 403, PR #27 머지 후에는 파서가 400. 어느 쪽이든 막혔으면 통과
+got=$(http_code --path-as-is "${URL}../etc/passwd")
+case $got in
+    403|400) ok "GET ../ outside docroot -> blocked ($got)" ;;
+    *)       bad "GET ../ outside docroot -> 403 or 400 (got $got)" ;;
+esac
+expect_code 405 "POST static file"        -d x "$URL"
+expect_code 431 "9KB header"              -H "X-Big: $(head -c 9000 /dev/zero | tr '\0' a)" "$URL"
+head -c 1100000 /dev/zero >"$TMP/huge"
+expect_code 413 "1.1MB body"              -H 'Expect:' --data-binary @"$TMP/huge" "$URL"
+
+# HEAD: 헤더는 GET 과 같고(Content-Length 포함) 본문은 없다.
+# curl -X HEAD 는 Content-Length 만큼 본문을 기다려 멈추므로 원시 요청으로 본다
+( printf 'HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1 ) |
+    nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' >"$TMP/head"
+if grep -q '^HTTP/1.1 200' "$TMP/head" && grep -qi '^Content-Length: 15$' "$TMP/head" &&
+   ! grep -q 'smoke' "$TMP/head"; then
+    ok "HEAD -> Content-Length, no body"
+else
+    bad "HEAD -> Content-Length, no body"
+fi
+
+# keep-alive: curl 한 번에 URL 두 개 → 같은 연결을 다시 쓴다.
+# num_connects 는 그 요청에서 새로 연 연결 수 (재사용이면 0). -v 문구는 curl 버전마다 달라서 쓰지 않는다
+conns=$(curl -s -o /dev/null -o /dev/null -w '%{num_connects} ' -m 3 "$URL" "${URL}sub/a.txt")
+[ "$conns" = "1 0 " ] && ok "keep-alive: second request reuses the connection" \
+                      || bad "keep-alive: second request reuses the connection (new connects: $conns)"
+
+# 연결 유지 기본값: HTTP/1.1 은 keep-alive, HTTP/1.0 은 close (요청에 Connection 이 없을 때)
+h11=$(curl -s -D - -o /dev/null -m 3 "$URL" | tr -d '\r' | grep -i '^Connection:')
+h10=$(curl -0 -s -D - -o /dev/null -m 3 "$URL" | tr -d '\r' | grep -i '^Connection:')
+[ "$h11" = "Connection: keep-alive" ] && [ "$h10" = "Connection: close" ] \
+    && ok "default Connection: 1.1 keep-alive, 1.0 close" \
+    || bad "default Connection: 1.1 keep-alive, 1.0 close (got '$h11' / '$h10')"
+
+# 파이프라이닝: 응답을 기다리지 않고 요청 세 개를 한 번에 보내면 순서대로 세 응답
+( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /sub/a.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+  sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' | grep '^HTTP/1.1' >"$TMP/pipe"
+if [ "$(tr '\n' ' ' <"$TMP/pipe")" = "HTTP/1.1 200 OK HTTP/1.1 200 OK HTTP/1.1 404 Not Found " ]; then
+    ok "pipelined requests -> 200, 200, 404 in order"
+else
+    bad "pipelined requests -> 200, 200, 404 in order (got: $(tr '\n' ' ' <"$TMP/pipe"))"
+fi
+
+# 파이프라이닝 (반쪽): 첫 응답 뒤 in 에 남은 다음 요청의 앞부분이 버려지지 않고,
+# 나중에 온 나머지와 합쳐져 처리되는지 (server.c conn_response_done).
+# 남은 바이트를 "바로" 처리하는지는 위의 한꺼번에 보내는 테스트가 본다 (이 경우는 나머지가
+# 도착하면 poll 이 깨워 주므로 바로 처리하지 않아도 통과한다)
+( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /sub/a.txt HT'
+  sleep 0.5
+  printf 'TP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+  sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' | grep -E '^HTTP/1.1|^sub file' >"$TMP/pipe2"
+if [ "$(tr '\n' ' ' <"$TMP/pipe2")" = "HTTP/1.1 200 OK HTTP/1.1 200 OK sub file " ]; then
+    ok "pipelined request split across reads -> 200, 200"
+else
+    bad "pipelined request split across reads -> 200, 200 (got: $(tr '\n' ' ' <"$TMP/pipe2"))"
+fi
+
+# 깨진 요청 -> 400
+( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/bad"
+grep -q '^HTTP/1.1 400' "$TMP/bad" && ok "malformed request -> 400" || bad "malformed request -> 400 (got $(cat "$TMP/bad"))"
+
+# 파서 오류도 HEAD 면 본문 없이 (Transfer-Encoding 은 501)
+( printf 'HEAD / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'; sleep 1 ) |
+    nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' >"$TMP/head501"
+if grep -q '^HTTP/1.1 501' "$TMP/head501" && ! grep -q '<html>' "$TMP/head501"; then
+    ok "HEAD with parse error -> 501, no body"
+else
+    bad "HEAD with parse error -> 501, no body (got: $(head -1 "$TMP/head501"))"
 fi
 
 # IPv6 소켓으로 열렸으면 ::1 로도 받아야 한다. 이 머신에 IPv6 루프백이 없으면(컨테이너 등)
