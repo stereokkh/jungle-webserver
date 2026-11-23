@@ -106,7 +106,8 @@ same "GET /api/add overflow (400)" '/api/add?a=9223372036854775807&b=1'
 same "POST /api/echo NUL/CRLF + 64KB" '/api/echo' -H 'Expect:' --data-binary "@$TMP/body"
 cmp -s "$TMP/p.b" "$TMP/body" && ok "POST /api/echo via proxy -> sent bytes back" \
                               || bad "POST /api/echo via proxy -> sent bytes back"
-same "POST /api/echo empty"       '/api/echo' -H 'Expect:' -X POST
+# 데이터 없이 -X POST 만 주면 curl 은 Content-Length 줄을 보내지 않는다: 길이 헤더 없는 POST = 빈 본문 → 200, 0 바이트
+same "POST /api/echo no Content-Length (empty)" '/api/echo' -H 'Expect:' -X POST
 same "GET /api/echo (405)"        '/api/echo'
 same "GET /api/nope (404)"        '/api/nope'
 
