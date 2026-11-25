@@ -20,7 +20,7 @@ CS:APP 3판 11장 Tiny 원본을 재현한 결과를 우리 서버의 어느 이
 | 8 | `GET /<script>alert(1)</script>` 의 404 본문에 요청 경로가 그대로 들어감. `Content-length` 없음 | `clienterror` 가 요청 값을 이스케이프 없이 HTML 에 넣어 반사형 XSS. 길이가 없어 keep-alive 불가 | #6 `http_append_error` 본문은 `<h1>상태 사유</h1>` 고정, `Content-Length` 항상 (PR #21) | 혜성 |
 | 9 | HTTP/1.1 요청에도 응답 첫 줄이 `HTTP/1.0 200 OK` | `doit` 이 version 을 읽기만 하고 안 씀 (응답은 1.0 고정). 검사가 없어 `HTTP/9.9` 도 안 걸러짐 (코드로만 확인) | #5 `version_minor` 저장, 1.0·1.1 외 505 (PR #24) | 상철 |
 | 10 | 대상 9000바이트 GET → 응답 일부만 오고 Tiny 가 종료 (상태 134 = SIGABRT) | 고정 `MAXLINE`(8192) 버퍼에 길이 검사가 없음 | #5 대상 2048 초과 414, 머리 8192 초과 431 (PR #24). 파서가 머리 8KB 초과를 먼저 판정해서 9000바이트 대상은 431 (3000바이트면 414). `run.sh` 는 9KB 헤더로 431 검사 | 혜성 |
-| 11 | 일반 파일 `notes-cgi-bin.html` → 403 | `parse_uri` 가 URI 어디든 `cgi-bin` 이 있으면 CGI 로 봄 | #8 라우팅은 접두사 비교 (PR #26), #10 앱은 `/api/add`·`/api/echo` 경로 전체 비교 (PR #30) | 혜성 |
+| 11 | 일반 파일 `notes-cgi-bin.html` → 403 | `parse_uri` 가 URI 어디든 `cgi-bin` 이 있으면 CGI 로 봄 | #8 라우팅은 접두사 비교 (PR #26), #10 앱은 `/api/add`·`/api/echo` 경로 전체 비교 (PR #30. `/api/add` 는 11-25 에 정확 일치 `/healthz` 로 바뀜) | 혜성 |
 
 ## 코드에서만 본 것 (재현 안 함)
 
@@ -28,7 +28,7 @@ CS:APP 3판 11장 Tiny 원본을 재현한 결과를 우리 서버의 어느 이
 |---|---|---|---|
 | 12 | `read_requesthdrs` 가 헤더를 읽고 버림. `Content-Length` 본문을 읽지 않고 GET 만 받음 (그 외 501) | 요청 경계를 몰라 keep-alive·파이프라이닝·POST 가 불가능 | #5 증분 파서 (`Content-Length` 본문, 413/431/501, PR #24), #7 keep-alive·파이프라이닝 (PR #29) |
 | 13 | `serve_static` 이 파일 전체를 `mmap` 해서 `Rio_writen` 으로 다 쓸 때까지 막힘 | 큰 파일·느린 클라이언트를 보내는 동안 다른 연결을 못 받음 | #6 16KB 씩 나눠 보내고 막히면 `poll` 로 돌아감 (`static_send_some`, PR #22). `run.sh` 1MB 일치 검사 |
-| 14 | `serve_dynamic` 이 요청마다 `fork`·`execve`, `adder.c` 는 `atoi`·범위 검사 없음 | `poll` 루프 안에서 자식을 기다리면 서버 전체가 멈춤. `a=abc` 가 0 으로 계산됨 | #10 서버 안 함수 `/api/add`·`/api/echo`, 숫자·범위·오버플로 400 (PR #30) |
+| 14 | `serve_dynamic` 이 요청마다 `fork`·`execve`, `adder.c` 는 `atoi`·범위 검사 없음 | `poll` 루프 안에서 자식을 기다리면 서버 전체가 멈춤. `a=abc` 가 0 으로 계산됨 | #10 서버 안 함수 `/api/add`·`/api/echo`, 숫자·범위·오버플로 400 (PR #30. 11-25 에 덧셈은 헬스체크 `/healthz` 로 바꿈, decisions.md) |
 | 15 | Reverse Proxy 없음 | Tiny 에 없는 기능 | #8 설정·라우팅 (PR #26), #9 중계·502/504·Round-Robin (진행 중) |
 
 ## 미확인

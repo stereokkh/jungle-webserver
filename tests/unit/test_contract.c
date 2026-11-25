@@ -71,9 +71,39 @@ static void test_route_without_proxy(void)
     CHECK_INT(handler_route(&req, NULL, &route), ROUTE_STATIC);
     CHECK(route == NULL);
 
-    set_get(&req, "/api/add");
+    set_get(&req, "/api/echo");
     CHECK_INT(handler_route(&req, NULL, &route), ROUTE_APP);
     CHECK(route == NULL);
+
+    set_get(&req, "/healthz");
+    CHECK_INT(handler_route(&req, NULL, &route), ROUTE_HEALTH);
+    CHECK(route == NULL);
+}
+
+/* 헬스체크는 프록시보다 먼저다: "/" 를 백엔드로 보내는 프런트에서도 /healthz 는 자기 자신이 답한다.
+ * 정확 일치라서 /healthz/x 처럼 비슷한 경로는 그대로 프록시로 간다 (docs/decisions.md 2026-11-25 헬스체크) */
+static void test_route_health_before_proxy(void)
+{
+    static http_request req;
+    static proxy_config cfg;
+    proxy_route *route = NULL;
+
+    memset(&cfg, 0, sizeof cfg);
+    strcpy(cfg.routes[0].prefix, "/");
+    cfg.routes[0].nbackends = 1;
+    cfg.nroutes = 1;
+
+    set_get(&req, "/healthz");
+    CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_HEALTH);
+    CHECK(route == NULL);
+    strcpy(req.target, "/healthz?probe=1");
+    CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_HEALTH);
+
+    set_get(&req, "/healthz/x");
+    CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_PROXY);
+    CHECK(route == &cfg.routes[0]);
+    set_get(&req, "/api/echo");
+    CHECK_INT(handler_route(&req, &cfg, &route), ROUTE_PROXY);
 }
 
 /* 앱 경로는 "/api/" 접두사로만 판단한다 (Tiny 의 strstr("cgi-bin") 오판 방지) */
@@ -90,11 +120,11 @@ static void test_app_match_prefix_only(void)
     set_get(&req, "/api");
     CHECK_INT(app_match(&req), 0);
 
-    /* app_match 는 target(파서가 만든 정규형)을 바이트 그대로 본다. "/%61pi/add" 같은 표기는
-     * 파서가 "/api/add" 로 바꿔서 넘기므로 app_match 가 디코딩하지 않는다 (#31).
-     * 파서를 거친 동작은 test_app.c test_add_normalized */
-    set_get(&req, "/api/add");
-    strcpy(req.target, "/api/add?a=1&b=2");
+    /* app_match 는 target(파서가 만든 정규형)을 바이트 그대로 본다. "/%61pi/echo" 같은 표기는
+     * 파서가 "/api/echo" 로 바꿔서 넘기므로 app_match 가 디코딩하지 않는다 (#31).
+     * 파서를 거친 동작은 test_app.c test_echo_normalized */
+    set_get(&req, "/api/echo");
+    strcpy(req.target, "/api/echo?x=1");
     CHECK_INT(app_match(&req), 1);
 }
 
@@ -155,6 +185,7 @@ int main(void)
     RUN(test_reason_never_null);
     RUN(test_append_failure_keeps_buffer);
     RUN(test_route_without_proxy);
+    RUN(test_route_health_before_proxy);
     RUN(test_app_match_prefix_only);
     RUN(test_static_close_idempotent);
     RUN(test_pick_backend_null_safe);

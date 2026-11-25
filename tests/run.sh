@@ -199,9 +199,11 @@ start_fake() {
 }
 
 # 프런트가 살아 있고 중계가 되는지. 502·504 검사마다 짝으로 붙인다: 실패 응답만 확인하면 "프록시 경로는
-# 전부 502" 인 서버(develop 의 스텁)도 통과하기 때문이다. 같은 프런트가 성공 응답도 낸다는 것을 함께 본다
+# 전부 502" 인 서버(develop 의 스텁)도 통과하기 때문이다. 같은 프런트가 성공 응답도 낸다는 것을 함께 본다.
+# 프런트 설정에 "/alive → 살아 있는 백엔드" 라우트가 있고 그 백엔드 docroot 에 alive/id ("alive") 가 있어야 한다.
+# (/healthz 는 프런트 자신이 답하므로 중계 확인에 쓸 수 없다)
 proxy_alive() {
-    [ "$(curl -s -m 3 "${URL}api/add?a=1&b=2")" = 3 ]
+    [ "$(curl -s -m 3 "${URL}alive/id")" = alive ]
 }
 
 echo "== smoke test ($(uname -s))"
@@ -284,10 +286,19 @@ expect_code 413 "1.1MB body"              -H 'Expect:' --data-binary @"$TMP/huge
 expect_code 501 "unknown method BREW"     -X BREW "$URL"
 expect_code 414 "3000-byte target"        "${URL}$(head -c 3000 /dev/zero | tr '\0' a)"
 
-# 내장 앱 (#10): 계산, 400, 405, echo 바이트 그대로, 모든 응답에 X-Instance
-body=$(curl -s -m 3 "${URL}api/add?a=1&b=2")
-[ "$body" = 3 ] && ok "GET /api/add?a=1&b=2 -> 3" || bad "GET /api/add?a=1&b=2 -> 3 (got '$body')"
-expect_code 400 "GET /api/add overflow"   "${URL}api/add?a=9223372036854775807&b=1"
+# 헬스체크 (2026-11-25): 200 ok, 자기 포트를 X-Instance 로, GET·HEAD 외 405, 정확 일치만
+curl -s -m 3 -D "$TMP/hz_head" -o "$TMP/hz_body" "${URL}healthz"
+if grep -q '^HTTP/1.1 200' "$TMP/hz_head" && [ "$(cat "$TMP/hz_body")" = ok ] &&
+   tr -d '\r' <"$TMP/hz_head" | grep -q "^X-Instance: $PORT\$"; then
+    ok "GET /healthz -> 200 ok, X-Instance: $PORT"
+else
+    bad "GET /healthz -> 200 ok, X-Instance: $PORT (got $(tr '\r\n' '||' <"$TMP/hz_head") body '$(cat "$TMP/hz_body")')"
+fi
+expect_code 405 "POST /healthz"           -X POST -H 'Content-Length: 0' "${URL}healthz"
+expect_code 404 "GET /healthz/x (exact match only)" "${URL}healthz/x"
+expect_code 404 "GET /api/add (removed)"  "${URL}api/add?a=1&b=2"
+
+# 내장 앱 (#10): 405, echo 바이트 그대로, 모든 응답에 X-Instance
 expect_code 405 "GET /api/echo"           "${URL}api/echo"
 printf 'a\000b\r\nc' >"$TMP/echo_in"
 curl -s -m 3 -H 'Expect:' --data-binary @"$TMP/echo_in" -o "$TMP/echo_out" "${URL}api/echo"
@@ -439,8 +450,9 @@ fi
 # 프록시 (이슈 #9): -c 로 라우트를 읽은 프런트 하나, 실제 백엔드 둘, 가짜 백엔드 여섯.
 #   포트: 프런트 PORT, 백엔드 PORT+1·+2, 가짜 PORT+3..+8, 아무도 안 듣는 포트 PORT+9
 #   라우트 (접두사는 떼지 않고 백엔드로 간다. 백엔드는 같은 바이너리라 /api/... 를 스스로 처리한다):
-#     /api    → 백엔드 1             (앱: add, echo)
-#     /files  → 백엔드 1             (정적 파일. 6 MB 파일)
+#     /api    → 백엔드 1             (앱: echo)
+#     /files  → 백엔드 1             (정적 파일. 작은 파일 small, 6 MB 파일)
+#     /alive  → 백엔드 1             (proxy_alive 가 alive/id 를 받는다)
 #     /rr     → 백엔드 1, 2          (Round-Robin. 두 백엔드의 rr/id 파일 내용이 "1" 과 "2")
 #     /down   → 듣는 이 없는 포트    (연결 거절 → 502)
 #     /f/<모드> → 가짜 백엔드
@@ -450,8 +462,10 @@ fi
 proxy_tests() {
     B1=$((PORT + 1)) B2=$((PORT + 2))
     DOWN=$((PORT + 9))
-    mkdir -p "$TMP/b1/files" "$TMP/b1/rr" "$TMP/b2/rr"
+    mkdir -p "$TMP/b1/files" "$TMP/b1/rr" "$TMP/b2/rr" "$TMP/b1/alive"
     printf 'backend 1\n' >"$TMP/b1/index.html"
+    printf 'alive\n' >"$TMP/b1/alive/id"
+    printf 'b1 small\n' >"$TMP/b1/files/small"
     printf 'backend 2\n' >"$TMP/b2/index.html"
     printf '1\n' >"$TMP/b1/rr/id"
     printf '2\n' >"$TMP/b2/rr/id"
@@ -470,6 +484,7 @@ proxy_tests() {
     cat >"$TMP/proxy.conf" <<EOF
 /api       $HOST:$B1
 /files     $HOST:$B1
+/alive     $HOST:$B1
 /rr        $HOST:$B1 $HOST:$B2
 /api/rr    $HOST:$B1 $HOST:$B2
 /down      $HOST:$DOWN
@@ -488,14 +503,24 @@ EOF
         return
     fi
 
-    # 1. GET: 상태, 본문, 어느 백엔드가 답했는지, 클라이언트 연결은 닫는다 (백엔드에 Connection: close 를 보냈으므로)
-    code=$(curl -s -D "$TMP/p.head" -o "$TMP/p.body" -w '%{http_code}' -m 3 "${URL}api/add?a=1&b=2")
+    # 1. GET: 상태, 본문(백엔드 1 docroot 에만 있는 파일이라 백엔드 1 이 답한 것), 클라이언트 연결은 닫는다
+    #    (백엔드에 Connection: close 를 보냈으므로)
+    code=$(curl -s -D "$TMP/p.head" -o "$TMP/p.body" -w '%{http_code}' -m 3 "${URL}files/small")
     tr -d '\r' <"$TMP/p.head" >"$TMP/p.head.lf"
-    if [ "$code" = 200 ] && [ "$(cat "$TMP/p.body")" = 3 ] &&
-       grep -qi "^X-Instance: $B1\$" "$TMP/p.head.lf" && grep -qi '^Connection: close$' "$TMP/p.head.lf"; then
-        ok "proxy GET -> 200, body 3, X-Instance $B1, Connection: close"
+    if [ "$code" = 200 ] && [ "$(cat "$TMP/p.body")" = "b1 small" ] &&
+       grep -qi '^Connection: close$' "$TMP/p.head.lf"; then
+        ok "proxy GET -> 200, body from backend 1, Connection: close"
     else
-        bad "proxy GET -> 200, body 3, X-Instance $B1, Connection: close (got $code, $(tr '\n' '|' <"$TMP/p.head.lf"))"
+        bad "proxy GET -> 200, body from backend 1, Connection: close (got $code, $(tr '\n' '|' <"$TMP/p.head.lf"))"
+    fi
+
+    # 1b. /healthz 는 프록시보다 먼저라 프런트 자신이 답한다 (X-Instance 가 백엔드가 아니라 프런트 포트)
+    curl -s -D "$TMP/hz.head" -o "$TMP/hz.body" -m 3 "${URL}healthz"
+    if grep -q '^HTTP/1.1 200' "$TMP/hz.head" && [ "$(cat "$TMP/hz.body")" = ok ] &&
+       tr -d '\r' <"$TMP/hz.head" | grep -q "^X-Instance: $PORT\$"; then
+        ok "proxy front /healthz -> answered by front (X-Instance $PORT)"
+    else
+        bad "proxy front /healthz -> answered by front (got $(tr '\r\n' '||' <"$TMP/hz.head"))"
     fi
 
     # 2. POST 100 KB: 요청 본문이 백엔드까지 가고 응답이 그대로 돌아온다
@@ -509,12 +534,12 @@ EOF
     fi
 
     # 3. HEAD: 응답 머리는 Content-Length 가 있어도 본문이 없다. 본문을 기다리지 않고 끝난다 (-m 3)
-    curl -s -I -o /dev/null -D "$TMP/h.head" -m 3 "${URL}api/add?a=1&b=2"
+    curl -s -I -o /dev/null -D "$TMP/h.head" -m 3 "${URL}files/small"
     rc=$?
-    ( printf 'HEAD /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1 ) |
+    ( printf 'HEAD /files/small HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'; sleep 1 ) |
         nc "$HOST" "$PORT" 2>/dev/null | tr -d '\r' >"$TMP/h.raw"
     if [ "$rc" -eq 0 ] && grep -q '^HTTP/1.1 200' "$TMP/h.head" &&
-       grep -q '^HTTP/1.1 200' "$TMP/h.raw" && ! grep -qx 3 "$TMP/h.raw"; then
+       grep -q '^HTTP/1.1 200' "$TMP/h.raw" && ! grep -qx 'b1 small' "$TMP/h.raw"; then
         ok "proxy HEAD -> 200, no body"
     else
         bad "proxy HEAD -> 200, no body (curl rc $rc, raw: $(tr '\n' '|' <"$TMP/h.raw"))"
@@ -563,7 +588,7 @@ EOF
     pad=$(head -c 8120 /dev/zero | tr '\0' a)
     ( printf 'GET / HTTP/1.1\r\nHost: %s:%s\r\nX-Pad: %s\r\n\r\n' "$HOST" "$PORT" "$pad"; sleep 1 ) |
         nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/p431.ctl"
-    ( printf 'GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: %s:%s\r\nX-Pad: %s\r\n\r\n' "$HOST" "$PORT" "$pad"; sleep 1 ) |
+    ( printf 'GET /files/small HTTP/1.1\r\nHost: %s:%s\r\nX-Pad: %s\r\n\r\n' "$HOST" "$PORT" "$pad"; sleep 1 ) |
         nc "$HOST" "$PORT" 2>/dev/null | head -1 | tr -d '\r' >"$TMP/p431"
     if grep -q '^HTTP/1.1 200' "$TMP/p431.ctl" && grep -q '^HTTP/1.1 431' "$TMP/p431" && proxy_alive; then
         ok "rewritten head over the limit -> 431"
@@ -674,7 +699,7 @@ EOF
 #         요청을 받고 답이 없는 가짜 SIL=PORT+19 (받은 요청을 파일에 남긴다), 처음에는 죽어 있다가 테스트 도중 실제 백엔드(L3)가 뜨는 D4=PORT+20
 #   라우트마다 접두사를 따로 둔다: 죽은 표시(10초)와 Round-Robin 순번이 라우트별이라 서로 영향을 주지 않고,
 #   새로 띄운 프런트에서 각 라우트를 처음부터 쓰므로 순서가 정해져 있다 (첫 요청은 설정 줄의 첫 주 백엔드에서 시작).
-#   502·504 검사에는 proxy_alive (/api/add → L1, 페일오버 없는 라우트)를 짝으로 붙인다.
+#   502·504 검사에는 proxy_alive (/alive → L1, 페일오버 없는 라우트)를 짝으로 붙인다.
 
 # "코드:본문" 한 줄 (200 이 아니면 코드만). 본문의 개행은 뗀다.
 # curl 이 0 이 아닌 값으로 끝나면(전송 오류: 본문이 Content-Length 보다 짧게 끊김 18, 시간 초과 28 등) 상태 줄이 200 이어도
@@ -751,6 +776,8 @@ failover_tests() {
         printf 'L3\n' >"$TMP/l3/$d/id"
     done
     printf 'backend L1\n' >"$TMP/l1/index.html"
+    mkdir -p "$TMP/l1/alive"
+    printf 'alive\n' >"$TMP/l1/alive/id"
     printf 'backend L2\n' >"$TMP/l2/index.html"
     printf 'backend L3\n' >"$TMP/l3/index.html"
     rm -f "$TMP/fo.r1.log" "$TMP/fo.ph.log" "$TMP/fo.r2.log" "$TMP/fo.sil.log"
@@ -763,7 +790,7 @@ failover_tests() {
     [ $hole -eq 1 ] && { bad "fake blackhole starts"; return; }
 
     cat >"$TMP/fo.conf" <<EOF
-/api/add   $HOST:$L1
+/alive     $HOST:$L1
 /api/echo  $HOST:$D1 $HOST:$L1 failover=connect
 /fo1/      $HOST:$D1 $HOST:$L1 failover=connect
 /fo2/      $HOST:$D1 $HOST:$L1
@@ -781,7 +808,7 @@ failover_tests() {
 EOF
     # connect 시간 초과 라우트는 설정이 따로다 (한 설정의 라우트는 최대 PROXY_MAX_ROUTES 개). 아래 6~8b 에서 서버를 다시 띄운다
     cat >"$TMP/fo.hole.conf" <<EOF
-/api/add   $HOST:$L1
+/alive     $HOST:$L1
 /fo6/      $HOST:$HOLE $HOST:$L1 failover=timeout
 /fo7/      $HOST:$HOLE failover=timeout
 /fo8/      $HOST:$HOLE $HOST:$L1 failover=connect
@@ -1035,8 +1062,10 @@ if start_server -c "$TMP/norm.conf"; then
     expect_code 400 "GET /admin%2Fx"                      --path-as-is "${URL}admin%2Fx"
     expect_code 400 "GET /admin%5Cx"                      --path-as-is "${URL}admin%5Cx"
     expect_code 400 'GET /admin\x'                        --path-as-is "${URL}admin\\x"
-    body=$(curl -s -m 3 --path-as-is "${URL}%61pi/add?a=1&b=2")
-    [ "$body" = 3 ] && ok "GET /%61pi/add?a=1&b=2 -> app 3" || bad "GET /%61pi/add?a=1&b=2 -> app 3 (got '$body')"
+    body=$(curl -s -m 3 --path-as-is -H 'Expect:' --data-binary hi "${URL}%61pi/echo")
+    [ "$body" = hi ] && ok "POST /%61pi/echo -> app echo" || bad "POST /%61pi/echo -> app echo (got '$body')"
+    body=$(curl -s -m 3 --path-as-is "${URL}%68ealthz")
+    [ "$body" = ok ] && ok "GET /%68ealthz -> healthz ok" || bad "GET /%68ealthz -> healthz ok (got '$body')"
     stop_server TERM
 else
     bad "server starts with proxy config"
@@ -1061,9 +1090,9 @@ fi
 grep -q '^access:' "$LOG" && bad "no access log by default" || ok "no access log by default"
 : >"$LOG"
 if start_server --access-log; then
-    curl -s -o /dev/null -m 3 "${URL}api/add?a=1&b=2"
+    curl -s -o /dev/null -m 3 "${URL}healthz"
     curl -s -o /dev/null -m 3 "${URL}nope.txt"
-    ( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /api/add?a=2&b=3 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+    ( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /healthz?n=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
       sleep 1 ) | nc "$HOST" "$PORT" >/dev/null 2>&1
     ( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" >/dev/null 2>&1
     curl -s -o /dev/null -m 3 -X DELETE "${URL}index.html"
@@ -1072,10 +1101,10 @@ if start_server --access-log; then
         grep -qE "$2" "$LOG" && ok "access log: $1" || { bad "access log: $1"; cat "$LOG"; }
     }
     expect_log "open line"          '^access: #[0-9]+ open [^ ]+:[0-9]+ \(active [0-9]+\)$'
-    expect_log "app 200"            '"GET /api/add\?a=1&b=2 HTTP/1\.1" 200 [0-9]+ [0-9]+ms$'
+    expect_log "healthz 200"        '"GET /healthz HTTP/1\.1" 200 [0-9]+ [0-9]+ms$'
     expect_log "static 404"         '"GET /nope\.txt HTTP/1\.1" 404 [0-9]+ [0-9]+ms$'
     expect_log "pipelined 1st"      '"GET / HTTP/1\.1" 200 [0-9]+ [0-9]+ms$'
-    expect_log "pipelined 2nd"      '"GET /api/add\?a=2&b=3 HTTP/1\.1" 200 '
+    expect_log "pipelined 2nd"      '"GET /healthz\?n=2 HTTP/1\.1" 200 '
     expect_log "close after 2 reqs" '^access: #[0-9]+ close done requests=2 [0-9]+ms \(active [0-9]+\)$'
     expect_log "bad request 400"    '"-" 400 [0-9]+ [0-9]+ms$'
     expect_log "unknown method 501" '"DELETE( /index\.html)?" 501 [0-9]+ [0-9]+ms$'
