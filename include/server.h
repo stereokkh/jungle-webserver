@@ -1,9 +1,9 @@
 /*
- * server.h — poll() 이벤트 루프, 연결 수명주기, 시그널/종료
+ * server.h — 이벤트 루프 (ev.h: 기본 poll, 빌드 때 epoll·kqueue), 연결 수명주기, 시그널/종료
  *
  * CS:APP 대응: tiny.c main() 의 while(1) { Accept; doit; Close; } 반복 루프
  * 담당: 트랙 A · 이슈 #7 (업스트림 상태 통합은 #9, B와 협업)
- * 현대식으로 바뀌는 점: 한 번에 한 연결 → poll 로 여러 연결, keep-alive, 타임아웃,
+ * 현대식으로 바뀌는 점: 한 번에 한 연결 → 이벤트 루프로 여러 연결, keep-alive, 타임아웃,
  *                       SIGINT/SIGTERM 시 모든 자원 정리 후 종료
  *
  * 모듈을 어떻게 이어 붙이는지(호출 순서, 버퍼 소유권, 정리 책임)는 docs/interfaces.md

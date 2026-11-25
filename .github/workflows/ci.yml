@@ -8,7 +8,8 @@ on:
 
 jobs:
   native:
-    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    # 기존 세 항목의 잡 이름은 그대로다 (develop 보호 규칙의 필수 검사가 이름으로 걸려 있다). event 가 있는 항목만 이름 뒤에 붙는다
+    name: ${{ matrix.os }} / ${{ matrix.cc }}${{ matrix.event && format(' / {0}', matrix.event) || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -16,13 +17,16 @@ jobs:
           - { os: ubuntu-latest, cc: gcc }
           - { os: ubuntu-latest, cc: clang }
           - { os: macos-latest,  cc: clang }
+          # 이벤트 백엔드 (docs/event-backend.md). 필수 검사가 아니다
+          - { os: ubuntu-latest, cc: gcc,   event: epoll }
+          - { os: macos-latest,  cc: clang, event: kqueue }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - name: Build
-        run: make CC=${{ matrix.cc }} WERROR=1
+        run: make CC=${{ matrix.cc }} WERROR=1 EVENT=${{ matrix.event }}
       - name: Test
-        run: make test CC=${{ matrix.cc }}
+        run: make test CC=${{ matrix.cc }} EVENT=${{ matrix.event }}
 
   alpine:
     name: alpine (musl) / ${{ matrix.cc }}

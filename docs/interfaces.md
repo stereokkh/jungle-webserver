@@ -102,8 +102,8 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
   - 중계 상한: 클라이언트 `out` 에 대기한 바이트가 `PROXY_RELAY_MAX`(64KB) 이상이면 업스트림을 읽지 않는다 (역압력). 그래서 `BUFFER_MAX` 보다 큰 응답도 모으지 않고 흘려보낸다
   - 응답 시작 = 머리 해석이 끝나 상태 줄 검사를 통과하고 머리 바이트를 `out` 에 넣은 때. 그 전 실패는 502/504, 그 뒤는 `out` 에 있는 것까지 보내고 닫는다 (요청을 보낸 뒤의 재시도는 없다. 응답 시작 전 connect 단계의 페일오버만 아래 "프록시 페일오버")
   - 본문 없음: 요청이 `HEAD` 이거나 상태가 204·304 이면 `Content-Length` 가 있어도 본문이 없다. `Transfer-Encoding` 이 있으면 업스트림 EOF 까지가 본문이다
-  - 한 연결이 pollfd 를 최대 둘 쓴다 (클라이언트, 업스트림). 프록시 중에는 클라이언트 입력을 읽지 않고 (`events` 0, 끊김만 감지), 응답이 시작돼 `out` 에 바이트가 있을 때만 클라이언트 POLLOUT 을 본다
-  - 업스트림 fd 는 `conn_close` 뿐 아니라 응답 끝·실패 때 `up_release` 가 닫는다 (`upstream_fd = -1` 로 두 번 닫기를 막는다)
+  - 한 연결이 감시 fd 를 최대 둘 쓴다 (클라이언트, 업스트림). 프록시 중에는 클라이언트 fd 를 아예 보지 않고 (`ev_pause`, 결정 2026-11-25 ev.h 1번. 끊김은 응답을 쓸 때나 마감 때 안다), 응답이 시작돼 `out` 에 바이트가 있을 때만 클라이언트 `WS_EV_OUT` 을 본다
+  - 업스트림 fd 는 `conn_close` 뿐 아니라 응답 끝·실패 때 `up_release` 가 닫는다 (`upstream_fd = -1` 로 두 번 닫기를 막는다). 감시하던 fd 는 모두 `close_watched`(`ev_forget` + `close`)로 닫는다 (`docs/event-backend.md` 3-3)
 - `SIGINT`/`SIGTERM`: 새 연결을 받지 않고 모든 `conn` 을 `conn_close` 한 뒤 `server_run` 이 0 을 반환한다
 
 ## 정한 세부 규칙

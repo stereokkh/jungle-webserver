@@ -38,7 +38,7 @@ access: #2 127.0.0.1:51930 "GET /api/add?a=3&b=4 HTTP/1.1" 200 187 0ms
 access: #2 close idle-timeout requests=1 10003ms (active 0)
 ```
 
-닫힘 이유: `done`(응답 뒤 정상 종료), `client-closed`, `idle-timeout`(10초), `request-timeout`(30초, slow loris), `linger-timeout`, `read-error`, `write-error`, `shutdown`. stderr 를 받는 쪽이 막히면 이벤트 루프도 멈추므로 관찰할 때만 켭니다.
+닫힘 이유: `done`(응답 뒤 정상 종료), `client-closed`, `idle-timeout`(10초), `request-timeout`(30초, slow loris), `linger-timeout`, `read-error`, `write-error`, `event-error`(이벤트 백엔드 등록 실패), `shutdown`. stderr 를 받는 쪽이 막히면 이벤트 루프도 멈추므로 관찰할 때만 켭니다.
 
 > `--merge-slashes` 는 nginx 의 `merge_slashes` 지시어와 같은 동작이지만 **기본값이 반대**입니다. nginx 는 기본으로 합치고, 이 서버는 기본으로 `//` 가 든 요청을 400 으로 거절합니다. 이유는 `docs/decisions.md` (2026-11-23).
 
@@ -47,7 +47,7 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 
 ## 동시성 모델과 제약
 
-프로세스 하나, 스레드 하나가 `poll()` 이벤트 루프로 모든 연결(클라이언트·업스트림)을 논블로킹으로 다룹니다.
+프로세스 하나, 스레드 하나가 이벤트 루프로 모든 연결(클라이언트·업스트림)을 논블로킹으로 다룹니다. 기다리는 부분은 `include/ev.h` 뒤에 있고 기본은 `poll()` 입니다 (`make EVENT=epoll` 은 Linux, `make EVENT=kqueue` 는 macOS 에서 비교용. 시작 줄에 백엔드 이름이 찍힙니다. `docs/event-backend.md`).
 
 | 고른 것 | 이유 |
 |---|---|
@@ -76,6 +76,7 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 make unit                               # 단위 테스트만
 make test                               # 내 환경에서 빌드 + 단위 테스트 + 스모크 테스트
 make asan                               # AddressSanitizer/UBSan 빌드로 같은 테스트 (Ubuntu·WSL·macOS)
+make test EVENT=epoll                   # 이벤트 백엔드를 epoll 로 (Linux). macOS 는 EVENT=kqueue, 기본은 poll
 make docker-test                        # Ubuntu 컨테이너에서
 make docker-test DISTRO=alpine          # Alpine 컨테이너에서
 make docker-test DISTRO=alpine CC=clang # 컴파일러 지정

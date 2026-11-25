@@ -10,7 +10,7 @@
 
 ## 2026-11-25 · [제안] 이벤트 대기 계층 `ev.h` (poll 기본, epoll·kqueue 선택 빌드)
 
-- **상태**: 제안 (상철, 11-25). 트랙 A(건호) 합의 전이다. 같은 문제의 다른 제안이 `feat/kqueue`(혜성, `poller.h`)에 있어 둘 중 하나로 정한다. 정해지면 이 줄을 지우고 제목의 [제안] 을 떼거나, 이 항목을 지운다
+- **상태**: 제안 (상철, 11-25). 트랙 A(건호) 합의 전이다. 같은 문제의 다른 제안이 `feat/kqueue`(혜성, `poller.h`)에 있어 둘 중 하나로 정한다. 정해지면 이 줄을 지우고 제목의 [제안] 을 떼거나, 이 항목을 지운다. 구현: `feat/ev-backend` (혜성, 11-25. 세 백엔드·`server.c`·Makefile·CI·`test_ev.c`. poll·epoll 은 WSL 에서 `make test`·`make asan` 통과, kqueue 는 macOS 실행 확인 전)
 - **제안**: `server.c` 는 `include/ev.h` 함수만 부르고 백엔드는 `make EVENT=poll|epoll|kqueue` 로 고른다 (기본 poll). 원하는 이벤트는 `build_interest` 한 곳에서 계산하고, epoll·kqueue 는 바뀐 fd 만 커널에 고친다. 명세는 `docs/event-backend.md`
   1. 프록시 중(`CONN_UP_*`) 클라이언트 fd 는 세 백엔드 모두 보지 않는다 (`ev_pause`). 결정 C6(11-23)의 "events 0 으로 끊김만 감지"를 바꾼다
   2. `ev_want` 는 `WS_EV_IN` 이나 `WS_EV_OUT` 하나만

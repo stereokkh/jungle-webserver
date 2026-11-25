@@ -1,21 +1,21 @@
 /*
- * server.c — poll() 이벤트 루프, 연결 수명주기, 시그널/종료
+ * server.c — 이벤트 루프 (ev.h: poll·epoll·kqueue 중 빌드 때 하나), 연결 수명주기, 시그널/종료
  *
  * CS:APP 대응: tiny.c main()
  *   Tiny:  listenfd = Open_listenfd(port);
  *          while (1) { connfd = Accept(...); doit(connfd); Close(connfd); }
  *   → 한 번에 연결 하나. 요청을 다 보내지 않는 클라이언트 하나가 다른 모든 연결을 기다리게 한다.
- *   여기서는 poll 로 listen fd + 모든 연결 fd 를 감시하고, 연결마다 상태(conn)를 두어
+ *   여기서는 listen fd + 모든 연결 fd 를 감시하고, 연결마다 상태(conn)를 두어
  *   읽기/처리/쓰기를 "지금 할 수 있는 만큼만" 진행한 뒤 루프로 돌아온다.
  *
- * 루프 한 바퀴:
- *   1. 유휴 시간을 넘긴 연결을 닫고, poll 대기 시간을 가장 먼저 만료될 연결 기준으로 정한다
- *   2. pollfd 목록을 새로 만든다: [0] 시그널 파이프, [1] listen 소켓, [2..] 연결
- *      (연결 상태에 따라 POLLIN 또는 POLLOUT 중 하나만 감시. 프록시 중인 연결은 클라이언트 fd 와
- *       업스트림 fd 로 칸을 둘 쓰고, 칸마다 어느 fd 인지(pfd_kind)를 기억한다)
- *   3. poll → 연결 이벤트 처리 → 마지막에 accept
+ * 루프 한 바퀴 (docs/event-backend.md):
+ *   1. 유휴 시간을 넘긴 연결을 닫고, 대기 시간을 가장 먼저 만료될 연결 기준으로 정한다
+ *   2. build_interest: 감시 대상마다 지금 원하는 이벤트를 ev_want(IN 또는 OUT 하나) 또는 ev_pause 로 알린다.
+ *      프록시 중인 연결은 클라이언트 fd 와 업스트림 fd 둘. 이벤트마다 tag(fd·칸·종류·칸 세대)가 붙어 돌아온다
+ *   3. ev_wait → 연결 이벤트 처리 → 마지막에 시그널·accept
  *      (accept 를 먼저 하면 방금 닫은 칸에 새 연결이 들어가서, 같은 칸을 가리키는
- *       이전 pollfd 의 revents 가 새 연결에 잘못 적용될 수 있다)
+ *       이전 이벤트가 새 연결에 잘못 적용될 수 있다. 칸 세대도 이것을 막는다)
+ *   감시하던 fd 는 close_watched(= ev_forget + close)로만 닫는다 (같은 번호의 새 fd 가 등록되지 않는 함정)
  *
  * 요청 하나의 흐름 (docs/interfaces.md 1~6단계):
  *   READING ─파서 DONE→ 응답을 out 에 만듦 → WRITING ─out 다 보냄→ (정적 파일이면) SENDING_FILE
@@ -25,7 +25,7 @@
  *   프록시 경로 (#9): 응답을 만들지 않고 업스트림 연결을 시작한다
  *     UP_CONNECTING ─연결됨→ UP_SENDING ─요청 다 보냄→ UP_RECEIVING ─응답 끝→ WRITING (남은 out 을 보내고 닫기)
  *     응답 시작 전 실패는 502/504 를 out 에 쓰고 WRITING, 시작 후 실패는 남은 out 만 보내고 닫는다.
- *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 pollfd 를 최대 둘 쓴다
+ *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 감시 fd 를 최대 둘 쓴다
  *     페일오버 (라우트에 failover= 가 있을 때만): UP_CONNECTING 에서 connect 가 실패하거나 시간이 넘으면 업스트림 fd 를
  *     닫고 다음 백엔드로 UP_CONNECTING 을 다시 한다. 요청 바이트는 UP_SENDING 부터 나가므로 그 전에만 되고,
  *     그래서 같은 요청(POST 포함)이 두 백엔드에서 실행되지 않는다. 시계(up_start_ms)는 첫 시도부터 한 번만 잰다
@@ -46,6 +46,7 @@
 #include "app.h"
 #include "proxy_config.h"
 #include "proxy.h"
+#include "ev.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -54,7 +55,6 @@
 #include <netdb.h>
 #include <errno.h>
 #include <limits.h>
-#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -127,12 +127,12 @@ typedef struct {
     const char *close_why;   /* 닫는 이유. NULL 이면 닫을 때의 상태 이름 */
 } conn;
 
-/* pollfd 목록의 고정 위치 */
-enum { PFD_SIGNAL = 0, PFD_LISTEN = 1, PFD_FIRST_CONN = 2 };
+/* ev tag 배치 (docs/event-backend.md 3-4): 0..31 fd, 32..47 conns 칸, 48..51 종류, 52..63 칸 세대 */
+enum { TAG_CLIENT = 0, TAG_UPSTREAM = 1, TAG_LISTEN = 2, TAG_SIGNAL = 3 };
+_Static_assert(SERVER_MAX_CONNS <= 65536, "conns slot must fit in 16 bits of the ev tag");
 
-/* 프록시 연결은 pollfd 를 둘(클라이언트, 업스트림) 쓴다. 칸 하나가 가리키는 fd 의 종류 */
-enum { PFD_KIND_CLIENT = 0, PFD_KIND_UPSTREAM = 1 };
-#define PFD_MAX (PFD_FIRST_CONN + 2 * SERVER_MAX_CONNS)
+/* 한 바퀴에 감시하는 fd 상한: 시그널 + listen + 연결마다 클라이언트·업스트림 */
+#define EV_MAX_WATCH (2 + 2 * (size_t)SERVER_MAX_CONNS)
 
 /* respond() 의 반환: 응답을 out 에 만들었다 / 응답 대신 업스트림 연결을 시작했다 */
 enum { RESPOND_OUT = 0, RESPOND_PROXY = 1 };
@@ -144,14 +144,31 @@ typedef struct {
     int64_t accept_resume_ms;                   /* 0 이 아니면 이 시각까지 accept 쉼 */
     conn *conns[SERVER_MAX_CONNS];              /* 빈 칸은 NULL */
     size_t nconns;
-    struct pollfd pfds[PFD_MAX];
-    size_t pfd_slot[PFD_MAX];                   /* pfds[i] 가 가리키는 conns 칸 */
-    int pfd_kind[PFD_MAX];                      /* pfds[i] 가 클라이언트 fd 인지 업스트림 fd 인지 */
-    proxy_config proxy;                         /* -c 가 있을 때만 (서버 수명 동안 유지) */
+    ev_loop *ev;                                /* 이벤트 백엔드 (ev.h) */
+    unsigned gen[SERVER_MAX_CONNS];             /* 칸 세대: conn_close 마다 1 증가. 낡은 이벤트를 거른다 */
+    proxy_config proxy;                        /* -c 가 있을 때만 (서버 수명 동안 유지) */
     int has_proxy;
     http_parse_options parse_opt;               /* 요청마다 같은 파서 옵션 (#31) */
     unsigned long long next_conn_id;            /* --access-log 의 연결 번호 */
 } server;
+
+static uint64_t tag_make(int fd, size_t slot, unsigned kind, unsigned gen)
+{
+    return (uint64_t)(uint32_t)fd | (uint64_t)(slot & 0xffffu) << 32 |
+           (uint64_t)(kind & 0xfu) << 48 | (uint64_t)(gen & 0xfffu) << 52;
+}
+
+static int tag_fd(uint64_t t)        { return (int)(uint32_t)t; }
+static size_t tag_slot(uint64_t t)   { return (size_t)(t >> 32 & 0xffffu); }
+static unsigned tag_kind(uint64_t t) { return (unsigned)(t >> 48 & 0xfu); }
+static unsigned tag_gen(uint64_t t)  { return (unsigned)(t >> 52 & 0xfffu); }
+
+/* 감시 중일 수 있는 fd 는 이것으로만 닫는다: 백엔드의 등록 기록을 먼저 지운다 (ev.h ev_forget) */
+static void close_watched(server *s, int fd)
+{
+    ev_forget(s->ev, fd);
+    close(fd);
+}
 
 /*
  * 시그널 처리: self-pipe.
@@ -428,9 +445,9 @@ static void conn_close(server *s, size_t slot)
                 c->id, c->close_why != NULL ? c->close_why : conn_state_name(c->state), c->nreq,
                 (long long)(now_ms() - c->open_ms), s->nconns - 1);
     }
-    close(c->fd);
+    close_watched(s, c->fd);
     if (c->upstream_fd >= 0)
-        close(c->upstream_fd);
+        close_watched(s, c->upstream_fd);
     static_close(&c->file);
     buffer_free(&c->in);
     buffer_free(&c->out);
@@ -438,6 +455,7 @@ static void conn_close(server *s, size_t slot)
     proxy_relay_free(&c->relay);
     free(c);
     s->conns[slot] = NULL;
+    s->gen[slot]++;             /* 이 칸을 가리키던 낡은 이벤트를 거른다 (dispatch) */
     s->nconns--;
     s->accept_resume_ms = 0;    /* fd 가 하나 생겼으니 쉬던 accept 를 다시 시도한다 */
 }
@@ -479,10 +497,10 @@ static int respond_static(server *s, conn *c, int head)
 }
 
 /* 업스트림 fd·요청·중계 상태를 정리한다 (conn_close 와 달리 클라이언트 연결은 둔다) */
-static void up_release(conn *c)
+static void up_release(server *s, conn *c)
 {
     if (c->upstream_fd >= 0)
-        close(c->upstream_fd);
+        close_watched(s, c->upstream_fd);
     c->upstream_fd = -1;
     buffer_free(&c->up_out);
     proxy_relay_free(&c->relay);
@@ -595,7 +613,7 @@ static int up_start_attempt(conn *c)
 /* ROUTE_PROXY: 다시 쓴 요청을 up_out 에 만들고 업스트림 connect 를 시작한다 (#9).
  * 프록시 응답 뒤에는 항상 연결을 닫으므로 keep_alive 는 0 (백엔드에도 Connection: close 를 보냈다).
  * 요청이 in 을 가리키는 동안(consume 전) 불러야 한다. 이 요청의 in 은 연결이 닫힐 때까지 consume 하지 않는다 (handle_request) */
-static int respond_proxy(conn *c, proxy_route *route, int head)
+static int respond_proxy(server *s, conn *c, proxy_route *route, int head)
 {
     int64_t now = now_ms();   /* 결정 4a: 요청을 프록시에 넘긴 시각. 재구성·connect 시작 시간도 마감에 든다 */
     int code;
@@ -611,7 +629,7 @@ static int respond_proxy(conn *c, proxy_route *route, int head)
     c->up_last_ms = now;
     code = up_start_attempt(c);
     if (code != 0) {
-        up_release(c);
+        up_release(s, c);
         return http_append_error(&c->out, code, 0, head, NULL);
     }
     c->last_active_ms = now_ms();
@@ -631,7 +649,7 @@ static int respond(server *s, conn *c)
 
     switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
     case ROUTE_PROXY:
-        return respond_proxy(c, route, head);
+        return respond_proxy(s, c, route, head);
     case ROUTE_APP:
         if (app_handle(&c->req, s->cfg->port, &c->out) == 0)
             return RESPOND_OUT;
@@ -852,7 +870,7 @@ static void up_fail(server *s, size_t slot, int code)
     conn *c = s->conns[slot];
     int head = c->relay.request_was_head;
 
-    up_release(c);
+    up_release(s, c);
     c->keep_alive = 0;
     c->last_active_ms = now_ms();   /* 클라이언트 유휴 타이머는 이 응답을 쓰는 시점부터 */
     if (http_append_error(&c->out, code, 0, head, NULL) < 0) {
@@ -881,7 +899,7 @@ static void up_finish(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
 
-    up_release(c);
+    up_release(s, c);
     c->keep_alive = 0;
     c->state = CONN_WRITING;
     if (buffer_pending(&c->out) == 0)
@@ -902,7 +920,7 @@ static void up_connect_failed(server *s, size_t slot, int timed_out)
     int code = timed_out ? 504 : 502;
 
     c->up_last_timeout = timed_out;
-    close(c->upstream_fd);
+    close_watched(s, c->upstream_fd);   /* 다음 시도의 새 fd 가 같은 번호를 받기 쉽다 (ev_forget 이 없으면 등록이 빠진다) */
     c->upstream_fd = -1;
     proxy_mark_down(route, c->up_backend, now_ms());
     if (route->failover & kind) {
@@ -1046,19 +1064,20 @@ static void up_on_event(server *s, size_t slot)
         up_receive(s, slot);   /* HUP 이어도 read 결과(남은 데이터 또는 0)로 판단 */
 }
 
-/* UP_* 상태의 클라이언트 fd 이벤트: 끊김은 모두 닫기, 응답 시작 후 POLLOUT 이면 out 을 보낸다 */
-static void up_on_client_event(server *s, size_t slot, short re)
+/* UP_* 상태의 클라이언트 fd 이벤트: 끊김은 모두 닫기, 응답 시작 후 쓰기 가능이면 out 을 보낸다.
+ * 클라이언트 fd 는 out 에 바이트가 있을 때만 WS_EV_OUT 으로 감시하므로 (결정 1) 이벤트도 그때만 온다 */
+static void up_on_client_event(server *s, size_t slot, unsigned re)
 {
     conn *c = s->conns[slot];
     ssize_t n;
     int was_paused = up_paused(c);
 
-    if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+    if (re & (WS_EV_ERR | WS_EV_HUP)) {
         c->close_why = "client-closed";
         conn_close(s, slot);       /* 업스트림 fd 도 같이 닫힌다 */
         return;
     }
-    if (!(re & POLLOUT) || buffer_pending(&c->out) == 0)
+    if (!(re & WS_EV_OUT) || buffer_pending(&c->out) == 0)
         return;
     log_note_status(c);
     n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
@@ -1201,8 +1220,8 @@ static int64_t expire_idle(server *s, int64_t now)
     return next;
 }
 
-/* expire_idle 이 돌려준 절대 마감 시각을 poll 의 대기 시간(ms)으로 바꾼다. 마감이 없으면 -1(무한), 이미 지났으면 0.
- * 시각은 poll 직전에 다시 읽는다: expire_idle 과 build_pollfds 가 쓴 시간이 대기 시간에서 빠진다 */
+/* expire_idle 이 돌려준 절대 마감 시각을 ev_wait 의 대기 시간(ms)으로 바꾼다. 마감이 없으면 -1(무한), 이미 지났으면 0.
+ * 시각은 ev_wait 직전에 다시 읽는다: expire_idle 과 build_interest 가 쓴 시간이 대기 시간에서 빠진다 */
 static int poll_timeout_ms(int64_t next_deadline)
 {
     int64_t left;
@@ -1215,82 +1234,99 @@ static int poll_timeout_ms(int64_t next_deadline)
     return left > INT_MAX ? INT_MAX : (int)left;
 }
 
-static size_t build_pollfds(server *s)
-{
-    size_t n = PFD_FIRST_CONN, i;
-
-    s->pfds[PFD_SIGNAL].fd = sig_pipe[0];
-    s->pfds[PFD_SIGNAL].events = POLLIN;
-    /* 음수 fd 는 poll 이 무시한다 (accept 를 쉬는 동안) */
-    s->pfds[PFD_LISTEN].fd = s->accept_resume_ms != 0 ? -1 : s->listen_fd;
-    s->pfds[PFD_LISTEN].events = POLLIN;
-
-    for (i = 0; i < SERVER_MAX_CONNS; i++) {
-        conn *c = s->conns[i];
-
-        if (c == NULL)
-            continue;
-        s->pfds[n].fd = c->fd;
-        s->pfd_slot[n] = i;
-        s->pfd_kind[n] = PFD_KIND_CLIENT;
-        if (!is_up_state(c->state)) {
-            s->pfds[n].events =
-                (c->state == CONN_READING || c->state == CONN_LINGERING) ? POLLIN : POLLOUT;
-            n++;
-            continue;
-        }
-        /* 프록시: 클라이언트 입력은 읽지 않는다 (C6). events 0 이어도 POLLHUP/POLLERR 는 온다.
-         * 응답이 시작돼 out 에 바이트가 있을 때만 POLLOUT */
-        s->pfds[n].events = (c->state == CONN_UP_RECEIVING && buffer_pending(&c->out) > 0) ? POLLOUT : 0;
-        n++;
-        s->pfds[n].fd = c->upstream_fd;
-        s->pfds[n].events = c->state == CONN_UP_RECEIVING ? POLLIN : POLLOUT;
-        /* 받는 중에 out 이 가득 차 읽을 바이트가 0 이면 음수 fd 로 poll 이 무시하게 한다 */
-        if (c->state == CONN_UP_RECEIVING && up_paused(c))
-            s->pfds[n].fd = -1;
-        s->pfd_slot[n] = i;
-        s->pfd_kind[n] = PFD_KIND_UPSTREAM;
-        n++;
-    }
-    for (i = 0; i < n; i++)
-        s->pfds[i].revents = 0;
-    return n;
-}
-
-static void dispatch(server *s, size_t npfds)
+/* 감시 대상마다 지금 원하는 이벤트를 알린다 (docs/event-backend.md 4장 표). 매 바퀴 모든 대상에 ev_want 또는 ev_pause.
+ *   READING·LINGERING → 클라이언트 IN / WRITING·SENDING_FILE·CLOSING → 클라이언트 OUT
+ *   UP_CONNECTING·UP_SENDING → 클라이언트 pause, 업스트림 OUT
+ *   UP_RECEIVING → 클라이언트는 out 에 바이트가 있으면 OUT 아니면 pause (결정 1), 업스트림은 역압력이면 pause 아니면 IN
+ * 연결 fd 의 등록이 실패하면 그 연결만 닫는다 ("event-error"). 반환 -1: 시그널·listen 등록 실패 (서버를 끝낸다) */
+static int build_interest(server *s)
 {
     size_t i;
 
-    for (i = PFD_FIRST_CONN; i < npfds; i++) {
-        size_t slot = s->pfd_slot[i];
-        short re = s->pfds[i].revents;
-        conn *c = s->conns[slot];
+    ev_begin(s->ev);
+    if (ev_want(s->ev, sig_pipe[0], tag_make(sig_pipe[0], 0, TAG_SIGNAL, 0), WS_EV_IN) < 0)
+        return -1;
+    if (s->accept_resume_ms != 0)
+        ev_pause(s->ev, s->listen_fd);   /* accept 를 쉬는 동안 (fd 고갈) */
+    else if (ev_want(s->ev, s->listen_fd, tag_make(s->listen_fd, 0, TAG_LISTEN, 0), WS_EV_IN) < 0)
+        return -1;
 
-        if (re == 0 || c == NULL)
+    for (i = 0; i < SERVER_MAX_CONNS; i++) {
+        conn *c = s->conns[i];
+        unsigned g = s->gen[i];
+        int rc = 0;
+
+        if (c == NULL)
             continue;
-        if (s->pfd_kind[i] == PFD_KIND_UPSTREAM) {
-            /* 같은 연결의 앞 항목(클라이언트)이 연결을 닫았거나 상태를 바꿨을 수 있다 → 낡은 항목은 건너뜀.
-             * 페일오버는 업스트림 fd 를 닫고 새로 연다. 새 fd 가 같은 번호를 받을 수 있어서 이 비교만으로는 바뀐 것을 못 알아본다.
-             * 그래도 안전한 이유: 한 연결의 업스트림 칸은 한 바퀴에 하나이고, fd 를 바꾸는 곳(up_on_event, expire_idle)은
-             * 그 칸을 처리하는 중이거나 pollfd 를 만들기 전이다. 다음 바퀴는 build_pollfds 가 현재 fd 로 다시 만든다 */
-            if (c->upstream_fd != s->pfds[i].fd || !is_up_state(c->state))
+        if (!is_up_state(c->state)) {
+            rc = ev_want(s->ev, c->fd, tag_make(c->fd, i, TAG_CLIENT, g),
+                         (c->state == CONN_READING || c->state == CONN_LINGERING) ? WS_EV_IN : WS_EV_OUT);
+        } else {
+            /* 프록시: 클라이언트 입력은 읽지 않는다 (C6) */
+            if (c->state == CONN_UP_RECEIVING && buffer_pending(&c->out) > 0)
+                rc = ev_want(s->ev, c->fd, tag_make(c->fd, i, TAG_CLIENT, g), WS_EV_OUT);
+            else
+                ev_pause(s->ev, c->fd);
+            if (rc == 0 && c->state == CONN_UP_RECEIVING && up_paused(c))
+                ev_pause(s->ev, c->upstream_fd);   /* 역압력: out 이 가득 차 읽을 바이트가 0 */
+            else if (rc == 0)
+                rc = ev_want(s->ev, c->upstream_fd, tag_make(c->upstream_fd, i, TAG_UPSTREAM, g),
+                             c->state == CONN_UP_RECEIVING ? WS_EV_IN : WS_EV_OUT);
+        }
+        if (rc < 0) {
+            fprintf(stderr, "webserver: event register: %s\n", strerror(errno));
+            c->close_why = "event-error";
+            conn_close(s, i);
+        }
+    }
+    return 0;
+}
+
+/* 이벤트 처리. 순서는 백엔드마다 다르므로(ev.h) 기대지 않고, 낡은 이벤트는 tag 로 거른다:
+ *   1. 칸이 비었다 (같은 배치의 앞 이벤트가 닫음)  2. tag 의 칸 세대가 지금과 다르다
+ *   3. 업스트림 이벤트인데 tag 의 fd 가 지금 upstream_fd 가 아니거나 업스트림 상태가 아니다
+ * 페일오버로 업스트림 fd 가 같은 번호로 바뀌어도 그 fd 의 이벤트는 한 배치에 하나뿐이고, 그것을 처리하는 중에 바뀐다.
+ * 시그널·accept 는 표시만 해 두고 연결 이벤트를 다 처리한 뒤에 (파일 맨 위 주석 3) */
+static void dispatch(server *s, const ev_event *evs, int nev)
+{
+    int i, sig = 0, acc = 0;
+
+    for (i = 0; i < nev; i++) {
+        uint64_t t = evs[i].tag;
+        unsigned re = evs[i].events, kind = tag_kind(t);
+        size_t slot = tag_slot(t);
+        conn *c;
+
+        if (kind == TAG_SIGNAL) {
+            sig = 1;
+            continue;
+        }
+        if (kind == TAG_LISTEN) {
+            acc = 1;
+            continue;
+        }
+        c = s->conns[slot];
+        if (c == NULL || tag_gen(t) != (s->gen[slot] & 0xfffu))
+            continue;
+        if (kind == TAG_UPSTREAM) {
+            if (c->upstream_fd != tag_fd(t) || !is_up_state(c->state))
                 continue;
             up_on_event(s, slot);
         } else if (is_up_state(c->state)) {
             up_on_client_event(s, slot, re);
-        } else if (re & (POLLERR | POLLNVAL)) {
+        } else if (re & WS_EV_ERR) {
             conn_close(s, slot);
         } else if (c->state == CONN_READING || c->state == CONN_LINGERING) {
-            if (re & (POLLIN | POLLHUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */
+            if (re & (WS_EV_IN | WS_EV_HUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */
                 conn_on_readable(s, slot);
-        } else if (re & (POLLOUT | POLLHUP)) {
-            conn_on_writable(s, slot);       /* HUP 이면 write 가 EPIPE 로 실패해 닫힌다 */
+        } else if (re & (WS_EV_OUT | WS_EV_HUP)) {
+            conn_on_writable(s, slot);           /* HUP 이면 write 가 EPIPE 로 실패해 닫힌다 */
         }
     }
-    if (s->pfds[PFD_SIGNAL].revents & POLLIN)
+    if (sig)
         drain_signal_pipe();
-    if (s->pfds[PFD_LISTEN].fd >= 0 && (s->pfds[PFD_LISTEN].revents & POLLIN))
-        accept_ready(s);   /* 연결 이벤트를 다 처리한 뒤에 (파일 맨 위 주석 3) */
+    if (acc)
+        accept_ready(s);
 }
 
 static void log_listening(const server *s)
@@ -1301,8 +1337,8 @@ static void log_listening(const server *s)
 
     memset(&ss, 0, sizeof ss);
     v6 = getsockname(s->listen_fd, (struct sockaddr *)&ss, &len) == 0 && ss.ss_family == AF_INET6;
-    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s%s%s\n",
-            s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", s->cfg->docroot,
+    fprintf(stderr, "webserver: listening on port %s (%s, %s), docroot %s%s%s%s%s\n",
+            s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", ev_backend(), s->cfg->docroot,
             s->has_proxy ? ", proxy config " : "", s->has_proxy ? s->cfg->proxy_conf : "",
             s->parse_opt.merge_slashes ? ", merge slashes" : "",
             s->cfg->access_log ? ", access log" : "");
@@ -1314,13 +1350,15 @@ static void shutdown_all(server *s)
     size_t i;
 
     if (s->listen_fd >= 0)
-        close(s->listen_fd);
+        close_watched(s, s->listen_fd);
     s->listen_fd = -1;
     for (i = 0; i < SERVER_MAX_CONNS; i++) {
         if (s->conns[i] != NULL)
             s->conns[i]->close_why = "shutdown";
         conn_close(s, i);
     }
+    if (sig_pipe[0] >= 0)
+        ev_forget(s->ev, sig_pipe[0]);
     close_signal_pipe();
 }
 
@@ -1352,6 +1390,12 @@ int server_run(const server_config *cfg)
         ret = -1;
         goto out;
     }
+    s->ev = ev_open(EV_MAX_WATCH);
+    if (s->ev == NULL) {
+        fprintf(stderr, "webserver: cannot open %s: %s\n", ev_backend(), strerror(errno));
+        ret = -1;
+        goto out;
+    }
     s->listen_fd = net_listen(cfg->port);
     if (s->listen_fd < 0) {
         fprintf(stderr, "webserver: cannot listen on port %s: %s\n", cfg->port, strerror(errno));
@@ -1362,24 +1406,31 @@ int server_run(const server_config *cfg)
 
     while (!stop_requested) {
         int64_t next_deadline = expire_idle(s, now_ms());
-        size_t npfds = build_pollfds(s);
-        int rc = poll(s->pfds, (nfds_t)npfds, poll_timeout_ms(next_deadline));
+        const ev_event *evs;
+        int rc;
 
+        if (build_interest(s) < 0) {
+            perror("webserver: event register");
+            ret = -1;
+            break;
+        }
+        rc = ev_wait(s->ev, poll_timeout_ms(next_deadline), &evs);
         if (rc < 0) {
             if (errno == EINTR)
                 continue;   /* 시그널: 루프 조건에서 stop_requested 확인 */
-            perror("webserver: poll");
+            fprintf(stderr, "webserver: %s: %s\n", ev_backend(), strerror(errno));
             ret = -1;
             break;
         }
         if (rc > 0)
-            dispatch(s, npfds);
+            dispatch(s, evs, rc);
     }
     if (ret == 0)
         fprintf(stderr, "webserver: shutting down (%zu connections)\n", s->nconns);
 
 out:
     shutdown_all(s);
+    ev_close(s->ev);
     free(s);
     return ret;
 }
