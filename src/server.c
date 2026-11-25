@@ -26,6 +26,9 @@
  *     UP_CONNECTING ─연결됨→ UP_SENDING ─요청 다 보냄→ UP_RECEIVING ─응답 끝→ WRITING (남은 out 을 보내고 닫기)
  *     응답 시작 전 실패는 502/504 를 out 에 쓰고 WRITING, 시작 후 실패는 남은 out 만 보내고 닫는다.
  *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 pollfd 를 최대 둘 쓴다
+ *     페일오버 (라우트에 failover= 가 있을 때만): UP_CONNECTING 에서 connect 가 실패하거나 시간이 넘으면 업스트림 fd 를
+ *     닫고 다음 백엔드로 UP_CONNECTING 을 다시 한다. 요청 바이트는 UP_SENDING 부터 나가므로 그 전에만 되고,
+ *     그래서 같은 요청(POST 포함)이 두 백엔드에서 실행되지 않는다. 시계(up_start_ms)는 첫 시도부터 한 번만 잰다
  *
  * Tiny 와 다른 점: 요청마다 연결을 닫지 않는다 (keep-alive), 한 연결이 느려도 다른 연결은
  * 계속 처리된다, 요청 하나를 받는 시간에 상한이 있다, 오류 응답이 RST 로 사라지지 않게
@@ -94,9 +97,17 @@ typedef struct {
     int keep_alive;          /* 이번 응답 후 연결 유지 여부 */
     static_file file;        /* CONN_SENDING_FILE 일 때 */
     int upstream_fd;         /* 프록시 백엔드 소켓, 없으면 -1 (#9) */
-    buffer up_out;           /* 백엔드로 보낼 요청 (#9). out 처럼 off 가 송신 진행 상태 */
+    buffer up_out;           /* 백엔드로 보낼 요청 (#9). out 처럼 off 가 송신 진행 상태. 시도마다 새로 만든다 (Host 가 백엔드 이름) */
     proxy_relay relay;       /* 업스트림 응답 머리 해석·본문 경계 (#9). calloc 0 이어도 free 해도 안전 */
-    int64_t up_start_ms;     /* 요청을 프록시에 넘긴 시각 (응답 시작 전 마감의 기준) */
+    int64_t up_start_ms;     /* 요청을 프록시에 넘긴 시각 (응답 시작 전 마감의 기준). 페일오버해도 다시 잡지 않는다 */
+    /* 페일오버 (이번 요청의 백엔드 선택 상태. 요청을 프록시에 넘길 때 respond_proxy 가 채운다) */
+    proxy_route *up_route;   /* 이번 요청의 라우트. s->proxy 안을 가리키므로 서버 수명 동안 유효 */
+    size_t up_rr_start;      /* proxy_rr_begin 이 돌려준 Round-Robin 시작 위치. 요청 하나에 한 번만 받는다 */
+    unsigned up_tried;       /* 이미 시도한 백엔드 비트 (proxy_pick_backend 의 tried_mask) */
+    size_t up_ntries;        /* 지금까지 시도한 백엔드 수 (route->tries 에 닿으면 멈춘다) */
+    size_t up_backend;       /* 지금 connect 중인 백엔드의 인덱스 (실패하면 죽은 표시를 붙일 곳) */
+    int64_t up_connect_ms;   /* 지금 시도의 connect 시작 시각 (PROXY_CONNECT_TIMEOUT_MS 의 기준) */
+    int up_last_timeout;     /* 마지막 실패가 connect 시간 초과면 1, connect 오류면 0. 시도가 끝났을 때 504 / 502 를 가른다 */
     int64_t up_last_ms;      /* 시작 후: 마지막 업스트림 바이트 또는 클라이언트 쓰기 진행 시각 (역압력으로 쉰 시간은 안 센다) */
     char client_ip[INET6_ADDRSTRLEN];   /* X-Forwarded-For 용. accept 때 채운다 (C7) */
     int64_t last_active_ms;  /* CLIENT_IDLE_TIMEOUT_MS / UPSTREAM_TIMEOUT_MS 검사 */
@@ -467,32 +478,142 @@ static int respond_static(server *s, conn *c, int head)
     return 0;
 }
 
+/* 업스트림 fd·요청·중계 상태를 정리한다 (conn_close 와 달리 클라이언트 연결은 둔다) */
+static void up_release(conn *c)
+{
+    if (c->upstream_fd >= 0)
+        close(c->upstream_fd);
+    c->upstream_fd = -1;
+    buffer_free(&c->up_out);
+    proxy_relay_free(&c->relay);
+}
+
+/* 응답 시작 전 전체 마감: 요청을 프록시에 넘긴 때(첫 시도)부터 UPSTREAM_TIMEOUT_MS. 페일오버해도 기준이 안 바뀐다 */
+static int up_budget_spent(const conn *c, int64_t now)
+{
+    return now >= c->up_start_ms + UPSTREAM_TIMEOUT_MS;
+}
+
+/* 지금 시도의 connect 가 PROXY_CONNECT_TIMEOUT_MS 를 넘겼나. failover=timeout 인 라우트에서만 잰다
+ * (없으면 connect 도 전체 마감 하나로 잰다). expire_idle 과 up_on_event 가 같은 판단을 쓰도록 한 곳에 둔다:
+ * poll 이 연결 이벤트를 늦게 돌려줘도 마감을 넘긴 시도는 연결됐다고 받지 않고 시간 초과로 다룬다 */
+static int up_connect_expired(const conn *c, int64_t now)
+{
+    return c->state == CONN_UP_CONNECTING && (c->up_route->failover & PROXY_FAILOVER_TIMEOUT) &&
+           now >= c->up_connect_ms + PROXY_CONNECT_TIMEOUT_MS;
+}
+
+/* 업스트림 connect 가 지금 어디까지 왔나 (소켓에 물어본다). 전체 마감에 걸린 두 자리(expire_idle, up_on_event 맨 위)가
+ * "그 백엔드를 죽었다고 표시할까"를 같은 판단으로 하도록 한 곳에 둔다.
+ *   SO_ERROR != 0            → UP_CONN_FAILED  (거절·도달 불가 등)
+ *   getpeername 성공         → UP_CONN_CONNECTED (연결은 이미 끝났고 POLLOUT 을 아직 처리하지 못했을 뿐: 멀쩡한 백엔드)
+ *   getpeername ENOTCONN     → UP_CONN_PENDING (SYN 에 답이 없다)
+ *   그 밖의 getpeername 오류 → UP_CONN_FAILED  (소켓이 이미 망가졌다)
+ * 순서가 중요하다: 오류가 난 소켓도 getpeername 은 ENOTCONN 이라 SO_ERROR 를 먼저 봐야 PENDING 과 구별된다.
+ * SO_ERROR 를 읽으면 그 오류는 지워진다. 이 함수를 부른 쪽은 fd 를 곧 닫으므로 괜찮다 */
+typedef enum { UP_CONN_PENDING, UP_CONN_CONNECTED, UP_CONN_FAILED } up_conn_state;
+
+static up_conn_state up_connect_state(int fd)
+{
+    struct sockaddr_storage peer;
+    socklen_t len = sizeof peer;
+
+    if (proxy_connect_result(fd) != 0)
+        return UP_CONN_FAILED;
+    if (getpeername(fd, (struct sockaddr *)&peer, &len) == 0)
+        return UP_CONN_CONNECTED;
+    return errno == ENOTCONN ? UP_CONN_PENDING : UP_CONN_FAILED;
+}
+
+/* 응답 시작 전 전체 마감에 걸린 연결의 현재 백엔드에 죽은 표시를 붙여야 하나.
+ * connect 중이던 시도만 해당하고, 이미 연결된 백엔드(늦게 처리했을 뿐)는 아니다. 페일오버가 꺼진 라우트면 표시 자체가 no-op 이다 */
+static int up_deadline_backend_failed(const conn *c)
+{
+    return c->state == CONN_UP_CONNECTING && up_connect_state(c->upstream_fd) != UP_CONN_CONNECTED;
+}
+
+/* 이번 요청의 다음 백엔드를 골라 up_out 을 새로 만들고 connect 를 시작한다. 첫 시도와 페일오버가 같은 함수를 쓴다.
+ * 성공하면 0: upstream_fd 가 열려 있으니 UP_CONNECTING 에서 POLLOUT 을 기다리면 된다.
+ * 실패하면 호출자가 클라이언트에게 보낼 상태 코드를 돌려준다. 이때 up_out 은 비우지 않고 둔다: 정리는 호출자의 up_release(up_fail 포함)가
+ * 한 곳에서 한다 (실패 경로마다 책임이 같다. 다음 시도 앞의 buffer_free 는 새 요청을 만들 자리를 비우는 것일 뿐이다):
+ *   431  다시 쓴 요청이 HTTP_MAX_HEADER 를 넘음 (결정 6). 첫 시도뿐 아니라 이름이 더 긴 백엔드로 넘어가다 넘어도 같다
+ *   504  전체 마감을 넘겼다, 또는 더 시도할 수 없고 마지막 실패가 connect 시간 초과
+ *   502  더 시도할 수 없고 마지막 실패가 connect 오류 (후보가 없거나 route->tries 에 닿은 것 포함)
+ * proxy_connect_start 가 동기적으로 실패해도(fd 고갈·임시 포트 고갈은 PROXY_CONNECT_LOCAL, 즉시 거절은 -1) 한 번 실패로 세고, 페일오버가 켜져 있으면
+ * 바로 다음 후보로 간다. 죽은 표시는 -1 일 때만 붙인다 (PROXY_CONNECT_LOCAL 은 이쪽 문제라 백엔드 탓이 아니다).
+ * 반복은 시도마다 up_ntries 가 늘고 route->tries(<= PROXY_MAX_BACKENDS)에 닿으면 끝나므로 connect 를 무한히 돌지 않는다.
+ * 전체 마감(첫 시도부터 UPSTREAM_TIMEOUT_MS)은 시도를 새로 열기 전, 요청을 다시 쓴 직후(connect 직전), 상태 코드를 정하기 전에 본다: 이미 넘었으면 새 connect 도
+ * 502·431 도 아니고 504 다 (다른 곳은 expire_idle·up_on_event 가 같은 마감에 504 를 보내므로 같은 요청에 두 가지 답이 없게).
+ * proxy_build_request 는 c->req 가 가리키는 in 을 읽는다. 그래서 handle_request 는 프록시 요청의 in 을 consume 하지 않는다 */
+static int up_start_attempt(conn *c)
+{
+    proxy_route *route = c->up_route;
+
+    while (c->up_ntries < route->tries) {
+        int idx, fd;
+        int64_t t;
+        const proxy_backend *be;
+
+        if (up_budget_spent(c, now_ms()))
+            break;
+        idx = proxy_pick_backend(route, now_ms(), c->up_tried, c->up_rr_start);
+        if (idx < 0)
+            break;
+        be = &route->backends[idx];
+        c->up_tried |= 1u << idx;
+        c->up_ntries++;
+        c->up_backend = (size_t)idx;
+        buffer_free(&c->up_out);   /* 지난 시도의 요청은 Host 가 지난 백엔드 이름이다. 버리고 새로 만든다 */
+        if (proxy_build_request(&c->req, be, c->client_ip, &c->up_out) < 0) {
+            /* 파서·설정 로더가 막아 주므로 남는 실패는 "다시 쓴 머리가 HTTP_MAX_HEADER 초과"와 메모리 부족뿐.
+             * 앞의 것이 현실적인 원인이라 431 로 답한다 */
+            return up_budget_spent(c, now_ms()) ? 504 : 431;
+        }
+        /* 요청을 다시 쓰는 동안 전체 마감을 넘겼을 수 있다. 시각을 한 번만 읽어 마감을 보고, 남았으면 그 값이 곧 connect 시계의 시작이다.
+         * 시각을 두 번 읽으면 그 사이에 마감이 지나도 connect 가 시작되고, 바로 실패하면 멀쩡한 백엔드를 죽었다고 표시한다.
+         * 재작성 시간은 connect 시계가 아니라 전체 마감에만 든다 */
+        t = now_ms();
+        if (up_budget_spent(c, t))
+            break;
+        c->up_connect_ms = t;
+        fd = proxy_connect_start(be);
+        if (fd >= 0) {
+            c->upstream_fd = fd;
+            return 0;
+        }
+        c->up_last_timeout = 0;
+        /* 이쪽 자원 문제(socket() 실패)는 connect 를 시도하지 않았으니 백엔드를 죽었다고 표시하지 않는다. 시도 횟수에는 센다.
+         * 동기 connect 실패(ENETUNREACH, ECONNREFUSED 등)는 백엔드에 닿지 못한 것이라 표시한다 */
+        if (fd != PROXY_CONNECT_LOCAL)
+            proxy_mark_down(route, (size_t)idx, now_ms());   /* 페일오버가 꺼져 있으면 아무것도 하지 않는다 */
+        if (!(route->failover & PROXY_FAILOVER_CONNECT))
+            break;
+    }
+    return (c->up_last_timeout || up_budget_spent(c, now_ms())) ? 504 : 502;
+}
+
 /* ROUTE_PROXY: 다시 쓴 요청을 up_out 에 만들고 업스트림 connect 를 시작한다 (#9).
  * 프록시 응답 뒤에는 항상 연결을 닫으므로 keep_alive 는 0 (백엔드에도 Connection: close 를 보냈다).
- * proxy_build_request 는 요청이 in 을 가리키는 동안(consume 전) 불러야 한다 */
+ * 요청이 in 을 가리키는 동안(consume 전) 불러야 한다. 이 요청의 in 은 연결이 닫힐 때까지 consume 하지 않는다 (handle_request) */
 static int respond_proxy(conn *c, proxy_route *route, int head)
 {
-    const proxy_backend *backend = proxy_next_backend(route);
     int64_t now = now_ms();   /* 결정 4a: 요청을 프록시에 넘긴 시각. 재구성·connect 시작 시간도 마감에 든다 */
-    int fd;
+    int code;
 
     c->keep_alive = 0;
-    if (backend == NULL)
-        return http_append_error(&c->out, 502, 0, head, NULL);
-    if (proxy_build_request(&c->req, backend, c->client_ip, &c->up_out) < 0) {
-        /* 파서·설정 로더가 막아 주므로 남는 실패는 "다시 쓴 머리가 HTTP_MAX_HEADER 초과"와 메모리 부족뿐.
-         * 앞의 것이 현실적인 원인이라 431 로 답한다 */
-        return http_append_error(&c->out, 431, 0, head, NULL);
-    }
-    fd = proxy_connect_start(backend);
-    if (fd < 0) {
-        buffer_free(&c->up_out);
-        return http_append_error(&c->out, 502, 0, head, NULL);
-    }
-    c->upstream_fd = fd;
+    c->up_route = route;
+    c->up_rr_start = proxy_rr_begin(route);   /* 순번은 요청당 한 칸. 페일오버가 다시 골라도 이 값으로 */
+    c->up_tried = 0;
+    c->up_ntries = 0;
+    c->up_last_timeout = 0;
     proxy_relay_init(&c->relay, head);
     c->up_start_ms = now;
     c->up_last_ms = now;
+    code = up_start_attempt(c);
+    if (code != 0) {
+        up_release(c);
+        return http_append_error(&c->out, code, 0, head, NULL);
+    }
     c->last_active_ms = now_ms();
     c->state = CONN_UP_CONNECTING;
     return RESPOND_PROXY;
@@ -568,10 +689,14 @@ static int handle_request(server *s, conn *c)
     rr = respond(s, c);
     if (rr < 0)
         return -1;
+    /* 프록시: respond_proxy 가 UP_CONNECTING 으로 정해 두었다. in 은 consume 하지 않는다. 페일오버가 요청을 다른
+     * 백엔드용으로 다시 쓸 때 req.headers/body 가 가리키는 in 이 필요하기 때문이다. 프록시 중에는 클라이언트 입력을
+     * 읽지 않으므로(C6) in 은 그대로 남고, 응답 뒤 conn_linger 가 비운다 (프록시 응답은 keep-alive 가 아니다) */
+    if (rr == RESPOND_PROXY)
+        return 0;
     /* 응답을 다 만든 뒤에 consume (req.headers/body 가 in 안을 가리킨다) */
     buffer_consume(&c->in, consumed);
-    if (rr == RESPOND_OUT)
-        c->state = CONN_WRITING;   /* RESPOND_PROXY 는 respond_proxy 가 UP_CONNECTING 으로 정해 두었다 */
+    c->state = CONN_WRITING;
     return 0;
 }
 
@@ -639,7 +764,7 @@ static void conn_on_readable(server *s, size_t slot)
         return;
     }
     /* reserve 가 compact 로 데이터를 옮길 수 있지만, 여기 올 때는 in 을 가리키는 req 포인터를
-     * 쓰는 중이 아니다 (응답을 만들고 consume 한 뒤에만 다시 읽는다) */
+     * 쓰는 중이 아니다 (응답을 만들고 consume 한 뒤에만 다시 읽는다. 프록시 요청은 consume 하지 않지만 UP_* 상태에서는 이 함수가 불리지 않는다) */
     if (buffer_reserve(&c->in, READ_CHUNK) < 0) {
         conn_close(s, slot);
         return;
@@ -721,16 +846,6 @@ static void conn_on_writable(server *s, size_t slot)
  * 프록시: 업스트림 연결·송신·중계 (#9)
  * --------------------------------------------------------------- */
 
-/* 업스트림 fd·요청·중계 상태를 정리한다 (conn_close 와 달리 클라이언트 연결은 둔다) */
-static void up_release(conn *c)
-{
-    if (c->upstream_fd >= 0)
-        close(c->upstream_fd);
-    c->upstream_fd = -1;
-    buffer_free(&c->up_out);
-    proxy_relay_free(&c->relay);
-}
-
 /* 응답 시작 전 실패(결정 2): 업스트림을 닫고 502/504 를 out 에 써서 WRITING 으로. 보낸 뒤 연결을 닫는다 */
 static void up_fail(server *s, size_t slot, int code)
 {
@@ -747,6 +862,19 @@ static void up_fail(server *s, size_t slot, int code)
     c->state = CONN_WRITING;
 }
 
+/* 응답 시작 전 전체 마감(UPSTREAM_TIMEOUT_MS)을 넘겨 504 를 보낸다. expire_idle 과 up_on_event 가 같은 일을 하도록 한 곳에 둔다.
+ * backend_failed 가 참이면 지금 시도 중인 백엔드에 죽은 표시를 붙인다 (페일오버가 꺼진 라우트면 proxy_mark_down 이 아무것도 안 한다).
+ * connect 가 멈춘 채 마감까지 온 백엔드를 그냥 두면, failover=connect 만 켠 라우트(connect 시계가 없다)에서
+ * 뒤이어 그 백엔드로 가는 요청마다 5초를 기다리고 504 를 받기 때문이다 */
+static void up_fail_deadline(server *s, size_t slot, int backend_failed)
+{
+    conn *c = s->conns[slot];
+
+    if (backend_failed)
+        proxy_mark_down(c->up_route, c->up_backend, now_ms());
+    up_fail(s, slot, 504);
+}
+
 /* 응답 끝(COMPLETE) 또는 시작 후 업스트림이 일찍 끊김(TRUNCATED): 업스트림을 닫고 out 에 남은 걸
  * 기존 WRITING 경로로 보낸 뒤 닫는다. out 이 이미 비었으면 바로 닫는 쪽으로 */
 static void up_finish(server *s, size_t slot)
@@ -758,6 +886,35 @@ static void up_finish(server *s, size_t slot)
     c->state = CONN_WRITING;
     if (buffer_pending(&c->out) == 0)
         conn_response_done(s, slot);
+}
+
+/* UP_CONNECTING 에서 connect 가 실패했다 (timed_out == 0: SO_ERROR != 0) 또는 PROXY_CONNECT_TIMEOUT_MS 를 넘겼다 (1).
+ * 어느 쪽이든 그 백엔드에 죽은 표시를 붙인다 (페일오버가 꺼진 라우트면 proxy_mark_down 이 아무것도 안 한다).
+ * 이 종류의 페일오버가 켜져 있으면 업스트림 fd 를 닫고 다음 백엔드로 connect 를 다시 시작해 UP_CONNECTING 에 머문다.
+ * 아니면, 또는 더 시도할 수 없으면 502 (connect 오류) / 504 (시간 초과, 또는 이미 전체 마감을 넘김).
+ * 요청 바이트는 UP_SENDING 에서야 나가므로 여기서 다른 백엔드로 넘겨도 같은 요청이 두 번 실행되지 않는다.
+ * 호출한 쪽은 이 함수가 돌아오면 upstream_fd 가 바뀌었을 수 있다고 보고 낡은 revents 로 더 처리하지 않는다 */
+static void up_connect_failed(server *s, size_t slot, int timed_out)
+{
+    conn *c = s->conns[slot];
+    proxy_route *route = c->up_route;
+    unsigned kind = timed_out ? PROXY_FAILOVER_TIMEOUT : PROXY_FAILOVER_CONNECT;
+    int code = timed_out ? 504 : 502;
+
+    c->up_last_timeout = timed_out;
+    close(c->upstream_fd);
+    c->upstream_fd = -1;
+    proxy_mark_down(route, c->up_backend, now_ms());
+    if (route->failover & kind) {
+        code = up_start_attempt(c);
+        if (code == 0)
+            return;
+    }
+    /* 넘어갈 수 없는 경우(이 종류의 페일오버가 꺼짐, 시도 소진)도 최종 상태 코드를 정하는 이 자리에서 전체 마감을 다시 본다:
+     * 마감이 이미 지났으면 502 가 아니라 504 다 (마감이 502·431 보다 앞선다. expire_idle 과 같은 답) */
+    if (up_budget_spent(c, now_ms()))
+        code = 504;
+    up_fail(s, slot, code);
 }
 
 /* 클라이언트 out 에 더 쌓아도 되는 바이트 (PROXY_RELAY_MAX 까지) */
@@ -847,8 +1004,10 @@ static void up_on_event(server *s, size_t slot)
     conn *c = s->conns[slot];
 
     /* 같은 poll 배치의 앞 이벤트를 처리하는 동안 마감이 지났을 수 있다. 시작 전이면 늦게 완성된 머리도 504 (결정 4a) */
-    if (!c->relay.started && now_ms() >= c->up_start_ms + UPSTREAM_TIMEOUT_MS) {
-        up_fail(s, slot, 504);
+    if (!c->relay.started && up_budget_spent(c, now_ms())) {
+        /* 아직 connect 중이거나 실패한 백엔드는 죽은 것이다. 연결이 이미 끝났다면(POLLOUT 을 늦게 처리했을 뿐) 표시하지 않는다.
+         * expire_idle 과 같은 판단이다 (up_deadline_backend_failed) */
+        up_fail_deadline(s, slot, up_deadline_backend_failed(c));
         return;
     }
     /* 시작 후: 읽으려고 기다리던 마감이 이미 지났으면 늦게 온 바이트는 받지 않고 대기분만 보내고 닫는다 (결정 4b) */
@@ -859,9 +1018,22 @@ static void up_on_event(server *s, size_t slot)
         return;
     }
     if (c->state == CONN_UP_CONNECTING) {
+        /* 이 시도의 connect 마감도 지났으면 (같은 배치의 앞 이벤트가 오래 걸렸거나 스케줄링이 밀렸을 때) 연결됐더라도
+         * 요청을 보내지 않고 시간 초과로 다음 백엔드에 넘긴다. expire_idle 의 판단과 같다 (up_connect_expired) */
+        if (up_connect_expired(c, now_ms())) {
+            up_connect_failed(s, slot, 1);
+            return;
+        }
         /* POLLOUT·POLLERR·POLLHUP 어느 쪽이 와도 getsockopt(SO_ERROR) 만으로 판단 (결정 5) */
         if (proxy_connect_result(c->upstream_fd) != 0) {
-            up_fail(s, slot, 502);
+            up_connect_failed(s, slot, 0);
+            return;                /* 다른 백엔드의 새 fd 로 바뀌었을 수 있다: 이 revents 로 이어서 처리하지 않는다 */
+        }
+        /* 맨 위의 마감 검사와 여기 사이에 시간이 흘렀을 수 있다 (스케줄링이 밀림). 요청이 백엔드에 닿은 뒤에야 504 를 주면
+         * 백엔드는 요청을 실행했는데 클라이언트는 실패로 본다. 첫 write 직전에 한 번 더 보고, 넘었으면 아무것도 쓰지 않는다.
+         * 연결은 됐으니 그 백엔드는 죽은 표시 없이 */
+        if (up_budget_spent(c, now_ms())) {
+            up_fail_deadline(s, slot, 0);
             return;
         }
         c->state = CONN_UP_SENDING;
@@ -961,15 +1133,21 @@ static int64_t conn_deadline(const conn *c)
             u = c->up_last_ms + UPSTREAM_TIMEOUT_MS;
         if (u >= 0 && u < d)
             d = u;
+        /* connect 시계: 라우트에 failover=timeout 이 있을 때만 (없으면 connect 도 전체 마감 UPSTREAM_TIMEOUT_MS 하나로 잰다) */
+        if (c->state == CONN_UP_CONNECTING && (c->up_route->failover & PROXY_FAILOVER_TIMEOUT) &&
+            c->up_connect_ms + PROXY_CONNECT_TIMEOUT_MS < d)
+            d = c->up_connect_ms + PROXY_CONNECT_TIMEOUT_MS;
     }
     return d;
 }
 
-/* 마감을 넘긴 연결을 닫고, 다음 poll 대기 시간(ms, 없으면 -1)을 돌려준다.
- * 마감: 유휴(바이트가 오가지 않음), 요청 하나를 받는 시간(slow loris), lingering */
-static int expire_idle(server *s, int64_t now)
+/* 마감을 넘긴 연결을 닫고, 남은 연결 중 가장 이른 마감 시각(now_ms 기준 절대 시각, 없으면 -1)을 돌려준다.
+ * 마감: 유휴(바이트가 오가지 않음), 요청 하나를 받는 시간(slow loris), lingering.
+ * 상대 시간(ms)이 아니라 절대 시각을 돌려주는 이유: 이 루프 안에서 페일오버 재작성·connect 가 시간을 쓰는데, 루프 시작의 now 로
+ * 뺀 값을 poll 에 넘기면 그만큼 더 기다린다. poll_timeout_ms 가 poll 직전 시각으로 뺀다 */
+static int64_t expire_idle(server *s, int64_t now)
 {
-    int64_t next = -1, left;
+    int64_t next = -1, d;
     size_t i;
 
     for (i = 0; i < SERVER_MAX_CONNS; i++) {
@@ -977,9 +1155,18 @@ static int expire_idle(server *s, int64_t now)
 
         if (c == NULL)
             continue;
-        if (is_up_state(c->state) && !c->relay.started &&
-            now >= c->up_start_ms + UPSTREAM_TIMEOUT_MS) {
-            up_fail(s, i, 504);        /* 응답 시작 전 시간 초과: 닫지 않고 504 를 보낸다 */
+        if (is_up_state(c->state) && !c->relay.started && up_budget_spent(c, now)) {
+            /* 응답 시작 전 시간 초과: 닫지 않고 504 를 보낸다. 아직 connect 중이었다면 그 백엔드가 마감까지 답이 없던 것이다.
+             * 단 소켓이 이미 연결됐다면(POLLOUT 이 아직 처리되지 않은 것) 표시하지 않는다 (up_deadline_backend_failed) */
+            up_fail_deadline(s, i, up_deadline_backend_failed(c));
+            c = s->conns[i];
+            if (c == NULL)
+                continue;
+        }
+        /* 전체 마감 검사 다음에: 이 시도의 connect 가 PROXY_CONNECT_TIMEOUT_MS 를 넘겼다. 다음 백엔드로 넘기거나 504.
+         * 위의 마감과 아래 "마감이 지났으면 닫기" 사이에 둬야 한다. 그렇지 않으면 시간 초과한 연결이 응답 없이 닫힌다 */
+        if (up_connect_expired(c, now)) {
+            up_connect_failed(s, i, 1);
             c = s->conns[i];
             if (c == NULL)
                 continue;
@@ -992,8 +1179,8 @@ static int expire_idle(server *s, int64_t now)
             if (c == NULL)
                 continue;
         }
-        left = conn_deadline(c) - now;
-        if (left <= 0) {
+        d = conn_deadline(c);
+        if (d <= now) {
             if (c->state == CONN_LINGERING)
                 c->close_why = "linger-timeout";
             else if (c->state == CONN_READING && c->req_start_ms != 0 &&
@@ -1002,17 +1189,30 @@ static int expire_idle(server *s, int64_t now)
             else
                 c->close_why = "idle-timeout";
             conn_close(s, i);
-        } else if (next < 0 || left < next)
-            next = left;
+        } else if (next < 0 || d < next)
+            next = d;
     }
     if (s->accept_resume_ms != 0) {
-        left = s->accept_resume_ms - now;
-        if (left <= 0)
+        if (s->accept_resume_ms <= now)
             s->accept_resume_ms = 0;
-        else if (next < 0 || left < next)
-            next = left;
+        else if (next < 0 || s->accept_resume_ms < next)
+            next = s->accept_resume_ms;
     }
-    return (int)next;
+    return next;
+}
+
+/* expire_idle 이 돌려준 절대 마감 시각을 poll 의 대기 시간(ms)으로 바꾼다. 마감이 없으면 -1(무한), 이미 지났으면 0.
+ * 시각은 poll 직전에 다시 읽는다: expire_idle 과 build_pollfds 가 쓴 시간이 대기 시간에서 빠진다 */
+static int poll_timeout_ms(int64_t next_deadline)
+{
+    int64_t left;
+
+    if (next_deadline < 0)
+        return -1;
+    left = next_deadline - now_ms();
+    if (left <= 0)
+        return 0;
+    return left > INT_MAX ? INT_MAX : (int)left;
 }
 
 static size_t build_pollfds(server *s)
@@ -1069,7 +1269,10 @@ static void dispatch(server *s, size_t npfds)
         if (re == 0 || c == NULL)
             continue;
         if (s->pfd_kind[i] == PFD_KIND_UPSTREAM) {
-            /* 같은 연결의 앞 항목(클라이언트)이 연결을 닫았거나 상태를 바꿨을 수 있다 → 낡은 항목은 건너뜀 */
+            /* 같은 연결의 앞 항목(클라이언트)이 연결을 닫았거나 상태를 바꿨을 수 있다 → 낡은 항목은 건너뜀.
+             * 페일오버는 업스트림 fd 를 닫고 새로 연다. 새 fd 가 같은 번호를 받을 수 있어서 이 비교만으로는 바뀐 것을 못 알아본다.
+             * 그래도 안전한 이유: 한 연결의 업스트림 칸은 한 바퀴에 하나이고, fd 를 바꾸는 곳(up_on_event, expire_idle)은
+             * 그 칸을 처리하는 중이거나 pollfd 를 만들기 전이다. 다음 바퀴는 build_pollfds 가 현재 fd 로 다시 만든다 */
             if (c->upstream_fd != s->pfds[i].fd || !is_up_state(c->state))
                 continue;
             up_on_event(s, slot);
@@ -1158,9 +1361,9 @@ int server_run(const server_config *cfg)
     log_listening(s);
 
     while (!stop_requested) {
-        int timeout = expire_idle(s, now_ms());
+        int64_t next_deadline = expire_idle(s, now_ms());
         size_t npfds = build_pollfds(s);
-        int rc = poll(s->pfds, (nfds_t)npfds, timeout);
+        int rc = poll(s->pfds, (nfds_t)npfds, poll_timeout_ms(next_deadline));
 
         if (rc < 0) {
             if (errno == EINTR)

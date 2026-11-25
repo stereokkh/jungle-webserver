@@ -14,7 +14,7 @@ set -u
 BIN=${BIN:-./webserver}
 FAKE=${FAKE:-./build/tools/fake_upstream}
 HOST=127.0.0.1
-PORT=${PORT:-$((20000 + $$ % 12000))}   # 최대 31999+9 (PORT..PORT+9 를 씀). 리눅스 ephemeral 범위(32768~60999) 아래
+PORT=${PORT:-$((20000 + $$ % 12000))}   # 최대 31999+20 (PORT..PORT+20 를 씀). 리눅스 ephemeral 범위(32768~60999) 아래
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/webserver-test.XXXXXX") || exit 1
 DOCROOT=$TMP/www
 LOG=$TMP/server.log
@@ -182,11 +182,11 @@ start_backend() {
     return 1
 }
 
-# 가짜 백엔드를 띄우고 "ready" 가 찍힐 때까지 최대 5초 기다린다: start_fake <port> <mode>
-# 출력은 $TMP/fake.<port>.out (hold 는 여기에 peer-closed 도 찍는다)
+# 가짜 백엔드를 띄우고 "ready" 가 찍힐 때까지 최대 5초 기다린다: start_fake <port> <mode> [요청 기록 파일]
+# 출력은 $TMP/fake.<port>.out (hold 는 여기에 peer-closed 도 찍는다). 기록 파일을 주면 받은 요청마다 한 줄이 붙는다
 start_fake() {
     _fo=$TMP/fake.$1.out
-    "$FAKE" "$1" "$2" >"$_fo" 2>&1 &
+    "$FAKE" "$1" "$2" ${3:+"$3"} >"$_fo" 2>&1 &
     UP_PIDS="$UP_PIDS $!"
     _i=0
     while [ $_i -lt 50 ]; do
@@ -650,7 +650,8 @@ EOF
 
 # 손으로 하는 확인 (run.sh 에 넣지 않는다: 제한을 줄여 따로 빌드해야 하고 4초 가까이 걸린다).
 # 느린 응답 두 시계: 전체 시간이 UPSTREAM_TIMEOUT_MS 보다 길어도 바이트 사이 간격이 짧으면 끝까지 받아야 한다.
-# fake drip 은 머리를 바로 보내고 본문 6바이트를 700 ms 마다 1바이트씩 (전체 약 3.5초). 제한 1000 ms 로 빌드한다:
+# fake drip 은 머리를 바로 보내고 본문 6바이트를 700 ms 마다 1바이트씩 (전체 약 3.5초). 제한 1000 ms 로 빌드한다
+# (connect 시간 초과는 server.h 가 그 절반으로 알아서 정한다. -DPROXY_CONNECT_TIMEOUT_MS 를 직접 줘도 되지만 전체 마감보다 작아야 한다):
 #   make BUILD_DIR=/tmp/jw-drip TARGET=/tmp/jw-drip/webserver CFLAGS='-O2 -g -DUPSTREAM_TIMEOUT_MS=1000' \
 #        /tmp/jw-drip/webserver /tmp/jw-drip/tools/fake_upstream
 #   /tmp/jw-drip/tools/fake_upstream 9301 drip &
@@ -659,8 +660,366 @@ EOF
 #   curl -sS -m 10 -w '\n%{http_code} %{time_total}s\n' http://127.0.0.1:9300/x
 # 기대: abcdef, 200, 3.5초 안팎 (제한 1초보다 길다). 실패하면 504 가 아니라 본문이 중간에 끊긴다
 # (응답 시작 뒤라 502 가 아니다). 끝나면 kill %1 %2.
+#
+# connect 시간 초과(PROXY_CONNECT_TIMEOUT_MS)는 failover_tests 가 가짜 blackhole(연결 대기열을 가득 채워 SYN 을 버리게 한
+# 소켓)로 자동으로 본다. 그 방법이 안 되는 환경에서는 건너뛰므로, 라우팅되지 않는 주소로 손으로도 볼 수 있다:
+#   echo '/x/ 10.255.255.1:80 127.0.0.1:9301 failover=timeout' >/tmp/p.conf   (9301 에 fake_upstream ok 를 띄운다)
+#   ./webserver -p 9300 -r www -c /tmp/p.conf &   curl -s -m 8 -w '\n%{http_code} %{time_total}s\n' http://127.0.0.1:9300/x/y
+# 기대: fake ok, 200, 1초 조금 넘게 (첫 요청이 10.255.255.1 에서 시작해야 한다. 환경에 따라 그 주소가 즉시 거절될 수 있다).
+# 페일오버 (failover=, backup=, tries=, 결정: docs/decisions.md 2026-11-25).
+#   포트: 살아 있는 백엔드 L1=PORT+10, L2=PORT+11 (실제 백엔드, /foN/id 가 자기 이름 L1·L2 를 돌려준다),
+#         아무도 안 듣는 D1=PORT+9, D2=PORT+12, D3=PORT+13, Host 를 돌려주는 가짜 FH=PORT+15,
+#         대기열이 가득 차 connect 가 멈추는 가짜 HOLE=PORT+14 (connect 시간 초과 검사. 이 환경이 못 만들면 그 검사만 건너뛴다),
+#         받은 요청을 파일에 남기는 가짜 R1=PORT+16 (ok), PH=PORT+17 (응답 머리를 반만 보내고 닫음), R2=PORT+18 (ok),
+#         요청을 받고 답이 없는 가짜 SIL=PORT+19 (받은 요청을 파일에 남긴다), 처음에는 죽어 있다가 테스트 도중 실제 백엔드(L3)가 뜨는 D4=PORT+20
+#   라우트마다 접두사를 따로 둔다: 죽은 표시(10초)와 Round-Robin 순번이 라우트별이라 서로 영향을 주지 않고,
+#   새로 띄운 프런트에서 각 라우트를 처음부터 쓰므로 순서가 정해져 있다 (첫 요청은 설정 줄의 첫 주 백엔드에서 시작).
+#   502·504 검사에는 proxy_alive (/api/add → L1, 페일오버 없는 라우트)를 짝으로 붙인다.
+
+# "코드:본문" 한 줄 (200 이 아니면 코드만). 본문의 개행은 뗀다.
+# curl 이 0 이 아닌 값으로 끝나면(전송 오류: 본문이 Content-Length 보다 짧게 끊김 18, 시간 초과 28 등) 상태 줄이 200 이어도
+# 정상 응답이 아니다. 그래서 "curl-rc<번호>" 를 돌려줘 어느 기대값("200:L1", "502" ...)과도 맞지 않게 한다
+fo_get() {
+    _c=$(curl -s -m 8 -o "$TMP/fo.body" -w '%{http_code}' "${URL}$1")
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        printf 'curl-rc%s' "$_rc"
+    elif [ "$_c" = 200 ]; then
+        printf '%s:%s' "$_c" "$(tr -d '\n' <"$TMP/fo.body")"
+    else
+        printf '%s' "$_c"
+    fi
+}
+
+# fo_timed <경로>: 한 번 요청해서 FO_CODE, FO_BODY(개행 뗌), FO_T(curl 이 잰 time_total, 소수 초)를 채운다.
+# curl 이 0 이 아닌 값으로 끝나면 FO_CODE 는 "curl-rc<번호>" (fo_get 과 같은 이유)
+fo_timed() {
+    _r=$(LC_ALL=C curl -s -m 10 -o "$TMP/fo.body" -w '%{http_code} %{time_total}' "${URL}$1")
+    _rc=$?
+    FO_CODE=${_r%% *}
+    [ "$_rc" -ne 0 ] && FO_CODE="curl-rc$_rc"
+    FO_T=${_r#* }
+    FO_BODY=$(tr -d '\n' <"$TMP/fo.body")
+}
+
+# fo_between <값> <하한> <상한>: 하한 <= 값 < 상한 (소수 비교는 awk)
+fo_between() {
+    awk -v t="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(t >= lo && t < hi) }'
+}
+
+# 요청 기록 파일의 줄 수. 가짜는 ready 를 찍기 전에 파일을 만들어 두므로 요청 0건이어도 파일은 있다.
+# 파일이 없으면 "0" 이 아니라 "nolog" 를 돌려줘서 기록을 못 한 가짜가 "요청을 안 받았다"로 읽히지 않게 한다 (비교는 전부 숫자와 하므로 실패로 센다)
+fo_lines() {
+    if [ -f "$1" ]; then wc -l <"$1" | tr -d ' '; else echo nolog; fi
+}
+
+# fo_seq <경로> <횟수>: 같은 경로를 이어서 요청해 fo_get 결과를 공백으로 이어 붙인다
+fo_seq() {
+    _s=
+    _n=0
+    while [ $_n -lt "$2" ]; do
+        _s="$_s $(fo_get "$1")"
+        _n=$((_n + 1))
+    done
+    printf '%s' "$_s"
+}
+
+# 대기열이 가득 찬 가짜(blackhole)를 띄운다. 0 준비됨, 2 이 환경은 못 만듦 (건너뜀), 1 시작 실패
+start_blackhole() {
+    _fo=$TMP/fake.$1.out
+    "$FAKE" "$1" blackhole >"$_fo" 2>&1 &
+    UP_PIDS="$UP_PIDS $!"
+    _i=0
+    while [ $_i -lt 50 ]; do
+        grep -q '^ready' "$_fo" && return 0
+        grep -q '^unsupported' "$_fo" && return 2
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    cat "$_fo"
+    return 1
+}
+
+failover_tests() {
+    L1=$((PORT + 10)) L2=$((PORT + 11)) D1=$((PORT + 9)) D2=$((PORT + 12)) D3=$((PORT + 13))
+    HOLE=$((PORT + 14)) FH=$((PORT + 15)) R1=$((PORT + 16)) PH=$((PORT + 17)) R2=$((PORT + 18))
+    SIL=$((PORT + 19)) D4=$((PORT + 20))
+    for d in fo1 fo2 fo3 fo3b fo3c fo4 fo4b fo5 fo6 fo7 fo8 fo13 fo14 fo15; do
+        mkdir -p "$TMP/l1/$d" "$TMP/l2/$d" "$TMP/l3/$d"
+        printf 'L1\n' >"$TMP/l1/$d/id"
+        printf 'L2\n' >"$TMP/l2/$d/id"
+        printf 'L3\n' >"$TMP/l3/$d/id"
+    done
+    printf 'backend L1\n' >"$TMP/l1/index.html"
+    printf 'backend L2\n' >"$TMP/l2/index.html"
+    printf 'backend L3\n' >"$TMP/l3/index.html"
+    rm -f "$TMP/fo.r1.log" "$TMP/fo.ph.log" "$TMP/fo.r2.log" "$TMP/fo.sil.log"
+    start_backend "$L1" "$TMP/l1" && start_backend "$L2" "$TMP/l2" || { bad "failover backends start"; return; }
+    start_fake "$FH" host || { bad "fake host starts"; return; }
+    start_fake "$R1" ok "$TMP/fo.r1.log" && start_fake "$PH" partial-head "$TMP/fo.ph.log" &&
+        start_fake "$R2" ok "$TMP/fo.r2.log" && start_fake "$SIL" silent "$TMP/fo.sil.log" || { bad "failover fakes start"; return; }
+    start_blackhole "$HOLE"
+    hole=$?
+    [ $hole -eq 1 ] && { bad "fake blackhole starts"; return; }
+
+    cat >"$TMP/fo.conf" <<EOF
+/api/add   $HOST:$L1
+/api/echo  $HOST:$D1 $HOST:$L1 failover=connect
+/fo1/      $HOST:$D1 $HOST:$L1 failover=connect
+/fo2/      $HOST:$D1 $HOST:$L1
+/fo3/      $HOST:$D1 $HOST:$D2 backup=$HOST:$L1 failover=connect
+/fo3b/     $HOST:$L1 backup=$HOST:$L2 failover=connect
+/fo3c/     $HOST:$D1 backup=$HOST:$L1
+/fo4/      $HOST:$D1 $HOST:$D2 $HOST:$D3 failover=connect tries=2
+/fo4b/     $HOST:$D1 $HOST:$D2 $HOST:$L1 failover=connect tries=2
+/fo5/      $HOST:$D1 $HOST:$D2 $HOST:$L1 $HOST:$L2 failover=connect
+/fo9/      $HOST:$D1 $HOST:$FH failover=connect
+/fo10/     $HOST:$D1 $HOST:$R1 failover=connect
+/fo11/     $HOST:$PH $HOST:$R2 failover=connect,timeout
+/fo13/     $HOST:$D4 $HOST:$L1 failover=connect
+/fo14/     $HOST:$D4 $HOST:$L1 failover=connect
+EOF
+    # connect 시간 초과 라우트는 설정이 따로다 (한 설정의 라우트는 최대 PROXY_MAX_ROUTES 개). 아래 6~8b 에서 서버를 다시 띄운다
+    cat >"$TMP/fo.hole.conf" <<EOF
+/api/add   $HOST:$L1
+/fo6/      $HOST:$HOLE $HOST:$L1 failover=timeout
+/fo7/      $HOST:$HOLE failover=timeout
+/fo8/      $HOST:$HOLE $HOST:$L1 failover=connect
+/fo12/     $HOST:$HOLE $HOST:$SIL failover=timeout
+/fo15/     $HOST:$HOLE backup=$HOST:$L1 failover=connect
+EOF
+
+    : >"$LOG"
+    if ! start_server -c "$TMP/fo.conf"; then
+        bad "failover front starts"
+        cat "$LOG"
+        return
+    fi
+
+    # 1. 주 백엔드 둘 중 하나가 죽어 있어도 failover=connect 면 모든 요청이 200 (502 없음). 죽은 쪽 차례에서 넘어간다
+    got=$(fo_seq fo1/id 6)
+    if [ "$got" = " 200:L1 200:L1 200:L1 200:L1 200:L1 200:L1" ]; then
+        ok "failover=connect: dead + live primary -> every request 200 from the live one"
+    else
+        bad "failover=connect: dead + live primary -> every request 200 from the live one (got$got)"
+    fi
+
+    # 2. 같은 구성에서 failover 를 안 쓰면 예전 동작: 번갈아 502, 200
+    got=$(fo_seq fo2/id 4)
+    case $got in
+        " 502 200:L1 502 200:L1"|" 200:L1 502 200:L1 502") ok "failover off: dead + live primary -> 502 and 200 alternate (as before)" ;;
+        *) bad "failover off: dead + live primary -> 502 and 200 alternate (got$got)" ;;
+    esac
+
+    # 3. 주 백엔드가 모두 죽었으면 백업이 답한다
+    got=$(fo_seq fo3/id 3)
+    if [ "$got" = " 200:L1 200:L1 200:L1" ]; then
+        ok "primaries all dead + backup alive -> 200 from the backup"
+    else
+        bad "primaries all dead + backup alive -> 200 from the backup (got$got)"
+    fi
+    # 3b. 주 백엔드가 멀쩡하면 백업은 쓰지 않는다 (L2 의 id 는 나오지 않는다)
+    got=$(fo_seq fo3b/id 4)
+    if [ "$got" = " 200:L1 200:L1 200:L1 200:L1" ]; then
+        ok "primary alive -> backup is not used"
+    else
+        bad "primary alive -> backup is not used (got$got)"
+    fi
+    # 3c. failover 가 꺼져 있으면 백업이 있어도 쓰지 않는다 (예전 동작 그대로 502)
+    got=$(fo_seq fo3c/id 2)
+    if [ "$got" = " 502 502" ] && proxy_alive; then
+        ok "backup= without failover -> backup is never used (502)"
+    else
+        bad "backup= without failover -> backup is never used (got$got)"
+    fi
+
+    # 4. 전부 죽었으면 502, 그리고 빠르게 (tries=2 로 시도를 줄였다. 연결 거절은 즉시라 시간은 참고용)
+    t0=$(date +%s)
+    got=$(fo_seq fo4/id 3)
+    elapsed=$(($(date +%s) - t0))
+    if [ "$got" = " 502 502 502" ] && [ "$elapsed" -le 2 ] && proxy_alive; then
+        ok "all backends dead, tries=2 -> 502, fast (${elapsed}s)"
+    else
+        bad "all backends dead, tries=2 -> 502, fast (got$got after ${elapsed}s)"
+    fi
+    # 4b. tries=2 는 살아 있는 셋째 백엔드까지 가지 않는다: 첫 요청은 둘(D1, D2)만 해 보고 502, 그다음 요청은 Round-Robin
+    #     시작이 한 칸 밀려 L1 에 닿는다. (tries 가 없었다면 첫 요청도 200.) 이 검사는 죽은 표시를 보지 않는다 (아래 4c)
+    got=$(fo_seq fo4b/id 3)
+    if [ "$got" = " 502 200:L1 200:L1" ]; then
+        ok "tries=2 stops before the third (live) backend: 502, then 200 from the live one"
+    else
+        bad "tries=2 stops before the third (live) backend (got$got)"
+    fi
+
+    # 4c. 죽은 표시가 다음 요청에 쓰인다: D4 는 처음에 죽어 있다. 첫 요청이 D4 → 실패 → L1 (D4 에 죽은 표시).
+    #     그 뒤 D4 자리에 실제 백엔드(L3)를 띄운다. 셋째 요청은 Round-Robin 이 다시 D4 차례지만 표시가 남아 있어 L1 이 답한다.
+    #     표시를 안 쓰면 L3 가 답한다. 같은 D4 를 쓰는 다른 라우트(fo14)의 첫 요청이 L3 인 것으로 L3 가 정말 살아났음을 확인한다
+    a1=$(fo_get fo13/id)
+    if start_backend "$D4" "$TMP/l3"; then
+        a2=$(fo_get fo13/id)
+        a3=$(fo_get fo13/id)
+        a4=$(fo_get fo14/id)
+        if [ "$a1 $a2 $a3 $a4" = "200:L1 200:L1 200:L1 200:L3" ]; then
+            ok "dead mark is remembered: the revived backend is skipped while marked (L1 answers, L3 alive via another route)"
+        else
+            bad "dead mark is remembered (got $a1 $a2 $a3 $a4, want 200:L1 200:L1 200:L1 200:L3)"
+        fi
+    else
+        bad "dead mark is remembered (L3 backend did not start)"
+    fi
+
+    # 5. POST 도 페일오버를 거쳐 한 번만 실행된다: 첫 요청은 D1 connect 실패 뒤 L1 로 가고 본문이 그대로 돌아온다.
+    #    요청 바이트는 connect 가 끝난 뒤에야 나가므로 실패한 백엔드에는 아무것도 가지 않는다
+    head -c 102400 /dev/urandom >"$TMP/fo.echo.in"
+    ok5=1
+    for _n in 1 2; do
+        code=$(curl -s -H 'Expect:' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/fo.echo.in" \
+               -o "$TMP/fo.echo.out" -w '%{http_code}' -m 5 "${URL}api/echo")
+        rc=$?                      # 완전한 응답을 기대하는 자리: curl 이 0 으로 끝나야 한다 (본문이 끊겨도 상태 줄은 200 일 수 있다)
+        [ "$rc" -eq 0 ] && [ "$code" = 200 ] && cmp -s "$TMP/fo.echo.in" "$TMP/fo.echo.out" || ok5=0
+    done
+    if [ $ok5 -eq 1 ]; then
+        ok "POST 100 KB through failover (dead primary first) -> echoed back identical, twice"
+    else
+        bad "POST 100 KB through failover -> echoed back identical (last code $code, curl rc $rc)"
+    fi
+
+    # 5a. 백엔드가 받은 횟수로 센다 (위 5 는 응답이 같은지만 본다: 요청이 두 번 나가 한쪽 응답만 중계돼도 통과한다).
+    #     가짜 R1 은 받은 요청마다 "<요청 줄> body=<본문 바이트>" 한 줄을 남긴다. POST 100 KB 두 번 → 정확히 두 줄, 본문은 온전히
+    head -c 102400 /dev/urandom >"$TMP/fo.post.in"
+    ok5a=1
+    for _n in 1 2; do
+        code=$(curl -s -H 'Expect:' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/fo.post.in" \
+               -o /dev/null -w '%{http_code}' -m 5 "${URL}fo10/x")
+        rc=$?
+        [ "$rc" -eq 0 ] && [ "$code" = 200 ] || ok5a=0
+    done
+    n=$(fo_lines "$TMP/fo.r1.log")
+    if [ $ok5a -eq 1 ] && [ "$n" = 2 ] && [ "$(sort -u "$TMP/fo.r1.log")" = "POST /fo10/x HTTP/1.1 body=102400" ]; then
+        ok "POST through failover (dead primary first) reaches the live backend exactly once per request, whole body"
+    else
+        bad "POST through failover reaches the live backend exactly once per request (codes ok=$ok5a, last curl rc $rc, $n lines: $(tr '\n' '|' <"$TMP/fo.r1.log"))"
+    fi
+    # 5b0. 요청을 보낸 뒤의 실패는 넘기지 않는다: PH 는 본문까지 받고 응답 머리를 반만 보낸 채 닫는다. 프록시는 이미 요청을 썼으므로
+    #      두 번째 백엔드 R2 로 다시 보내면 안 된다 → 502, PH 는 한 번, R2 는 한 번도 못 받는다 (failover=connect,timeout 이어도)
+    head -c 1000 /dev/urandom >"$TMP/fo.post.small"
+    code=$(curl -s -H 'Expect:' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/fo.post.small" \
+           -o /dev/null -w '%{http_code}' -m 5 "${URL}fo11/x")
+    rc=$?                          # 502 도 완전한 응답이다 (curl 0). 본문이 끊기거나 시간 초과면 502 로 보여도 실패
+    nph=$(fo_lines "$TMP/fo.ph.log")
+    nr2=$(fo_lines "$TMP/fo.r2.log")
+    # 로그가 비었다는 것만으로는 R2 가 "받지 못했다"인지 "받고 기록하다 죽었다"인지 모른다. 그래서 R2 에 직접 확인 요청을 하나 보내
+    # 답을 받고(200) 그 요청이 로그에 정확히 한 줄로 남는지 본다: R2 가 살아 있고 기록도 한다는 증거다
+    code2=$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$HOST:$R2/confirm")
+    rc2=$?
+    nr2c=$(fo_lines "$TMP/fo.r2.log")
+    if [ "$rc" -eq 0 ] && [ "$rc2" -eq 0 ] && [ "$code" = 502 ] && [ "$nph" = 1 ] && [ "$nr2" = 0 ] && [ "$(cat "$TMP/fo.ph.log")" = "POST /fo11/x HTTP/1.1 body=1000" ] &&
+       [ "$code2" = 200 ] && [ "$nr2c" = 1 ] && [ "$(cat "$TMP/fo.r2.log")" = "GET /confirm HTTP/1.1 body=0" ]; then
+        ok "failure after the request was sent is not failed over: 502, first backend got it once, second never (and the second is alive and logging)"
+    else
+        bad "failure after the request was sent is not failed over (code $code curl rc $rc, first backend $nph, second $nr2; confirm request: code $code2 curl rc $rc2, log lines $nr2c)"
+    fi
+
+    # 5b. 동시 요청: 죽은 백엔드 둘, 산 백엔드 둘. 한 poll 바퀴 안에서 여러 연결이 동시에 실패하고 넘어가도 전부 200.
+    #     요청마다 본문 파일(fo5.<i>.body)과 결과 파일(fo5.<i>.res: "curl 종료코드 상태코드")을 따로 둔다.
+    #     curl 종료코드가 0 이고 상태 200 이고 본문이 L1 또는 L2 여야 센다 (본문이 끊긴 200 은 정상 응답이 아니다)
+    pids=
+    i=0
+    rm -f "$TMP"/fo5.*
+    while [ $i -lt 40 ]; do
+        {
+            c=$(curl -s -m 5 -o "$TMP/fo5.$i.body" -w '%{http_code}' "${URL}fo5/id" 2>/dev/null)
+            echo "$? $c" >"$TMP/fo5.$i.res"
+        } &
+        pids="$pids $!"
+        i=$((i + 1))
+    done
+    wait $pids
+    n=0
+    i=0
+    while [ $i -lt 40 ]; do
+        if [ "$(cat "$TMP/fo5.$i.res" 2>/dev/null)" = "0 200" ]; then
+            case "$(tr -d '\n' <"$TMP/fo5.$i.body" 2>/dev/null)" in L1|L2) n=$((n + 1)) ;; esac
+        fi
+        i=$((i + 1))
+    done
+    [ "$n" -eq 40 ] && ok "failover: 40 concurrent requests, 2 dead + 2 live backends -> all 200" \
+                    || bad "failover: 40 concurrent requests, 2 dead + 2 live backends -> all 200 (only $n complete; first bad: $(cat "$TMP"/fo5.*.res | grep -v '^0 200$' | head -3 | tr '\n' '|'))"
+
+    # 9. 넘어간 요청의 Host 는 처음 고른(죽은) 백엔드가 아니라 실제로 보낸 백엔드의 이름이다
+    got=$(fo_get fo9/x)
+    if [ "$got" = "200:$HOST:$FH" ]; then
+        ok "failover rewrites Host for the backend actually used ($got)"
+    else
+        bad "failover rewrites Host for the backend actually used (got $got, want 200:$HOST:$FH)"
+    fi
+
+    stop_server TERM
+
+    # 6~8. connect 시간 초과 (PROXY_CONNECT_TIMEOUT_MS 1초, 전체 마감 UPSTREAM_TIMEOUT_MS 5초). 시간은 curl 의 time_total 로 재고 폭을 둔다
+    if [ $hole -eq 0 ]; then
+        : >"$LOG"
+        if ! start_server -c "$TMP/fo.hole.conf"; then
+            bad "failover front (connect timeout routes) starts"
+            cat "$LOG"
+            return
+        fi
+        # 6. failover=timeout: 멈춘 connect 를 1초 뒤 닫고 다음 백엔드로 → 200
+        #    시간은 curl 의 time_total (소수 초). 정수 초 시계는 두 date 가 초 경계에 걸치면 너무 이른 재시도도 통과시킨다.
+        #    아래 한계 0.95 는 서버의 1000 ms 시계(ms 로 버림)가 curl 보다 늦게 시작해도 정상 구현이 걸리지 않을 만큼의 여유다
+        fo_timed fo6/id
+        if [ "$FO_CODE" = 200 ] && [ "$FO_BODY" = L1 ] && fo_between "$FO_T" 0.95 3; then
+            ok "failover=timeout: stalled connect -> next backend after about 1s, 200 (${FO_T}s)"
+        else
+            bad "failover=timeout: stalled connect -> next backend after about 1s, 200 (got $FO_CODE:$FO_BODY after ${FO_T}s, want 200:L1 in 0.95-3s)"
+        fi
+        # 7. 넘어갈 곳이 없으면 마지막 실패가 시간 초과라서 504 (1초 안팎. 5초 전체 마감이 아니다)
+        fo_timed fo7/x
+        if [ "$FO_CODE" = 504 ] && fo_between "$FO_T" 0.95 3 && proxy_alive; then
+            ok "failover=timeout, no backend left -> 504 after about 1s (${FO_T}s)"
+        else
+            bad "failover=timeout, no backend left -> 504 after about 1s (got $FO_CODE after ${FO_T}s, want 504 in 0.95-3s)"
+        fi
+        # 8. failover=connect 만이면 connect 시계는 없다: 멈춘 connect 는 전체 마감(5초)에 504. 뒤에 L1 이 있어도 시계를 새로 잡지 않는다
+        fo_timed fo8/id
+        if [ "$FO_CODE" = 504 ] && fo_between "$FO_T" 4.5 7 && proxy_alive; then
+            ok "failover=connect only: stalled connect -> 504 at the overall deadline (${FO_T}s)"
+        else
+            bad "failover=connect only: stalled connect -> 504 at the overall deadline (got $FO_CODE after ${FO_T}s, want 504 in 4.5-7s)"
+        fi
+        # 8b. 전체 마감은 첫 시도부터 한 번만 잰다: HOLE 에서 1초 기다린 뒤 SIL 로 넘어가 요청을 보내도 답이 없다.
+        #     첫 시도 기준이면 5초 안팎에 504, 넘어갈 때 시계를 새로 잡으면 6초 이상이다 (curl 이 잰 시간, 초 단위 아님)
+        #     SIL 이 요청을 실제로 한 번 받았는지도 본다 (fake 의 기록 줄 수): 넘어가지 못한 채 HOLE 에서 5초를 채우고 504 가 나도
+        #     코드와 시간은 같아서, 줄 수를 안 보면 페일오버가 깨져도 통과한다
+        res=$(LC_ALL=C curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}' "${URL}fo12/x")
+        rc=$?                      # 504 도 완전한 응답이다: curl 이 0 으로 끝나야 한다 (-m 10 시간 초과는 28)
+        nsil=$(fo_lines "$TMP/fo.sil.log")
+        if [ "$rc" -eq 0 ] && [ "${res%% *}" = 504 ] && awk -v t="${res#* }" 'BEGIN { exit !(t >= 4.5 && t < 5.9) }' && [ "$nsil" = 1 ] && proxy_alive; then
+            ok "failover=timeout: overall deadline counts from the first attempt, not from the failover (504 after ${res#* }s, second backend got the request)"
+        else
+            bad "failover=timeout: overall deadline counts from the first attempt (got '$res' curl rc $rc, second backend got $nsil request(s), want 504 in 4.5-5.9s and 1)"
+        fi
+        # 8c. 마감에 connect 가 아직 멈춰 있던 백엔드는 죽은 표시를 받는다. failover=connect 만이면 connect 시계가 없어 이 길뿐이다.
+        #     첫 요청: 주 백엔드 HOLE 에서 멈춰 5초 마감에 504. 둘째 요청: 표시가 없다면 또 HOLE 에서 5초를 기다려 504 이고,
+        #     표시가 있으면 HOLE 을 건너뛰고 백업 L1 이 바로 답한다 (1초 안)
+        fo_timed fo15/id
+        first_code=$FO_CODE first_t=$FO_T
+        fo_timed fo15/id
+        if [ "$first_code" = 504 ] && fo_between "$first_t" 4.5 7 && [ "$FO_CODE" = 200 ] && [ "$FO_BODY" = L1 ] && fo_between "$FO_T" 0 1; then
+            ok "failover=connect only: backend stuck at the overall deadline is marked down (504 at ${first_t}s, next request 200 from the backup in ${FO_T}s)"
+        else
+            bad "failover=connect only: stuck backend is marked down at the deadline (first $first_code after ${first_t}s, want 504 in 4.5-7s; next $FO_CODE:$FO_BODY after ${FO_T}s, want 200:L1 in under 1s)"
+        fi
+        stop_server TERM
+    else
+        echo "  skip connect-timeout checks (this kernel does not drop SYNs for a full backlog; see the manual check in the notes)"
+    fi
+}
+
 : >"$LOG"
 proxy_tests
+: >"$LOG"
+failover_tests
 
 # 경로 정규형 (#31): 라우팅과 정적 파일이 같은 정규형을 본다.
 # 프런트 docroot 에 프록시 접두사와 같은 경로의 파일(admin/x)을 두고, 라우트를 건너뛰어 그 파일이

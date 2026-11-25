@@ -7,6 +7,8 @@
  *   /api/          127.0.0.1:8001 127.0.0.1:8003   # 뒤에 오는 주석도 된다
  *   /static/       localhost:8002
  *   /v6/           [::1]:8001
+ *   /ha/           127.0.0.1:8001 127.0.0.1:8002 backup=127.0.0.1:8003 failover=connect,timeout tries=3
+ *   - '=' 가 있는 토큰은 옵션(backup=, failover=, tries=)이다. 뜻은 proxy_config.h, 여기서는 읽는 규칙만 둔다
  *   - 공백(SP, TAB)으로 나눈다. 줄 끝은 LF, CRLF 모두 받고 마지막 줄은 LF 가 없어도 된다
  *   - '#' 는 토큰 맨 앞에 있을 때만 주석이다 ("/a#b" 는 접두사 글자 오류)
  *   - 빈 파일, 주석만 있는 파일은 "no routes" 로 거절한다 (-c 를 줬다면 프록시를 쓰겠다는 뜻이므로)
@@ -17,6 +19,8 @@
  *   Tiny 의 open_clientfd 는 연결할 때마다 getaddrinfo 를 부른다 (DNS 가 느리면 서버 전체가 멈춘다).
  *   여기서는 시작할 때 한 번만 해석하고, 백엔드마다 주소를 하나만 저장하므로 IPv4 를 먼저 고른다
  *   (이유는 proxy_config.h)
+ * 백엔드 고르기 (proxy_rr_begin, proxy_pick_backend, proxy_mark_down)는 이 파일 맨 아래. 시계를 읽지 않고
+ *   현재 시각을 인자로 받는 순수 함수라서 단위 테스트가 시간을 마음대로 돌린다
  * 담당: 트랙 B · 이슈 #8 (단위 테스트: tests/unit/test_proxy_config.c)
  */
 #include "proxy_config.h"
@@ -33,6 +37,7 @@
 #define CONF_LINE_MAX    1024   /* 줄 끝(CRLF) 제외 */
 #define CONF_PREFIX_MAX  127    /* prefix[128] 의 마지막은 NUL 자리 */
 #define CONF_NAME_MAX    63     /* name[64] 의 마지막은 NUL 자리 */
+#define CONF_OPT_MAX     (CONF_NAME_MAX + 7)   /* 옵션 토큰: "backup=" + 백엔드 이름 최대 길이 */
 
 #define BACKEND_SHAPE_MSG "invalid backend '%s' (expected host:port or [ipv6]:port)"
 
@@ -246,6 +251,116 @@ static int next_token(const char *line, size_t len, size_t *pos, const char **t,
     return 1;
 }
 
+/* 한 줄에 한 번만 쓸 수 있는 옵션이 이미 나왔는지 기억하는 비트 (backup= 은 여러 번 되므로 없다) */
+enum { OPT_FAILOVER = 1, OPT_TRIES = 2 };
+
+static int item_is(const char *item, size_t n, const char *name)
+{
+    return strlen(name) == n && memcmp(item, name, n) == 0;
+}
+
+/* "failover=" 의 값을 읽어 rt->failover 에 넣는다. 쉼표로 나눈 off·connect·timeout.
+ * 빈 항목("a,,b", 끝 쉼표), 중복, 모르는 값은 오류. off 는 혼자서만 (off,connect 는 오류).
+ * 값이 통째로 비었으면 parse_option 이 먼저 거른다 */
+static int parse_failover(const conf_state *st, proxy_route *rt, const char *v, size_t vl)
+{
+    unsigned flags = 0;
+    size_t items = 0, b = 0, e;
+    int has_off = 0;
+
+    for (;;) {
+        unsigned bit = 0;
+
+        for (e = b; e < vl && v[e] != ','; e++)
+            ;
+        if (e == b)
+            return conf_fail(st, "empty item in failover value (expected off, connect, timeout)");
+        if (item_is(v + b, e - b, "off")) {
+            if (has_off)
+                return conf_fail(st, "duplicate failover value 'off'");
+            has_off = 1;
+        } else if (item_is(v + b, e - b, "connect")) {
+            bit = PROXY_FAILOVER_CONNECT;
+        } else if (item_is(v + b, e - b, "timeout")) {
+            bit = PROXY_FAILOVER_TIMEOUT;
+        } else {
+            return conf_fail(st, "unknown failover value '%.*s' (expected off, connect, timeout)",
+                             (int)(e - b), v + b);
+        }
+        if (flags & bit)
+            return conf_fail(st, "duplicate failover value '%.*s'", (int)(e - b), v + b);
+        flags |= bit;
+        items++;
+        if (e == vl)
+            break;
+        b = e + 1;
+    }
+    if (has_off && items > 1)
+        return conf_fail(st, "failover=off cannot be combined with other values");
+    rt->failover = flags;
+    return 0;
+}
+
+/* "tries=" 의 값: 앞자리 0 없는 10진수 1..PROXY_MAX_BACKENDS (포트와 같은 이유로 표기를 한 가지만 둔다) */
+static int parse_tries(const conf_state *st, proxy_route *rt, const char *v, size_t vl)
+{
+    size_t i, n = 0;
+    int ok = vl <= 2 && v[0] != '0';    /* 세 자리부터는 어차피 8 을 넘는다. 자릿수를 먼저 막아 n 이 넘칠 일이 없다 */
+
+    for (i = 0; ok && i < vl; i++) {
+        if (v[i] < '0' || v[i] > '9')
+            ok = 0;
+        else
+            n = n * 10 + (size_t)(v[i] - '0');
+    }
+    if (!ok || n < 1 || n > PROXY_MAX_BACKENDS)
+        return conf_fail(st, "invalid tries '%.*s' (1-%d, decimal, no leading zero)", (int)vl, v, PROXY_MAX_BACKENDS);
+    rt->tries = n;
+    return 0;
+}
+
+/* '=' 가 있는 토큰 하나(t[0..tl), eq 는 첫 '=')를 옵션으로 읽는다. backup= 은 백엔드 칸을 하나 더 쓴다 */
+static int parse_option(const conf_state *st, proxy_route *rt, const char *t, size_t tl,
+                        const char *eq, unsigned *seen)
+{
+    size_t kl = (size_t)(eq - t), vl = tl - kl - 1;
+    const char *v = eq + 1;
+
+    if (tl > CONF_OPT_MAX)
+        return conf_fail(st, "option too long (max %d bytes)", CONF_OPT_MAX);
+    if (kl == 0)
+        return conf_fail(st, "option has no name ('=' at the start of a token)");
+    if (!item_is(t, kl, "backup") && !item_is(t, kl, "failover") && !item_is(t, kl, "tries"))
+        return conf_fail(st, "unknown option '%.*s' (expected backup, failover, tries)", (int)kl, t);
+    if (vl == 0)
+        return conf_fail(st, "option '%.*s' has no value", (int)kl, t);
+
+    if (item_is(t, kl, "backup")) {
+        char tok[CONF_NAME_MAX + 1];
+        proxy_backend *be = &rt->backends[rt->nbackends];
+
+        if (rt->nbackends == PROXY_MAX_BACKENDS)
+            return conf_fail(st, "too many backends (max %d)", PROXY_MAX_BACKENDS);
+        memcpy(tok, v, vl);                     /* tl <= CONF_OPT_MAX 라서 vl <= CONF_NAME_MAX 다 (위에서 걸렀다) */
+        tok[vl] = '\0';
+        if (parse_backend(st, tok, be) < 0)     /* name 에는 "backup=" 없이 host:port 만 들어간다 (Host 헤더가 된다) */
+            return -1;
+        be->is_backup = 1;
+        rt->nbackends++;
+        return 0;
+    }
+    if (item_is(t, kl, "failover")) {
+        if (*seen & OPT_FAILOVER)
+            return conf_fail(st, "duplicate option 'failover'");
+        *seen |= OPT_FAILOVER;
+        return parse_failover(st, rt, v, vl);
+    }
+    if (*seen & OPT_TRIES)
+        return conf_fail(st, "duplicate option 'tries'");
+    *seen |= OPT_TRIES;
+    return parse_tries(st, rt, v, vl);
+}
+
 /* 줄 하나(줄 끝 제거됨, NUL 종료 아님)를 처리한다. 라우트가 있으면 cfg 에 추가 */
 static int parse_line(conf_state *st, const char *line, size_t len, proxy_config *cfg)
 {
@@ -253,6 +368,7 @@ static int parse_line(conf_state *st, const char *line, size_t len, proxy_config
     const char *t;
     proxy_route *rt;
     char tok[CONF_NAME_MAX + 1];
+    unsigned seen = 0;
 
     if (!next_token(line, len, &pos, &t, &tl))
         return 0;                       /* 빈 줄, 주석 줄 */
@@ -282,8 +398,16 @@ static int parse_line(conf_state *st, const char *line, size_t len, proxy_config
     memcpy(rt->prefix, t, tl);
     rt->prefix[tl] = '\0';
 
-    /* 4. 백엔드를 왼쪽부터 */
+    /* 4. 토큰을 왼쪽부터: '=' 가 없으면 주 백엔드, 있으면 옵션 (순서 무관). 백엔드 이름에는 '=' 가 못 들어가므로
+     *    '=' 하나로 갈라도 주 백엔드의 모양 검사(parse_backend)는 그대로다 */
     while (next_token(line, len, &pos, &t, &tl)) {
+        const char *eq = memchr(t, '=', tl);
+
+        if (eq != NULL) {
+            if (parse_option(st, rt, t, tl, eq, &seen) < 0)
+                return -1;
+            continue;
+        }
         if (rt->nbackends == PROXY_MAX_BACKENDS)
             return conf_fail(st, "too many backends (max %d)", PROXY_MAX_BACKENDS);
         if (tl > CONF_NAME_MAX)
@@ -295,9 +419,19 @@ static int parse_line(conf_state *st, const char *line, size_t len, proxy_config
         rt->nbackends++;
     }
 
-    /* 5. 백엔드가 하나도 없음 */
+    /* 5. 백엔드가 하나도 없음, 또는 백업뿐임 (주 백엔드가 있어야 요청이 어디서 시작할지 정해진다) */
     if (rt->nbackends == 0)
         return conf_fail(st, "no backend for prefix '%s'", rt->prefix);
+    for (i = 0; i < rt->nbackends && rt->backends[i].is_backup; i++)
+        ;
+    if (i == rt->nbackends)
+        return conf_fail(st, "no primary backend for prefix '%s' (backup= needs at least one plain backend)",
+                         rt->prefix);
+
+    /* 6. tries 를 안 적었으면 주 + 백업 전부. 기본은 "다 해 본다" 이고, 모든 백엔드가 죽었을 때 응답이
+     *    끝없이 늦어지는 것을 막고 싶을 때만 tries 로 줄인다 */
+    if (!(seen & OPT_TRIES))
+        rt->tries = rt->nbackends;
 
     st->first_line[cfg->nroutes] = st->lineno;
     cfg->nroutes++;
@@ -306,7 +440,7 @@ static int parse_line(conf_state *st, const char *line, size_t len, proxy_config
 
 int proxy_config_load(const char *path, proxy_config *cfg)
 {
-    /* 크기가 27KB 쯤이라 지역 복사본을 만들지 않고 *cfg 에 바로 쓴다. 실패하면 전부 0 으로 되돌린다 */
+    /* 크기가 29KB 쯤이라 지역 복사본을 만들지 않고 *cfg 에 바로 쓴다. 실패하면 전부 0 으로 되돌린다 */
     char line[CONF_LINE_MAX + 2];
     conf_state st;
     FILE *fp;
@@ -403,16 +537,87 @@ proxy_route *proxy_match(proxy_config *cfg, const char *target)
     return best;
 }
 
-const proxy_backend *proxy_next_backend(proxy_route *route)
-{
-    size_t i;
+/* ---------------------------------------------------------------
+ * 백엔드 고르기 (순수 함수. 계약은 proxy_config.h)
+ * --------------------------------------------------------------- */
 
-    /* Round-Robin (#9, C9): 부를 때마다 next 를 한 칸 민다. 백엔드가 하나면 늘 0 번.
-     * 서버가 단일 스레드 루프라 락이 없다. next 가 범위 밖이어도(손으로 채운 route) 나머지 연산으로 맞춘다.
-     * 이 함수 하나만 되돌리면(항상 backends[0]) 이슈 #9 의 "RR 은 마지막, 늦으면 뺀다" 가 된다 */
-    if (route == NULL || route->nbackends == 0)
-        return NULL;
-    i = route->next % route->nbackends;
-    route->next = (i + 1) % route->nbackends;
-    return &route->backends[i];
+/* 주 백엔드(is_backup == 0)의 인덱스를 등장 순서대로 prim 에 담고 개수를 돌려준다. nbackends 가 배열보다 크면 잘라 본다 */
+static size_t list_primaries(const proxy_route *route, size_t *prim)
+{
+    size_t i, n = 0, nb = route->nbackends < PROXY_MAX_BACKENDS ? route->nbackends : PROXY_MAX_BACKENDS;
+
+    for (i = 0; i < nb; i++)
+        if (!route->backends[i].is_backup)
+            prim[n++] = i;
+    return n;
+}
+
+size_t proxy_rr_begin(proxy_route *route)
+{
+    size_t prim[PROXY_MAX_BACKENDS], np, k;
+
+    /* Round-Robin (#9, C9): 요청마다 next 를 한 칸 민다. 순번은 "주 백엔드들 중 몇 번째"라 백업이 섞여 있어도
+     * 주 백엔드끼리만 0, 1, ..., n-1, 0 으로 돈다. 서버가 단일 스레드 루프라 락이 없다.
+     * 이 함수가 항상 0 을 돌려주게 바꾸면(항상 첫 주 백엔드) 이슈 #9 의 "RR 은 마지막, 늦으면 뺀다" 가 된다 */
+    if (route == NULL)
+        return 0;
+    np = list_primaries(route, prim);
+    if (np == 0)
+        return 0;
+    k = route->next % np;
+    route->next = (k + 1) % np;
+    return k;
+}
+
+int proxy_pick_backend(const proxy_route *route, int64_t now_ms, unsigned tried_mask, size_t rr_start)
+{
+    size_t prim[PROXY_MAX_BACKENDS], order[PROXY_MAX_BACKENDS], np, n = 0, i, pass;
+    int all_down;
+
+    if (route == NULL)
+        return -1;
+    np = list_primaries(route, prim);
+    /* 페일오버가 꺼져 있으면 후보는 rr_start 번째 주 백엔드 하나뿐이다 (예전 Round-Robin 그대로). 백업은 쓰이지 않고,
+     * 죽은 표시는 proxy_mark_down 이 안 붙이므로 보지 않는다. 이미 시도했으면 -1 (헤더 계약) */
+    if (route->failover == 0) {
+        size_t only;
+
+        if (np == 0)
+            return -1;
+        only = prim[rr_start % np];
+        return (tried_mask & (1u << only)) ? -1 : (int)only;
+    }
+    /* 후보 순서: 주 백엔드를 rr_start 부터 한 바퀴, 그다음 백업 */
+    for (i = 0; i < np; i++)
+        order[n++] = prim[(rr_start % np + i) % np];
+    for (i = 0; i < route->nbackends && i < PROXY_MAX_BACKENDS; i++)
+        if (route->backends[i].is_backup)
+            order[n++] = i;
+
+    /* pass 0: 안 해 봤고 안 죽은 첫 후보. pass 1: 죽은 표시를 무시 (라우트의 백엔드가 전부 죽은 표시일 때만:
+     * 기다리지 않고 다음 후보를 시도해 살아난 백엔드를 바로 찾는다). "전부"는 이미 시도한 것까지 센다.
+     * 시도한 것을 빼고 세면, 앞 시도의 표시가 이 요청 중에 만료된 경우에 (그 백엔드만 살아 있고 나머지는 죽음)
+     * 죽은 쪽을 표시 무시로 고르게 돼서 "전부 죽었을 때만" 이라는 규칙보다 넓어진다 */
+    for (i = 0; i < n; i++)
+        if (now_ms >= route->backends[order[i]].down_until_ms)
+            break;
+    all_down = n > 0 && i == n;
+    for (pass = 0; pass < (all_down ? 2u : 1u); pass++)
+        for (i = 0; i < n; i++) {
+            const proxy_backend *be = &route->backends[order[i]];
+
+            if (tried_mask & (1u << order[i]))
+                continue;
+            if (pass == 0 && now_ms < be->down_until_ms)
+                continue;
+            return (int)order[i];
+        }
+    return -1;
+}
+
+void proxy_mark_down(proxy_route *route, size_t idx, int64_t now_ms)
+{
+    if (route == NULL || route->failover == 0 || idx >= route->nbackends || idx >= PROXY_MAX_BACKENDS)
+        return;
+    route->backends[idx].down_until_ms = now_ms + PROXY_BACKEND_DOWN_MS;
 }

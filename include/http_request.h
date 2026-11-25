@@ -42,8 +42,11 @@ typedef enum {
  * 파싱 결과. 크기가 수 KB 이므로 conn 안(힙)에 두고 스택에 만들지 않는다.
  *
  * 포인터 수명: headers, body 는 http_parse_request 에 넘긴 buf 안을 가리킨다.
- *   호출자(server.c)는 이 요청의 응답 생성·프록시 요청 생성이 끝난 뒤에
- *   buffer_consume(in, consumed) 한다. 그 전에 입력 버퍼에 append / consume / compact 하지 않는다.
+ *   호출자(server.c)는 이 요청의 응답 생성이 끝난 뒤에 buffer_consume(in, consumed) 한다.
+ *   그 전에 입력 버퍼에 append / consume / compact 하지 않는다.
+ *   예외는 프록시 요청이다: 페일오버(2026-11-25)가 요청을 다른 백엔드용으로 다시 만들 때마다 proxy_build_request 가
+ *   headers, body 를 다시 읽으므로, 프록시로 넘긴 요청의 in 은 업스트림 시도가 끝날 때까지(연결이 닫힐 때까지) consume 하지 않는다.
+ *   그동안 그 연결은 클라이언트 입력을 읽지 않으니(CONN_UP_*) in 이 바뀔 일이 없다.
  *   나머지 필드는 값 복사라 언제든 써도 된다.
  */
 typedef struct {

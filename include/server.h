@@ -35,6 +35,8 @@
  *   응답 시작 후: 업스트림에서 읽으려고 기다리는 동안 바이트가 이만큼 안 오면 연결을 닫는다.
  *                 느린 클라이언트 때문에 읽기를 멈춘 시간은 세지 않는다 (그건 CLIENT_IDLE_TIMEOUT_MS)
  * 그래서 전체 전송 시간이 이보다 길어도 바이트 사이 간격이 짧으면 끝까지 중계된다.
+ * 페일오버(라우트의 failover=)로 다른 백엔드를 시도해도 응답 시작 전 시계는 처음 시도부터 한 번만 간다
+ * (다시 잡지 않는다). 그래서 백엔드를 몇 개 거치든 응답 시작 전 전체 시간은 이 값으로 막힌다.
  * #ifndef 는 수동 검증(느리게 찔끔찔끔 보내는 업스트림) 때 -D 로 줄여 빌드하기 위한 것 */
 #ifndef UPSTREAM_TIMEOUT_MS
 #define UPSTREAM_TIMEOUT_MS     5000
@@ -43,6 +45,29 @@
  * 클라이언트 쪽이 먼저 만료돼 504 대신 응답 없이 닫히므로 빌드에서 막는다 */
 #if UPSTREAM_TIMEOUT_MS >= CLIENT_IDLE_TIMEOUT_MS
 #error "UPSTREAM_TIMEOUT_MS must be smaller than CLIENT_IDLE_TIMEOUT_MS"
+#endif
+
+/* 업스트림 connect 한 번에 줄 시간. 라우트에 failover=timeout 이 있을 때만 재고, 넘으면 그 connect 를 닫고
+ * 다음 백엔드로 넘어간다 (없으면 0 이 아니라 "재지 않는다": connect 도 UPSTREAM_TIMEOUT_MS 하나로 잰다).
+ * 전체 마감(UPSTREAM_TIMEOUT_MS)보다 짧아야 다음 백엔드를 시도할 시간이 남고, 0 보다 커야 한다 (0 이하면 connect 마다 시작하자마자
+ * 마감이 지난 것이 되어 failover=timeout 이 모든 connect 를 시간 초과로 닫는다). 둘 다 빌드에서 막는다.
+ * #ifndef 는 -D 로 줄여 빌드해 보기 위한 것. 안 주면 기본값은 아래 */
+#ifndef PROXY_CONNECT_TIMEOUT_MS
+/* 따로 주지 않으면 기본값을 UPSTREAM_TIMEOUT_MS 에서 정한다: 보통은 1000, 전체 마감이 1000 이하로 줄어 있으면 그 절반.
+ * 그래서 -DUPSTREAM_TIMEOUT_MS=1000 하나만 줘도 빌드된다. 둘 다 -D 로 주면 아래 검사가 그대로 적용된다 */
+#if UPSTREAM_TIMEOUT_MS < 2
+#error "UPSTREAM_TIMEOUT_MS must be at least 2 (the connect timeout must be at least 1 and smaller than it)"
+#elif UPSTREAM_TIMEOUT_MS > 1000
+#define PROXY_CONNECT_TIMEOUT_MS 1000
+#else
+#define PROXY_CONNECT_TIMEOUT_MS (UPSTREAM_TIMEOUT_MS / 2)
+#endif
+#endif
+#if PROXY_CONNECT_TIMEOUT_MS <= 0
+#error "PROXY_CONNECT_TIMEOUT_MS must be greater than 0"
+#endif
+#if PROXY_CONNECT_TIMEOUT_MS >= UPSTREAM_TIMEOUT_MS
+#error "PROXY_CONNECT_TIMEOUT_MS must be smaller than UPSTREAM_TIMEOUT_MS"
 #endif
 
 typedef struct {

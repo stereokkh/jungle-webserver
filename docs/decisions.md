@@ -8,6 +8,34 @@
 
 ---
 
+## 2026-11-25 · 프록시 페일오버: backup=, failover=, tries= (범위 안으로)
+
+- **결정** (상철 판단, 11-25. 설계는 이대로 두고 구현한다):
+  1. CLAUDE.md "범위 밖"의 "백엔드 장애 시 자동 재시도/페일오버" 중 **페일오버를 범위 안으로** 옮긴다. 요청이 업스트림에 나간 뒤의 자동 재시도는 계속 범위 밖이다
+  2. 설정은 라우트 줄의 옵션이다 (옵션은 접두사 뒤 어디에나, `=` 없는 토큰은 주 백엔드): `/api/ 127.0.0.1:18801 127.0.0.1:18802 backup=127.0.0.1:18803 failover=connect,timeout tries=3`
+     - `backup=<host:port>`: 백업 백엔드. 여러 번 가능. 주 + 백업이 `PROXY_MAX_BACKENDS`(8)를 넘으면 오류, 주 백엔드가 하나도 없는 줄(백업만)은 오류
+     - `failover=<목록>`: 쉼표로 나눈 `off`, `connect`, `timeout`. `off` 는 혼자서만. 빈 항목·중복·모르는 값은 오류. 없으면 `off` = 예전 동작 그대로
+     - `tries=N`: 요청 하나가 시도할 백엔드 수 (첫 시도 포함). 앞자리 0 없는 10진수 1..8. 없으면 주 + 백업 전부
+     - `failover=`, `tries=` 는 한 줄에 한 번, 모르는 이름·빈 값·`=` 로 시작하는 토큰은 오류 (기존 `경로:줄: 이유` 형식)
+     - `failover=off`(또는 없음)이면 `backup=` 은 오류가 아니지만 절대 쓰이지 않고, `tries=` 는 효과가 없다
+  3. `connect`: connect 실패 (`proxy_connect_start` 가 -1 이거나 `proxy_connect_result` 가 0 이 아님) → 다음 백엔드. `timeout`: connect 가 `PROXY_CONNECT_TIMEOUT_MS`(기본 1초, `UPSTREAM_TIMEOUT_MS` 가 1초 이하로 줄어 있으면 그 절반, `#ifndef`, `server.h`) 안에 안 끝남 → 그 fd 를 닫고 다음 백엔드. connect 시계는 라우트에 `timeout` 이 있을 때만 잰다 (없으면 예전처럼 전체 마감 하나). `0 < PROXY_CONNECT_TIMEOUT_MS < UPSTREAM_TIMEOUT_MS` 를 빌드에서 검사한다 (0 이하면 모든 connect 가 시작하자마자 시간 초과. 기본값 파생 덕에 `-DUPSTREAM_TIMEOUT_MS=1000` 하나만 줘도 빌드되고, `UPSTREAM_TIMEOUT_MS` 가 2 미만이면 #error)
+  4. **요청 바이트를 업스트림에 쓰기 전(`CONN_UP_CONNECTING`)에만** 넘긴다. `CONN_UP_SENDING` 이후 실패는 예전 그대로 502/504/연결 종료. 그래서 POST 를 포함한 같은 요청이 두 백엔드에서 실행되지 않는다
+  5. 전체 마감은 그대로다: `up_start_ms` 는 첫 시도에서 한 번만 잡고 넘어가도 다시 잡지 않는다. 넘어가는 중에도 `UPSTREAM_TIMEOUT_MS` 가 지나면 504. 새 시도를 열기 전, 요청을 다시 쓴 직후(connect 직전), 연결이 끝난 뒤 첫 write 직전(`up_on_event`: 넘었으면 요청을 쓰지 않고 504, 연결된 백엔드라 죽은 표시 없음), 상태 코드(431·502)를 정하기 전에도 이 마감을 본다 (이미 넘었으면 다음 connect 를 열지 않고 502·431 대신 504. 페일오버로 넘길 수 없는 connect 실패의 최종 상태 코드를 정하는 자리(`up_connect_failed`)에서도 다시 보므로 마감이 지난 뒤의 502 는 없다. 재작성 중에 마감이 지나도 connect 를 열지 않아 멀쩡한 백엔드를 죽었다고 표시하지 않는다). 시도별 connect 시계(`timeout`)는 그 직전 검사에 쓴 같은 시각에서 시작하고(재작성 시간은 전체 마감에만 든다), poll 이 연결 이벤트를 늦게 돌려줘도 그 마감을 넘긴 시도는 연결됐다고 받지 않고 시간 초과로 다룬다. 다음 poll 대기 시간은 가장 이른 마감을 절대 시각으로 들고 있다가 poll 직전에 now 를 다시 읽어 빼므로(`expire_idle` → `poll_timeout_ms`), 만료 패스 안에서 한 연결의 페일오버가 쓴 시간이 다른 연결의 마감 대기에 더해지지 않는다
+  6. 더 시도할 수 없을 때 (`tries` 소진, 후보 없음): 마지막 실패가 connect 오류면 502, connect 시간 초과면 504
+  7. 선택 순서 (한 요청 안): 주 백엔드를 Round-Robin 으로 (죽은 표시가 없고 이 요청에서 안 해 본 것), 주가 남지 않으면 백업을 적은 순서로 (같은 조건). 라우트의 백엔드가 **전부**(이미 시도한 것도 센다) 죽은 표시 중이면 표시를 무시하고 같은 순서로 안 해 본 것을 고른다 (살아난 백엔드를 기다리지 않고 찾는다). 하나라도 죽지 않았는데 남은 후보가 죽은 표시뿐이면 후보 없음이다. `route->next` 는 주 백엔드끼리만, 요청 시작에 한 칸 (페일오버가 꺼져 있으면 예전 순서 0, 1, ..., n-1, 0 과 같다)
+  8. 수동 건강 검사("잠깐 기억"): 페일오버가 켜진 라우트에서 connect 오류·시간 초과가 난 백엔드를 `now + PROXY_BACKEND_DOWN_MS`(10초, `#ifndef`)까지 죽은 것으로 표시한다. 시간으로만 풀린다. `failover=off` 면 아무것도 표시하지 않는다
+  9. 선택·표시는 `proxy_config.c` 의 순수 함수다 (시계 없이 `now_ms` 를 받는다): `proxy_rr_begin`, `proxy_pick_backend`, `proxy_mark_down`. `proxy_next_backend` 는 없앴다 (고르는 쪽이 이제 요청마다 tried 와 시각을 알아야 한다)
+- **구현 중 정한 것**:
+  - I1. 죽은 표시는 켜진 `failover` 종류와 상관없이 붙인다 (`failover=timeout` 만이어도 connect 거절이 난 백엔드는 표시된다. 그 요청은 502 이지만 다음 요청부터는 건너뛴다). "페일오버가 켜져 있고 connect·시간 초과 실패가 났다" 를 그대로 읽은 것
+  - I2. `tries` 한도는 호출자(`server.c`)가 센다. `proxy_pick_backend` 는 `tries` 를 모르고 `tried_mask` 로 중복만 피한다. 로더는 `tries` 를 백엔드 수로 자르지 않는다 (`tries=5` 에 백엔드 3 이면 후보가 없어 3번에서 끝난다)
+  - I3. 넘어갈 때 요청을 새 백엔드용으로 다시 쓴다 (`Host` 가 백엔드 이름이다). `proxy_build_request` 가 `c->req`(입력 버퍼 안을 가리킴)를 읽으므로 프록시로 간 요청의 `in` 은 연결이 닫힐 때까지 consume 하지 않는다. 프록시 중에는 클라이언트 입력을 읽지 않고 응답 뒤 항상 lingering close 가 `in` 을 비운다. 새 이름 때문에 다시 쓴 머리가 `HTTP_MAX_HEADER` 를 넘으면 결정 6(11-23)대로 431
+  - I4. `proxy_connect_start` 가 동기적으로 실패한 시도도 실패 한 번으로 세고 이벤트 루프를 거치지 않고 바로 다음 후보로 간다 (반복은 `tries` 와 후보 수로 끝난다)
+  - I5. 동기 실패 중 이쪽 문제(`socket()` 의 EMFILE·ENFILE·ENOBUFS·ENOMEM, 논블로킹 설정 실패, connect 의 `EADDRNOTAVAIL` = 리눅스에서 임시 포트가 바닥남)는 `PROXY_CONNECT_LOCAL`(-2)로 구별해 돌려준다. 백엔드 탓이 아니므로 그 백엔드에 죽은 표시를 붙이지 않는다 (시도 횟수에는 센다). 그 밖의 동기 connect 실패(`ENETUNREACH`, `ECONNREFUSED` 등, -1)는 표시한다
+  - I6. 응답 시작 전 전체 마감에 걸렸을 때 아직 `CONN_UP_CONNECTING` 이었으면(connect 가 마감까지 안 끝남) 그 백엔드에도 죽은 표시를 붙인다. `failover=connect` 만 켠 라우트는 connect 시계가 없어 이 길로만 표시가 붙고, 안 붙이면 그 백엔드로 가는 요청마다 5초를 기다려 504 를 받는다. 마감을 발견하는 두 자리(`expire_idle`, `up_on_event`)는 같은 판단(`up_connect_state`)을 쓴다: `SO_ERROR` 가 0 이 아니거나(실패) `getpeername` 이 `ENOTCONN`(아직 진행 중)이면 표시하고, `getpeername` 이 성공하면(연결은 끝났고 POLLOUT 을 늦게 처리했을 뿐) 표시하지 않는다 (멀쩡한 백엔드는 죽은 것이 아니다)
+  - I7. `failover=off` 에서 `proxy_pick_backend` 의 후보는 `rr_start` 번째 주 백엔드 하나뿐이다 (이미 시도했거나 주 백엔드가 없으면 -1). 백업을 고르지 않는다는 계약과 코드가 같다
+- **이유**: `tries` 는 모든 백엔드가 죽었을 때 응답이 끝없이 늦어지는 것을 막는다 (기본은 "다 해 본다"이고 줄이고 싶을 때만 쓴다). 요청을 보내기 시작한 뒤에는 백엔드가 요청을 이미 실행했을지 모르므로(특히 POST) 넘기지 않는다. connect 시간 초과만 따로 둔 것은 연결이 멈춘 백엔드(SYN 이 버려짐)가 전체 5초를 다 쓰게 하지 않기 위해서다. 죽은 표시를 10초 기억하는 것은 nginx 의 `max_fails`/`fail_timeout` 과 같은 발상이다: 요청마다 죽은 백엔드에 connect 를 시도하고 기다리지 않는다. 옵션을 `backup=` 처럼 `key=value` 로 둔 것은 기존 토큰(`host:port`)과 겹치지 않고 앞으로 옵션을 늘릴 때 설정 형식이 안 깨지기 때문이다
+- **영향**: `proxy_config.h/.c` (옵션 읽기, 선택 함수), `proxy.h/.c` (주석), `server.h` (`PROXY_CONNECT_TIMEOUT_MS`), `server.c` (A 트랙 건호님 파일: UP_CONNECTING 의 재시도, connect 시계, `in` consume 시점. 리뷰 필요), `tests/unit/test_proxy_config.c`, `tests/unit/test_contract.c` (`proxy_next_backend` 시험을 새 함수로 옮김), `include/http_request.h` (포인터 수명 계약의 프록시 예외), `tests/run.sh`, `tests/tools/fake_upstream.c` (`host`, `blackhole` 모드, 요청 기록 파일 인자, 기록 파일은 ready 전에 열고 쓰기 실패 시 종료, blackhole 의 시스템 호출 오류는 unsupported 가 아니라 시작 실패), `docs/api.md`, `docs/interfaces.md`, `CLAUDE.md`, `README.md`
+
 ## 2026-11-23 · 업스트림 중계 방식 (이슈 #9)
 
 - **결정** (상철 판단, 11-23 설계 문답):

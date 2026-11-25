@@ -24,7 +24,7 @@
 #include "http_request.h"
 #include "proxy_config.h"
 
-static proxy_config cfg;            /* 27KB 쯤이라 스택에 두지 않는다 */
+static proxy_config cfg;            /* 29KB 쯤이라 스택에 두지 않는다 */
 static const proxy_config zero_cfg; /* 전부 0 */
 static char g_path[64];
 static char g_msg[1024];
@@ -786,8 +786,479 @@ static void test_handler_route_integration(void)   /* M7 */
     free(buf);
 }
 
+/* ---- 페일오버 옵션: backup=, failover=, tries= (2026-11-25) ---- */
+
+static void test_opt_defaults(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2\n") == 0);
+    CHECK_INT(cfg.routes[0].nbackends, 2);
+    CHECK_INT(cfg.routes[0].failover, 0);               /* 없으면 off (예전 동작) */
+    CHECK_INT(cfg.routes[0].tries, 2);                  /* 없으면 주 + 백업 전부 */
+    CHECK_INT(cfg.routes[0].next, 0);
+    CHECK_INT(cfg.routes[0].backends[0].is_backup, 0);
+    CHECK_INT(cfg.routes[0].backends[1].is_backup, 0);
+    CHECK_INT(cfg.routes[0].backends[0].down_until_ms, 0);
+}
+
+static void test_opt_full_line(void)
+{
+    REQUIRE(conf_load("/api/ 127.0.0.1:18801 127.0.0.1:18802 backup=127.0.0.1:18803 failover=connect,timeout tries=3\n") == 0);
+    CHECK_INT(cfg.nroutes, 1);
+    CHECK_INT(cfg.routes[0].nbackends, 3);
+    check_v4(&cfg.routes[0].backends[0], "127.0.0.1", 18801);
+    check_v4(&cfg.routes[0].backends[2], "127.0.0.1", 18803);
+    CHECK_STR(cfg.routes[0].backends[2].name, "127.0.0.1:18803");   /* Host 헤더가 되는 이름에 "backup=" 이 안 붙는다 */
+    CHECK_INT(cfg.routes[0].backends[0].is_backup, 0);
+    CHECK_INT(cfg.routes[0].backends[1].is_backup, 0);
+    CHECK_INT(cfg.routes[0].backends[2].is_backup, 1);
+    CHECK_INT(cfg.routes[0].failover, PROXY_FAILOVER_CONNECT | PROXY_FAILOVER_TIMEOUT);
+    CHECK_INT(cfg.routes[0].tries, 3);
+}
+
+/* 옵션은 접두사 뒤 어디에나. 백엔드 인덱스는 줄의 등장 순서이고, Round-Robin 은 주 백엔드끼리만 돈다 */
+static void test_opt_anywhere_and_order(void)
+{
+    proxy_route *rt;
+    size_t i;
+    static const int want[] = { 1, 2, 1, 2 };
+
+    REQUIRE(conf_load("/a/ backup=127.0.0.1:3 failover=timeout 127.0.0.1:1 tries=2 127.0.0.1:2\n") == 0);
+    rt = &cfg.routes[0];
+    CHECK_INT(rt->nbackends, 3);
+    CHECK_INT(rt->backends[0].is_backup, 1);
+    check_v4(&rt->backends[0], "127.0.0.1", 3);
+    check_v4(&rt->backends[1], "127.0.0.1", 1);
+    check_v4(&rt->backends[2], "127.0.0.1", 2);
+    CHECK_INT(rt->failover, PROXY_FAILOVER_TIMEOUT);
+    CHECK_INT(rt->tries, 2);
+    for (i = 0; i < 4; i++)
+        CHECK_INT(proxy_pick_backend(rt, 0, 0, proxy_rr_begin(rt)), want[i]);
+}
+
+static void test_opt_failover_values(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 failover=off\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, 0);
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 failover=connect\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, PROXY_FAILOVER_CONNECT);
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 failover=timeout\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, PROXY_FAILOVER_TIMEOUT);
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 failover=timeout,connect\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, PROXY_FAILOVER_CONNECT | PROXY_FAILOVER_TIMEOUT);
+}
+
+/* backup= 이나 tries= 가 failover=off(또는 없음)와 같이 있어도 오류가 아니다. 백업은 안 쓰이고 tries 는 효과가 없다 */
+static void test_opt_backup_tries_with_failover_off(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:2 tries=2 failover=off\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, 0);
+    CHECK_INT(cfg.routes[0].backends[1].is_backup, 1);
+    CHECK_INT(cfg.routes[0].tries, 2);
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:2\n") == 0);   /* failover 줄이 없어도 */
+    CHECK_INT(cfg.routes[0].failover, 0);
+    /* 그리고 실제로 안 쓰인다: 주 백엔드 하나가 계속 고른다 (모든 요청이 첫 시도에서 끝난다) */
+    CHECK_INT(proxy_pick_backend(&cfg.routes[0], 0, 0, proxy_rr_begin(&cfg.routes[0])), 0);
+    proxy_mark_down(&cfg.routes[0], 0, 0);                              /* failover 꺼짐: 표시 안 함 */
+    CHECK_INT(proxy_pick_backend(&cfg.routes[0], 0, 0, proxy_rr_begin(&cfg.routes[0])), 0);
+}
+
+static void test_opt_tries_values(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2 127.0.0.1:3 backup=127.0.0.1:4\n") == 0);
+    CHECK_INT(cfg.routes[0].tries, 4);                  /* 기본은 주 + 백업 */
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 tries=1\n") == 0);
+    CHECK_INT(cfg.routes[0].tries, 1);
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 tries=8\n") == 0);
+    CHECK_INT(cfg.routes[0].tries, 8);                  /* 백엔드 수보다 커도 오류는 아니다 (더 고를 후보가 없을 뿐) */
+}
+
+static void test_opt_backup_ipv6_and_many(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 backup=[::1]:8001\n") == 0);
+    check_v6(&cfg.routes[0].backends[1], "::1", 8001);
+    CHECK_STR(cfg.routes[0].backends[1].name, "[::1]:8001");
+    CHECK_INT(cfg.routes[0].backends[1].is_backup, 1);
+    /* 주 5 + 백업 3 = 8 은 된다 */
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2 127.0.0.1:3 127.0.0.1:4 127.0.0.1:5 "
+                      "backup=127.0.0.1:6 backup=127.0.0.1:7 backup=127.0.0.1:8\n") == 0);
+    CHECK_INT(cfg.routes[0].nbackends, 8);
+    CHECK_INT(cfg.routes[0].tries, 8);
+    /* 같은 주소를 주와 백업에 같이 써도 된다 (C12 와 같다) */
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:1\n") == 0);
+}
+
+static void test_err_opt_duplicate(void)
+{
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect failover=timeout\n"), 1, "duplicate option 'failover'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=off failover=off\n"), 1, "duplicate option 'failover'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=2 tries=2\n"), 1, "duplicate option 'tries'");
+}
+
+static void test_err_opt_failover_values(void)
+{
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=off,connect\n"), 1, "cannot be combined");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect,off\n"), 1, "cannot be combined");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=timeout,off,connect\n"), 1, "cannot be combined");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=off,off\n"), 1, "duplicate failover value");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=bogus\n"), 1, "unknown failover value 'bogus'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect,bogus\n"), 1, "unknown failover value 'bogus'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=Connect\n"), 1, "unknown failover value");   /* 대소문자 구분 */
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect,connect\n"), 1, "duplicate failover value 'connect'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=timeout,connect,timeout\n"), 1, "duplicate failover value 'timeout'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect,,timeout\n"), 1, "empty item");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=,connect\n"), 1, "empty item");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=connect,\n"), 1, "empty item");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=,\n"), 1, "empty item");
+    expect_err(conf_load("/a/ 127.0.0.1:1 failover=\n"), 1, "no value");
+}
+
+static void test_err_opt_tries_values(void)
+{
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=0\n"), 1, "invalid tries '0'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=9\n"), 1, "invalid tries '9'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=07\n"), 1, "invalid tries '07'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=00\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=10\n"), 1, "invalid tries '10'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=100\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=99999999999999999999\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=-1\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=+1\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=1x\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=x\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=2,3\n"), 1, "invalid tries");
+    expect_err(conf_load("/a/ 127.0.0.1:1 tries=\n"), 1, "no value");
+}
+
+static void test_err_opt_shape(void)
+{
+    expect_err(conf_load("/a/ 127.0.0.1:1 foo=bar\n"), 1, "unknown option 'foo'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 Backup=127.0.0.1:2\n"), 1, "unknown option 'Backup'");   /* 대소문자 구분 */
+    expect_err(conf_load("/a/ 127.0.0.1:1 foo=\n"), 1, "unknown option 'foo'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 =x\n"), 1, "no name");
+    expect_err(conf_load("/a/ 127.0.0.1:1 =\n"), 1, "no name");
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=\n"), 1, "no value");
+    expect_err(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2=3\n"), 1, "unknown option");   /* 백엔드 토큰에 '=' 를 붙인 오타 */
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=1=2:80\n"), 1, "invalid backend '1=2:80'");   /* 이름에 '=' */
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=nocolon\n"), 1, "invalid backend 'nocolon'");
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:0\n"), 1, "invalid port");
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:08001\n"), 1, "invalid port");
+    expect_err(conf_load("/a/ 127.0.0.1:1 backup=127.0.0.1:2 backup=bad\n"), 1, "invalid backend 'bad'");
+    expect_err(conf_load("/ok/ 127.0.0.1:1\n/a/ 127.0.0.1:1 failover=zzz\n"), 2, "unknown failover value");   /* 줄 번호 */
+}
+
+static void test_err_opt_too_long(void)
+{
+    char text[256];
+    int n;
+
+    /* 71바이트 옵션 토큰: "backup=" + 63바이트 이름이 한도(70)라서 이름이 63바이트를 넘는 backup= 도 여기서 걸린다.
+     * (한도 안의 긴 이름은 getaddrinfo 가 이름 해석을 시도하므로, 이 파일의 "DNS 안 함" 약속 때문에 시험하지 않는다) */
+    n = snprintf(text, sizeof text, "/a/ 127.0.0.1:1 backup=%.*s:80\n", 61, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    REQUIRE(n > 0 && (size_t)n < sizeof text);
+    expect_err(conf_load(text), 1, "option too long");
+    n = snprintf(text, sizeof text, "/a/ 127.0.0.1:1 failover=%.*s\n", 80, "connect,connect,connect,connect,connect,connect,connect,connect,connect,connect");
+    REQUIRE(n > 0 && (size_t)n < sizeof text);
+    expect_err(conf_load(text), 1, "option too long");
+}
+
+static void test_err_opt_backends(void)
+{
+    /* 백업뿐인 줄 */
+    expect_err(conf_load("/a/ backup=127.0.0.1:1\n"), 1, "no primary backend");
+    expect_err(conf_load("/a/ backup=127.0.0.1:1 backup=127.0.0.1:2 failover=connect\n"), 1, "no primary backend");
+    /* 옵션뿐인 줄은 백엔드가 없다 */
+    expect_err(conf_load("/a/ failover=connect tries=2\n"), 1, "no backend for prefix");
+    /* 주 + 백업 합계가 8 을 넘음 (어느 쪽이 9번째든) */
+    expect_err(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2 127.0.0.1:3 127.0.0.1:4 127.0.0.1:5 "
+                         "backup=127.0.0.1:6 backup=127.0.0.1:7 backup=127.0.0.1:8 backup=127.0.0.1:9\n"),
+               1, "too many backends");
+    expect_err(conf_load("/a/ backup=127.0.0.1:1 backup=127.0.0.1:2 backup=127.0.0.1:3 backup=127.0.0.1:4 "
+                         "backup=127.0.0.1:5 backup=127.0.0.1:6 backup=127.0.0.1:7 127.0.0.1:8 127.0.0.1:9\n"),
+               1, "too many backends");
+    expect_err(conf_load("/a/ 127.0.0.1:1 127.0.0.1:2 127.0.0.1:3 127.0.0.1:4 127.0.0.1:5 127.0.0.1:6 "
+                         "127.0.0.1:7 127.0.0.1:8 failover=connect backup=127.0.0.1:9\n"),
+               1, "too many backends");
+}
+
+/* 주석은 옵션에서도 토큰 맨 앞에서만 */
+static void test_opt_comment(void)
+{
+    REQUIRE(conf_load("/a/ 127.0.0.1:1 failover=connect # tries=bogus backup=\n") == 0);
+    CHECK_INT(cfg.routes[0].failover, PROXY_FAILOVER_CONNECT);
+    CHECK_INT(cfg.routes[0].tries, 1);
+}
+
+/* ---- 백엔드 고르기: proxy_rr_begin / proxy_pick_backend / proxy_mark_down (순수 함수, 시각은 인자) ---- */
+
+static proxy_route mk_rt;
+
+/* layout 글자 하나가 백엔드 하나: 'P' 주, 'B' 백업 (줄의 등장 순서). tries 는 백엔드 수로 둔다 */
+static proxy_route *mk(const char *layout, unsigned failover)
+{
+    size_t i;
+
+    memset(&mk_rt, 0, sizeof mk_rt);
+    for (i = 0; layout[i] != '\0'; i++)
+        mk_rt.backends[i].is_backup = layout[i] == 'B';
+    mk_rt.nbackends = strlen(layout);
+    mk_rt.failover = failover;
+    mk_rt.tries = mk_rt.nbackends;
+    return &mk_rt;
+}
+
+#define PICK(rt, now, tried, rr) proxy_pick_backend((rt), (now), (tried), (rr))
+#define BIT(i) (1u << (i))
+
+/* 페일오버가 꺼진 라우트: 고르는 순서가 #9 의 Round-Robin 과 같다 (0, 1, ..., n-1, 0 ...). 백업은 절대 안 나온다 */
+static void test_pick_rr_same_as_old(void)
+{
+    proxy_route *rt = mk("PPP", 0);
+    size_t i;
+
+    for (i = 0; i < 7; i++)
+        CHECK_INT(PICK(rt, 0, 0, proxy_rr_begin(rt)), i % 3);
+    CHECK_INT(rt->next, 7 % 3);
+
+    rt = mk("BPBP", 0);                                  /* 주 백엔드는 인덱스 1, 3. 순번은 "주 중 몇 번째" */
+    for (i = 0; i < 6; i++) {
+        size_t rr = proxy_rr_begin(rt);
+
+        CHECK_INT(rr, i % 2);
+        CHECK_INT(PICK(rt, 0, 0, rr), i % 2 == 0 ? 1 : 3);
+    }
+    rt = mk("P", 0);
+    for (i = 0; i < 3; i++)
+        CHECK_INT(PICK(rt, 0, 0, proxy_rr_begin(rt)), 0);
+    CHECK_INT(rt->next, 0);
+}
+
+/* 페일오버가 꺼진 라우트는 rr_start 번째 주 백엔드 하나뿐이다: 이미 시도했으면 백업이 있어도 다음 주 백엔드나 백업으로 넘어가지 않고 -1 */
+static void test_pick_failover_off_single_candidate(void)
+{
+    proxy_route *rt = mk("PBP", 0);                      /* 주 백엔드는 인덱스 0, 2. 백업은 1 */
+
+    CHECK_INT(PICK(rt, 0, 0, 0), 0);
+    CHECK_INT(PICK(rt, 0, 0, 1), 2);
+    CHECK_INT(PICK(rt, 0, BIT(0), 0), -1);               /* 시도한 것: 다음 주 백엔드(2)도 백업(1)도 아니다 */
+    CHECK_INT(PICK(rt, 0, BIT(2), 1), -1);
+    CHECK_INT(PICK(rt, 0, BIT(1), 0), 0);                /* 백업을 시도했다는 비트는 이 후보와 상관없다 */
+    rt->backends[0].down_until_ms = 1000000;             /* 손으로 단 표시도 꺼진 라우트에서는 보지 않는다 */
+    CHECK_INT(PICK(rt, 0, 0, 0), 0);
+    rt = mk("BB", 0);                                    /* 주 백엔드가 없으면 백업을 대신 고르지 않는다 */
+    CHECK_INT(PICK(rt, 0, 0, 0), -1);
+}
+
+static void test_pick_skip_down(void)
+{
+    proxy_route *rt = mk("PPP", PROXY_FAILOVER_CONNECT);
+
+    proxy_mark_down(rt, 1, 1000);
+    CHECK_INT(rt->backends[1].down_until_ms, 1000 + PROXY_BACKEND_DOWN_MS);
+    CHECK_INT(PICK(rt, 1000, 0, 0), 0);
+    CHECK_INT(PICK(rt, 1000, 0, 1), 2);                  /* 시작 위치가 죽은 것이면 RR 순서로 다음 */
+    CHECK_INT(PICK(rt, 1000, 0, 2), 2);
+    CHECK_INT(PICK(rt, 1000, BIT(2), 1), 0);             /* 2 는 해 봤고 1 은 죽음 → 한 바퀴 돌아 0 */
+    CHECK_INT(PICK(rt, 1000, BIT(2) | BIT(0), 1), -1);   /* 남은 건 죽은 1 뿐이고 0, 2 는 죽지 않았다 → "전부 죽음"이 아니라 후보 없음 (아래 all-down 규칙) */
+}
+
+static void test_pick_skip_tried(void)
+{
+    proxy_route *rt = mk("PPP", PROXY_FAILOVER_CONNECT);
+
+    CHECK_INT(PICK(rt, 0, BIT(0), 0), 1);
+    CHECK_INT(PICK(rt, 0, BIT(0) | BIT(1), 0), 2);
+    CHECK_INT(PICK(rt, 0, BIT(0) | BIT(1) | BIT(2), 0), -1);
+    CHECK_INT(PICK(rt, 0, BIT(1), 1), 2);                /* 시작 위치 1 은 해 봤다 → 2 */
+    CHECK_INT(PICK(rt, 0, BIT(1) | BIT(2), 1), 0);       /* 한 바퀴 돌아 0 */
+    CHECK_INT(PICK(rt, 0, 0, 7), 1);                     /* 범위 밖 시작 위치는 나머지 (7 % 3 == 1) */
+}
+
+static void test_pick_backups_only_after_primaries(void)
+{
+    proxy_route *rt = mk("PPBB", PROXY_FAILOVER_CONNECT);   /* 인덱스 2, 3 이 백업 (이 순서로 쓴다) */
+
+    CHECK_INT(PICK(rt, 0, 0, 0), 0);
+    CHECK_INT(PICK(rt, 0, BIT(0), 0), 1);
+    CHECK_INT(PICK(rt, 0, BIT(0) | BIT(1), 0), 2);       /* 주가 다 소진돼서야 백업 */
+    CHECK_INT(PICK(rt, 0, BIT(0) | BIT(1) | BIT(2), 0), 3);
+    CHECK_INT(PICK(rt, 0, BIT(0) | BIT(1) | BIT(2) | BIT(3), 0), -1);
+    /* 주 백엔드가 살아 있는 동안 백업은 안 나온다 (죽은 것은 주가 아니라 백업 쪽으로) */
+    proxy_mark_down(rt, 0, 100);
+    CHECK_INT(PICK(rt, 100, 0, 0), 1);
+    proxy_mark_down(rt, 1, 100);
+    CHECK_INT(PICK(rt, 100, 0, 0), 2);                   /* 주가 둘 다 죽음 → 안 죽은 백업을 먼저 */
+    proxy_mark_down(rt, 2, 100);
+    CHECK_INT(PICK(rt, 100, 0, 0), 3);                   /* 백업 순서: 2 가 죽었으면 3 */
+    /* 백업의 RR 은 없다: 시작 위치와 무관하게 적은 순서 */
+    rt = mk("BPBP", PROXY_FAILOVER_CONNECT);              /* 주 1, 3 / 백업 0, 2 */
+    CHECK_INT(PICK(rt, 0, BIT(1) | BIT(3), 0), 0);
+    CHECK_INT(PICK(rt, 0, BIT(1) | BIT(3), 1), 0);
+    CHECK_INT(PICK(rt, 0, BIT(1) | BIT(3) | BIT(0), 1), 2);
+}
+
+/* 전부 죽은 표시여도 기다리지 않고 (주 RR → 백업) 순서로 안 해 본 것을 고른다 */
+static void test_pick_all_down_fallback(void)
+{
+    proxy_route *rt = mk("PPB", PROXY_FAILOVER_CONNECT | PROXY_FAILOVER_TIMEOUT);
+
+    proxy_mark_down(rt, 0, 0);
+    proxy_mark_down(rt, 1, 0);
+    proxy_mark_down(rt, 2, 0);
+    CHECK_INT(PICK(rt, 100, 0, 0), 0);
+    CHECK_INT(PICK(rt, 100, 0, 1), 1);
+    CHECK_INT(PICK(rt, 100, BIT(0), 0), 1);
+    CHECK_INT(PICK(rt, 100, BIT(0) | BIT(1), 0), 2);
+    CHECK_INT(PICK(rt, 100, BIT(0) | BIT(1) | BIT(2), 0), -1);
+    /* 일부만 죽었으면 그 일부를 건너뛴다: 라우트의 백엔드가 "전부" 죽었을 때만 표시를 무시 (시도해 본 것도 센다) */
+    rt = mk("PPB", PROXY_FAILOVER_CONNECT);
+    proxy_mark_down(rt, 0, 0);
+    proxy_mark_down(rt, 2, 0);
+    CHECK_INT(PICK(rt, 100, 0, 0), 1);
+    /* 1 은 해 봤고(표시는 이 요청 중에 만료됐다고 보자) 남은 0, 2 는 죽음. 1 이 안 죽었으니 전부 죽은 게 아니다 → 후보 없음 */
+    CHECK_INT(PICK(rt, 100, BIT(1), 0), -1);
+    /* 같은 상황에서 1 도 죽은 표시면 전부 죽음 → 표시를 무시하고 안 해 본 주 0 부터 */
+    proxy_mark_down(rt, 1, 0);
+    CHECK_INT(PICK(rt, 100, BIT(1), 0), 0);
+    CHECK_INT(PICK(rt, 100, BIT(1) | BIT(0), 0), 2);
+}
+
+/* 죽은 표시는 시간으로만 풀린다 */
+static void test_pick_down_expires_by_time(void)
+{
+    proxy_route *rt = mk("PP", PROXY_FAILOVER_TIMEOUT);
+
+    proxy_mark_down(rt, 0, 5000);
+    CHECK_INT(PICK(rt, 5000, 0, 0), 1);
+    CHECK_INT(PICK(rt, 5000 + PROXY_BACKEND_DOWN_MS - 1, 0, 0), 1);   /* 만료 직전까지 죽음 */
+    CHECK_INT(PICK(rt, 5000 + PROXY_BACKEND_DOWN_MS, 0, 0), 0);       /* 만료 시각부터 살아남 */
+    CHECK_INT(PICK(rt, 5000 + PROXY_BACKEND_DOWN_MS + 1, 0, 0), 0);
+    CHECK_INT(PICK(rt, 4000, 0, 0), 1);                               /* 표시한 시각보다 이른 now 도 죽음 */
+    proxy_mark_down(rt, 0, 9000);                                     /* 다시 부르면 만료가 새로 잡힌다 */
+    CHECK_INT(rt->backends[0].down_until_ms, 9000 + PROXY_BACKEND_DOWN_MS);
+}
+
+static void test_mark_down_off_and_bounds(void)
+{
+    proxy_route *rt = mk("PP", 0);
+    proxy_route before;
+
+    proxy_mark_down(rt, 0, 1000);                        /* 페일오버 꺼짐: 기억하지 않는다 */
+    CHECK_INT(rt->backends[0].down_until_ms, 0);
+    CHECK_INT(PICK(rt, 1000, 0, 0), 0);
+
+    rt = mk("PP", PROXY_FAILOVER_CONNECT);
+    memcpy(&before, rt, sizeof before);
+    proxy_mark_down(rt, 2, 1000);                        /* 범위 밖 (nbackends == 2) */
+    proxy_mark_down(rt, 100, 1000);
+    CHECK(memcmp(&before, rt, sizeof before) == 0);
+    proxy_mark_down(rt, 1, 1000);
+    CHECK_INT(rt->backends[0].down_until_ms, 0);
+    CHECK_INT(rt->backends[1].down_until_ms, 1000 + PROXY_BACKEND_DOWN_MS);
+}
+
+/* pick 은 route 를 바꾸지 않는다 (RR 순번은 proxy_rr_begin 만 민다) */
+static void test_pick_does_not_mutate(void)
+{
+    proxy_route *rt = mk("PBP", PROXY_FAILOVER_CONNECT);
+    proxy_route before;
+
+    proxy_mark_down(rt, 0, 0);
+    memcpy(&before, rt, sizeof before);
+    (void)PICK(rt, 5, 0, 1);
+    (void)PICK(rt, 5, BIT(2), 0);
+    (void)PICK(rt, 5, 0xFFu, 0);
+    CHECK(memcmp(&before, rt, sizeof before) == 0);
+    CHECK_INT(PICK(rt, 5, 0xFFu, 0), -1);
+}
+
+/* server.c 의 up_start_attempt 와 같은 반복: 시도마다 실패한다고 치고(죽은 표시) 고른 순서를 order 에 쌓는다.
+ * tries 한도는 pick 이 아니라 호출자가 센다 (proxy_config.h) — 여기서는 server.c 처럼 호출자가 센다 */
+static size_t attempt_all_fail(proxy_route *rt, int64_t now, int *order)
+{
+    size_t rr = proxy_rr_begin(rt), n = 0;
+    unsigned tried = 0;
+
+    while (n < rt->tries) {
+        int i = PICK(rt, now, tried, rr);
+
+        if (i < 0)
+            break;
+        order[n++] = i;
+        tried |= BIT(i);
+        proxy_mark_down(rt, (size_t)i, now);
+    }
+    return n;
+}
+
+static void test_pick_tries_is_callers_job(void)
+{
+    int order[PROXY_MAX_BACKENDS];
+    proxy_route *rt = mk("PPPB", PROXY_FAILOVER_CONNECT);
+
+    /* pick 은 tries 를 모른다: 호출자가 세지 않으면 백엔드 수만큼 계속 고른다 */
+    rt->tries = 99;
+    CHECK_INT(attempt_all_fail(rt, 0, order), 4);
+    CHECK_INT(order[0], 0); CHECK_INT(order[1], 1); CHECK_INT(order[2], 2); CHECK_INT(order[3], 3);
+
+    rt = mk("PPPB", PROXY_FAILOVER_CONNECT);
+    rt->tries = 2;
+    CHECK_INT(attempt_all_fail(rt, 0, order), 2);
+    CHECK_INT(order[0], 0); CHECK_INT(order[1], 1);
+
+    /* 다음 요청은 순번 1 에서 시작. 방금 0, 1 이 죽은 표시라 안 죽은 주 2 가 첫 시도, 그다음은 안 죽은 백업 3 */
+    CHECK_INT(attempt_all_fail(rt, 100, order), 2);
+    CHECK_INT(order[0], 2); CHECK_INT(order[1], 3);
+
+    /* 모든 주가 죽은 표시면 안 죽은 백업이 첫 시도 */
+    rt = mk("PPB", PROXY_FAILOVER_CONNECT);
+    rt->tries = 3;
+    proxy_mark_down(rt, 0, 0);
+    proxy_mark_down(rt, 1, 0);
+    CHECK_INT(attempt_all_fail(rt, 10, order), 3);
+    CHECK_INT(order[0], 2); CHECK_INT(order[1], 0); CHECK_INT(order[2], 1);
+}
+
+/* 설정 파일에서 읽은 라우트로 한 번 더: 주/백업 섞인 줄 */
+static void test_pick_with_loaded_route(void)
+{
+    proxy_route *rt;
+    int order[PROXY_MAX_BACKENDS];
+
+    REQUIRE(conf_load("/a/ backup=127.0.0.1:9 127.0.0.1:1 127.0.0.1:2 failover=connect tries=3\n") == 0);
+    rt = &cfg.routes[0];
+    CHECK_INT(attempt_all_fail(rt, 0, order), 3);        /* 주 1, 2, 그다음 백업 0 */
+    CHECK_INT(order[0], 1); CHECK_INT(order[1], 2); CHECK_INT(order[2], 0);
+    CHECK_INT(proxy_rr_begin(rt), 1);                    /* 순번은 요청당 한 칸 (위 요청이 0 을 썼다). 주가 둘이라 0, 1, 0 ... */
+    CHECK_INT(proxy_rr_begin(rt), 0);
+}
+
 int main(void)
 {
+    RUN(test_opt_defaults);
+    RUN(test_opt_full_line);
+    RUN(test_opt_anywhere_and_order);
+    RUN(test_opt_failover_values);
+    RUN(test_opt_backup_tries_with_failover_off);
+    RUN(test_opt_tries_values);
+    RUN(test_opt_backup_ipv6_and_many);
+    RUN(test_opt_comment);
+    RUN(test_err_opt_duplicate);
+    RUN(test_err_opt_failover_values);
+    RUN(test_err_opt_tries_values);
+    RUN(test_err_opt_shape);
+    RUN(test_err_opt_too_long);
+    RUN(test_err_opt_backends);
+    RUN(test_pick_rr_same_as_old);
+    RUN(test_pick_failover_off_single_candidate);
+    RUN(test_pick_skip_down);
+    RUN(test_pick_skip_tried);
+    RUN(test_pick_backups_only_after_primaries);
+    RUN(test_pick_all_down_fallback);
+    RUN(test_pick_down_expires_by_time);
+    RUN(test_mark_down_off_and_bounds);
+    RUN(test_pick_does_not_mutate);
+    RUN(test_pick_tries_is_callers_job);
+    RUN(test_pick_with_loaded_route);
     RUN(test_load_basic);
     RUN(test_load_format_tolerance);
     RUN(test_load_last_line_without_lf);
