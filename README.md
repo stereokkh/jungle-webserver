@@ -25,9 +25,20 @@ make                                  # ./webserver 생성
 ./webserver -p 8080 -r www            # Ctrl-C(SIGINT)·SIGTERM 으로 종료
 ./webserver -p 8080 -r www -c proxy.conf   # Reverse Proxy (설정에 적은 접두사는 백엔드로 중계 · 형식은 docs/interfaces.md)
 ./webserver -p 8080 -r www --merge-slashes # 경로의 // 를 400 대신 / 로 합침
+./webserver -p 8080 -r www --access-log    # 연결 열림·요청·닫힘을 stderr 에 한 줄씩 (기본 꺼짐)
 make run                              # = ./webserver -p 8080 -r www
 make clean
 ```
+
+`--access-log` 출력 예 (요청 줄은 응답을 다 보낸 뒤에, 끊겨서 못 끝낸 요청은 끝에 `incomplete`):
+
+```text
+access: #2 open 127.0.0.1:51930 (active 1)
+access: #2 127.0.0.1:51930 "GET /api/add?a=3&b=4 HTTP/1.1" 200 187 0ms
+access: #2 close idle-timeout requests=1 10003ms (active 0)
+```
+
+닫힘 이유: `done`(응답 뒤 정상 종료), `client-closed`, `idle-timeout`(10초), `request-timeout`(30초, slow loris), `linger-timeout`, `read-error`, `write-error`, `shutdown`. stderr 를 받는 쪽이 막히면 이벤트 루프도 멈추므로 관찰할 때만 켭니다.
 
 > `--merge-slashes` 는 nginx 의 `merge_slashes` 지시어와 같은 동작이지만 **기본값이 반대**입니다. nginx 는 기본으로 합치고, 이 서버는 기본으로 `//` 가 든 요청을 400 으로 거절합니다. 이유는 `docs/decisions.md` (2026-11-23).
 

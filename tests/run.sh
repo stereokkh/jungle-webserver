@@ -698,4 +698,31 @@ else
     cat "$LOG"
 fi
 
+# --access-log: 기본은 꺼져 있고, 켜면 연결 열림·요청·닫힘을 stderr 에 한 줄씩
+grep -q '^access:' "$LOG" && bad "no access log by default" || ok "no access log by default"
+: >"$LOG"
+if start_server --access-log; then
+    curl -s -o /dev/null -m 3 "${URL}api/add?a=1&b=2"
+    curl -s -o /dev/null -m 3 "${URL}nope.txt"
+    ( printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /api/add?a=2&b=3 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'
+      sleep 1 ) | nc "$HOST" "$PORT" >/dev/null 2>&1
+    ( printf 'GARBAGE\r\n\r\n'; sleep 1 ) | nc "$HOST" "$PORT" >/dev/null 2>&1
+    curl -s -o /dev/null -m 3 -X DELETE "${URL}index.html"
+    stop_server TERM
+    expect_log() {
+        grep -qE "$2" "$LOG" && ok "access log: $1" || { bad "access log: $1"; cat "$LOG"; }
+    }
+    expect_log "open line"          '^access: #[0-9]+ open [^ ]+:[0-9]+ \(active [0-9]+\)$'
+    expect_log "app 200"            '"GET /api/add\?a=1&b=2 HTTP/1\.1" 200 [0-9]+ [0-9]+ms$'
+    expect_log "static 404"         '"GET /nope\.txt HTTP/1\.1" 404 [0-9]+ [0-9]+ms$'
+    expect_log "pipelined 1st"      '"GET / HTTP/1\.1" 200 [0-9]+ [0-9]+ms$'
+    expect_log "pipelined 2nd"      '"GET /api/add\?a=2&b=3 HTTP/1\.1" 200 '
+    expect_log "close after 2 reqs" '^access: #[0-9]+ close done requests=2 [0-9]+ms \(active [0-9]+\)$'
+    expect_log "bad request 400"    '"-" 400 [0-9]+ [0-9]+ms$'
+    expect_log "unknown method 501" '"DELETE( /index\.html)?" 501 [0-9]+ [0-9]+ms$'
+else
+    bad "server starts with --access-log"
+    cat "$LOG"
+fi
+
 exit $fail

@@ -103,6 +103,17 @@ typedef struct {
     int64_t req_start_ms;    /* 지금 요청의 첫 바이트를 받은 시각, 없으면 0 (CLIENT_REQUEST_TIMEOUT_MS) */
     int64_t linger_end_ms;   /* LINGERING 의 마감 (CLIENT_LINGER_TIMEOUT_MS) */
     size_t need_len;         /* 파서 NEED_MORE 의 consumed: 이만큼 모이기 전엔 파서를 부르지 않음 */
+    /* --access-log 용 (꺼져 있으면 log_active 는 늘 0 이고 나머지는 쓰지 않는다) */
+    unsigned long long id;   /* 연결 번호 (서버 시작 후 1부터) */
+    char client_port[8];
+    int64_t open_ms;
+    unsigned long nreq;      /* 이 연결에서 끝난 요청 수 */
+    int log_active;          /* 처리 중인 요청이 있다: 응답이 끝나거나 연결이 닫힐 때 한 줄 */
+    char log_req[192];       /* "METHOD target HTTP/1.x" (출력 가능한 ASCII 만) */
+    int64_t log_start_ms;    /* 그 요청의 첫 바이트 시각 */
+    int resp_status;         /* 클라이언트로 나간 상태 줄의 코드, 아직이면 0 */
+    unsigned long long resp_bytes;   /* 클라이언트로 쓴 바이트 (머리 + 본문) */
+    const char *close_why;   /* 닫는 이유. NULL 이면 닫을 때의 상태 이름 */
 } conn;
 
 /* pollfd 목록의 고정 위치 */
@@ -128,6 +139,7 @@ typedef struct {
     proxy_config proxy;                         /* -c 가 있을 때만 (서버 수명 동안 유지) */
     int has_proxy;
     http_parse_options parse_opt;               /* 요청마다 같은 파서 옵션 (#31) */
+    unsigned long long next_conn_id;            /* --access-log 의 연결 번호 */
 } server;
 
 /*
@@ -216,6 +228,123 @@ static int would_block(int err)
 }
 
 /* ---------------------------------------------------------------
+ * access log (--access-log, 기본 꺼짐)
+ *   stderr 에 한 줄씩 쓴다. 기존 시작·종료 메시지와 같은 곳이라 `make run` 한 창에서 다 보인다.
+ *     access: #3 open 127.0.0.1:51234 (active 1)
+ *     access: #3 127.0.0.1:51234 "GET /api/add?a=1&b=2 HTTP/1.1" 200 142 1ms
+ *     access: #3 close idle-timeout requests=1 10012ms (active 0)
+ *   요청 줄은 응답을 끝까지 보냈을 때(또는 그 전에 연결이 닫히면 "incomplete" 를 붙여) 쓴다.
+ *   상태 코드는 모듈마다 응답을 out 에 쓰는 방식이 달라서(정적·앱·오류·프록시 중계) 따로 넘기지 않고,
+ *   클라이언트로 처음 쓰는 상태 줄 "HTTP/1.x NNN" 에서 읽는다.
+ *   stderr 는 버퍼링이 없어 줄이 바로 나가지만, 받는 쪽(파이프)이 막히면 poll 루프도 멈춘다.
+ *   그래서 기본은 꺼 두고 관찰할 때만 켠다
+ * --------------------------------------------------------------- */
+
+static const char *conn_state_name(conn_state st)
+{
+    switch (st) {
+    case CONN_READING:       return "reading";
+    case CONN_WRITING:       return "writing";
+    case CONN_SENDING_FILE:  return "sending-file";
+    case CONN_UP_CONNECTING: return "upstream-connecting";
+    case CONN_UP_SENDING:    return "upstream-sending";
+    case CONN_UP_RECEIVING:  return "upstream-receiving";
+    case CONN_CLOSING:       return "closing";
+    case CONN_LINGERING:     return "lingering";
+    default:                 return "?";
+    }
+}
+
+/* 로그 한 줄에 요청에서 온 문자열을 넣을 때: 출력 가능한 ASCII 가 아니거나 '"' 면 '?' 로.
+ * 요청 대상에 줄바꿈 등을 넣어 가짜 로그 줄을 만들지 못하게 한다 (파서가 대부분 막지만 한 번 더) */
+static size_t log_put(char *dst, size_t size, size_t at, const char *src)
+{
+    for (; *src != '\0' && at + 1 < size; src++, at++) {
+        unsigned char ch = (unsigned char)*src;
+
+        dst[at] = (ch < 0x20 || ch > 0x7e || ch == '"') ? '?' : (char)ch;
+    }
+    dst[at] = '\0';
+    return at;
+}
+
+/* 파서가 DONE/ERROR 를 돌려준 직후에 부른다 (req 가 아직 유효하고 req_start_ms 를 지우기 전) */
+static void log_request_begin(server *s, conn *c, parse_result r)
+{
+    char ver[16];
+    size_t at = 0;
+
+    if (!s->cfg->access_log)
+        return;
+    c->log_active = 1;
+    c->log_start_ms = c->req_start_ms != 0 ? c->req_start_ms : now_ms();
+    c->resp_status = 0;
+    c->resp_bytes = 0;
+    if (r != PARSE_DONE) {
+        /* 깨진 요청: 파서가 메서드(501 등)·대상까지 읽었으면 그만큼만, 아니면 "-".
+         * 파서는 시작할 때 req 를 0 으로 지우므로 못 읽은 필드는 빈 문자열이다 */
+        if (c->req.method_str[0] == '\0') {
+            snprintf(c->log_req, sizeof c->log_req, "-");
+            return;
+        }
+        at = log_put(c->log_req, sizeof c->log_req, at, c->req.method_str);
+        if (c->req.target[0] != '\0') {
+            at = log_put(c->log_req, sizeof c->log_req, at, " ");
+            log_put(c->log_req, sizeof c->log_req, at, c->req.target);
+        }
+        return;
+    }
+    at = log_put(c->log_req, sizeof c->log_req, at, c->req.method_str);
+    at = log_put(c->log_req, sizeof c->log_req, at, " ");
+    at = log_put(c->log_req, sizeof c->log_req, at, c->req.target);
+    snprintf(ver, sizeof ver, " HTTP/1.%d", c->req.version_minor);
+    log_put(c->log_req, sizeof c->log_req, at, ver);
+}
+
+/* 클라이언트로 out 을 쓰기 직전에 부른다. 이번 응답의 첫 쓰기면 out 은 상태 줄로 시작한다 */
+static void log_note_status(conn *c)
+{
+    const char *p = buffer_peek(&c->out);
+    size_t n = buffer_pending(&c->out);
+
+    if (!c->log_active || c->resp_status != 0 || n < 12 ||
+        memcmp(p, "HTTP/1.", 7) != 0 || p[8] != ' ')
+        return;
+    if (p[9] >= '1' && p[9] <= '5' && p[10] >= '0' && p[10] <= '9' && p[11] >= '0' && p[11] <= '9')
+        c->resp_status = (p[9] - '0') * 100 + (p[10] - '0') * 10 + (p[11] - '0');
+}
+
+/* 요청 하나가 끝났다 (응답을 다 보냄, 또는 note != NULL 이면 그 전에 연결이 닫힘) */
+static void log_request_end(conn *c, const char *note)
+{
+    char status[8];
+
+    if (!c->log_active)
+        return;
+    c->log_active = 0;
+    c->nreq++;
+    if (c->resp_status != 0)
+        snprintf(status, sizeof status, "%d", c->resp_status);
+    else
+        snprintf(status, sizeof status, "-");
+    fprintf(stderr, "access: #%llu %s:%s \"%s\" %s %llu %lldms%s%s\n",
+            c->id, c->client_ip, c->client_port, c->log_req, status, c->resp_bytes,
+            (long long)(now_ms() - c->log_start_ms), note != NULL ? " " : "", note != NULL ? note : "");
+}
+
+/* 상대 포트 (같은 IP 의 여러 연결을 ss 출력과 맞춰 보려고) */
+static void fill_client_port(int fd, char *buf, size_t size)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+
+    memset(&ss, 0, sizeof ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &len) < 0 ||
+        getnameinfo((struct sockaddr *)&ss, len, NULL, 0, buf, (socklen_t)size, NI_NUMERICSERV) != 0)
+        snprintf(buf, size, "?");
+}
+
+/* ---------------------------------------------------------------
  * 연결 생성·정리
  * --------------------------------------------------------------- */
 
@@ -265,6 +394,13 @@ static int conn_open(server *s, int fd)
     c->last_active_ms = now_ms();
     s->conns[i] = c;
     s->nconns++;
+    if (s->cfg->access_log) {
+        c->id = ++s->next_conn_id;
+        c->open_ms = c->last_active_ms;
+        fill_client_port(fd, c->client_port, sizeof c->client_port);
+        fprintf(stderr, "access: #%llu open %s:%s (active %zu)\n",
+                c->id, c->client_ip, c->client_port, s->nconns);
+    }
     return 0;
 }
 
@@ -275,6 +411,12 @@ static void conn_close(server *s, size_t slot)
 
     if (c == NULL)
         return;
+    if (s->cfg->access_log) {
+        log_request_end(c, "incomplete");   /* 응답을 끝내기 전에 닫힘 (끊김·시간 초과·송신 오류) */
+        fprintf(stderr, "access: #%llu close %s requests=%lu %lldms (active %zu)\n",
+                c->id, c->close_why != NULL ? c->close_why : conn_state_name(c->state), c->nreq,
+                (long long)(now_ms() - c->open_ms), s->nconns - 1);
+    }
     close(c->fd);
     if (c->upstream_fd >= 0)
         close(c->upstream_fd);
@@ -406,6 +548,7 @@ static int handle_request(server *s, conn *c)
         return 0;
     }
     c->need_len = 0;              /* DONE·ERROR: 다음 요청에 남기지 않는다 */
+    log_request_begin(s, c, r);   /* req_start_ms 를 지우기 전에 (요청 처리 시간의 시작) */
     c->req_start_ms = 0;
 
     if (r == PARSE_ERROR) {
@@ -459,6 +602,7 @@ static void conn_response_done(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
 
+    log_request_end(c, NULL);     /* 파이프라이닝으로 다음 요청을 처리하기 전에 이번 요청을 쓴다 */
     if (c->state == CONN_CLOSING || !c->keep_alive) {
         conn_linger(s, slot);
         return;
@@ -479,8 +623,10 @@ static void conn_drain(server *s, size_t slot)
     char tmp[4096];
     ssize_t n = read(s->conns[slot]->fd, tmp, sizeof tmp);
 
-    if (n == 0 || (n < 0 && !would_block(errno)))
+    if (n == 0 || (n < 0 && !would_block(errno))) {
+        s->conns[slot]->close_why = "done";   /* 응답 뒤 클라이언트도 닫음: 정상 종료 */
         conn_close(s, slot);
+    }
 }
 
 static void conn_on_readable(server *s, size_t slot)
@@ -500,11 +646,14 @@ static void conn_on_readable(server *s, size_t slot)
     }
     n = read(c->fd, c->in.data + c->in.len, c->in.cap - c->in.len);
     if (n < 0) {
-        if (!would_block(errno))
+        if (!would_block(errno)) {
+            c->close_why = "read-error";
             conn_close(s, slot);   /* ECONNRESET 등: 이 연결만 닫는다 */
+        }
         return;
     }
     if (n == 0) {                  /* 클라이언트가 연결을 닫음 */
+        c->close_why = "client-closed";
         conn_close(s, slot);
         return;
     }
@@ -523,12 +672,14 @@ static void conn_send_file(server *s, size_t slot)
     int r = static_send_some(&c->file, c->fd);
 
     if (r < 0) {
+        c->close_why = "write-error";
         conn_close(s, slot);       /* 응답 도중 실패: 이미 헤더를 보냈으니 닫는 수밖에 없다 */
         return;
     }
     c->last_active_ms = now_ms();
     if (r == 0)
         return;                    /* 남은 건 다음 POLLOUT 에 */
+    c->resp_bytes += (unsigned long long)c->file.size;
     /* 다 보냈으면 바로 닫는다. keep-alive 로 다음 요청의 static_open 이 덮어쓰면 fd 가 샌다
      * (PR #25 리뷰). conn_close 의 static_close 와 겹쳐도 안전하다 */
     static_close(&c->file);
@@ -544,13 +695,17 @@ static void conn_on_writable(server *s, size_t slot)
         conn_send_file(s, slot);
         return;
     }
+    log_note_status(c);
     n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
     if (n < 0) {
-        if (!would_block(errno))
+        if (!would_block(errno)) {
+            c->close_why = "write-error";
             conn_close(s, slot);   /* EPIPE, ECONNRESET: 이 연결만 닫는다 */
+        }
         return;
     }
     buffer_consume(&c->out, (size_t)n);
+    c->resp_bytes += (unsigned long long)n;
     c->last_active_ms = now_ms();
     if (buffer_pending(&c->out) > 0)
         return;                    /* 남은 건 다음 POLLOUT 에 */
@@ -727,18 +882,23 @@ static void up_on_client_event(server *s, size_t slot, short re)
     int was_paused = up_paused(c);
 
     if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+        c->close_why = "client-closed";
         conn_close(s, slot);       /* 업스트림 fd 도 같이 닫힌다 */
         return;
     }
     if (!(re & POLLOUT) || buffer_pending(&c->out) == 0)
         return;
+    log_note_status(c);
     n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
     if (n < 0) {
-        if (!would_block(errno))
+        if (!would_block(errno)) {
+            c->close_why = "write-error";
             conn_close(s, slot);
+        }
         return;
     }
     buffer_consume(&c->out, (size_t)n);
+    c->resp_bytes += (unsigned long long)n;
     c->last_active_ms = now_ms();
     /* 역압력으로 읽기를 쉬던 연결이 다시 읽게 된 순간에만 업스트림 유휴 시계를 새로 시작한다.
      * 쉬지 않았다면 클라이언트 쓰기는 업스트림 유휴와 상관없다 (결정 4b) */
@@ -833,9 +993,16 @@ static int expire_idle(server *s, int64_t now)
                 continue;
         }
         left = conn_deadline(c) - now;
-        if (left <= 0)
+        if (left <= 0) {
+            if (c->state == CONN_LINGERING)
+                c->close_why = "linger-timeout";
+            else if (c->state == CONN_READING && c->req_start_ms != 0 &&
+                     now >= c->req_start_ms + CLIENT_REQUEST_TIMEOUT_MS)
+                c->close_why = "request-timeout";   /* slow loris */
+            else
+                c->close_why = "idle-timeout";
             conn_close(s, i);
-        else if (next < 0 || left < next)
+        } else if (next < 0 || left < next)
             next = left;
     }
     if (s->accept_resume_ms != 0) {
@@ -931,10 +1098,11 @@ static void log_listening(const server *s)
 
     memset(&ss, 0, sizeof ss);
     v6 = getsockname(s->listen_fd, (struct sockaddr *)&ss, &len) == 0 && ss.ss_family == AF_INET6;
-    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s%s\n",
+    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s%s%s\n",
             s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", s->cfg->docroot,
             s->has_proxy ? ", proxy config " : "", s->has_proxy ? s->cfg->proxy_conf : "",
-            s->parse_opt.merge_slashes ? ", merge slashes" : "");
+            s->parse_opt.merge_slashes ? ", merge slashes" : "",
+            s->cfg->access_log ? ", access log" : "");
 }
 
 /* 새 연결을 먼저 막고(listen 닫기) → 모든 연결·파일·업스트림 → 시그널 파이프 순으로 정리 */
@@ -945,8 +1113,11 @@ static void shutdown_all(server *s)
     if (s->listen_fd >= 0)
         close(s->listen_fd);
     s->listen_fd = -1;
-    for (i = 0; i < SERVER_MAX_CONNS; i++)
+    for (i = 0; i < SERVER_MAX_CONNS; i++) {
+        if (s->conns[i] != NULL)
+            s->conns[i]->close_why = "shutdown";
         conn_close(s, i);
+    }
     close_signal_pipe();
 }
 
