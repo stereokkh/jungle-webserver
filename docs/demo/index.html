@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>웹서버 요청 흐름 시연</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<style>
+:root{
+  --bg:#ffffff; --layer:#f2f2f2; --border:#ebebeb; --border-strong:#c9c9c9; --line:#8f8f8f;
+  --text:#171717; --text2:#666666; --text3:#6b6b6b;
+  --ring:#006bff; --err:#d8001b; --err-bg:#ffeeef; --ok:#107d32; --ok-bg:#ecfdec;
+  --info-bg:#f0f7ff; --info-line:#cae7ff; --amber:#a35200; --purple:#7d00cc; --purple-bg:#faf0ff;
+  --shadow:0 1px 2px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0a0a0a; --layer:#1a1a1a; --border:#2e2e2e; --border-strong:#454545; --line:#8f8f8f;
+    --text:#ededed; --text2:#a1a1a1; --text3:#878787;
+    --ring:#006efe; --err:#ff565f; --err-bg:#330a11; --ok:#00ca50; --ok-bg:#002608;
+    --info-bg:#06193a; --info-line:#003674; --amber:#ffb224; --purple:#c472fb; --purple-bg:#290c33;
+    --shadow:0 1px 2px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0a0a0a; --layer:#1a1a1a; --border:#2e2e2e; --border-strong:#454545; --line:#8f8f8f;
+  --text:#ededed; --text2:#a1a1a1; --text3:#878787;
+  --ring:#006efe; --err:#ff565f; --err-bg:#330a11; --ok:#00ca50; --ok-bg:#002608;
+  --info-bg:#06193a; --info-line:#003674; --amber:#ffb224; --purple:#c472fb; --purple-bg:#290c33;
+  --shadow:0 1px 2px rgba(0,0,0,.5);
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text)}
+body{font-family:"Pretendard Variable",Pretendard,system-ui,sans-serif;font-size:16px;line-height:1.6}
+.mono,code,.log,.kicker,.conf{font-family:"Geist Mono",ui-monospace,monospace}
+main{max-width:1080px;margin:0 auto;padding:40px 16px 64px}
+.kicker{font-size:13px;line-height:20px;color:var(--text3);letter-spacing:.02em}
+h1{font-size:32px;line-height:40px;font-weight:600;letter-spacing:-.03em;margin:8px 0}
+.lead{color:var(--text2);margin:0 0 16px;max-width:66ch}
+.notice{font-size:14px;line-height:1.55;color:var(--text2);border-left:2px solid var(--border-strong);padding:4px 0 4px 12px;margin:0 0 24px;max-width:78ch}
+code{font-size:13px;background:var(--layer);padding:1px 4px}
+.label{font-size:13px;color:var(--text3);margin:0 0 8px}
+.picker{display:flex;flex-wrap:wrap;gap:4px;background:var(--layer);padding:4px;margin:0 0 16px}
+.picker button{height:34px;padding:0 10px;border:1px solid transparent;background:transparent;color:var(--text2);font:500 13px/20px "Geist Mono",monospace;cursor:pointer;white-space:nowrap}
+.picker button:hover{color:var(--text)}
+.picker button[aria-pressed="true"]{background:var(--bg);border-color:var(--border);color:var(--text);box-shadow:var(--shadow)}
+.picker button:focus-visible,.themebtn:focus-visible{outline:none;box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--ring)}
+.picker .grp{font:500 12.5px "Pretendard Variable",sans-serif;color:var(--text3);align-self:center;padding:0 6px 0 10px}
+.confbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 12px}
+.conf{font-size:13px;line-height:20px;background:var(--layer);border:1px solid var(--border);padding:8px 12px;overflow-x:auto;white-space:nowrap;max-width:100%}
+.conf .on{color:var(--ok);font-weight:600}.conf .off{color:var(--text2)}
+.themebtn{margin-left:auto;height:34px;padding:0 12px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:500 14px/20px "Pretendard Variable",sans-serif;cursor:pointer}
+.stagewrap{border:1px solid var(--border);background:var(--bg);box-shadow:var(--shadow);overflow-x:auto}
+svg{display:block;width:100%;min-width:760px;height:auto}
+.frame{fill:none;stroke:var(--border-strong);stroke-dasharray:2 4}
+.frame-t{font:600 14px "Pretendard Variable",sans-serif;fill:var(--text2)}
+.frame-s{font:400 12.5px "Geist Mono",monospace;fill:var(--text3)}
+.node rect.box{fill:var(--bg);stroke:var(--border-strong);stroke-width:1}
+.node.click{cursor:pointer;outline:none}
+.node.click:hover rect.box{stroke:var(--line)}
+.node.click:focus-visible rect.box{stroke:var(--ring);stroke-width:2}
+.node.active rect.box{stroke:var(--ring);stroke-width:2}
+.node.ok rect.box{stroke:var(--ok);stroke-width:2}
+.node.fail rect.box{stroke:var(--err);stroke-width:2}
+.node.down rect.box,.node.idle rect.box{stroke-dasharray:5 4;fill:var(--layer)}
+.node.down .t1,.node.idle .t1{fill:var(--text2)}
+.node .t1{font:600 15px "Pretendard Variable",sans-serif;fill:var(--text)}
+.node .t2{font:400 12.5px "Geist Mono",monospace;fill:var(--text2)}
+.node .t3{font:500 12.5px "Geist Mono",monospace;fill:var(--text3)}
+.dot.st-up{fill:var(--ok)}.dot.st-down{fill:var(--line)}
+.rest{fill:var(--amber);font:500 12.5px "Geist Mono",monospace}
+.edge{fill:none;stroke:var(--border-strong);stroke-width:1.5}
+.edge.hot{stroke:var(--ring);stroke-width:2}
+.edge.bad{stroke:var(--err);stroke-width:2}
+.edge.good{stroke:var(--ok);stroke-width:2}
+.pkt circle{fill:var(--ring)}
+.pkt.okp circle{fill:var(--ok)}
+.pkt.errp circle{fill:var(--err)}
+.pkt rect{fill:var(--bg);stroke:var(--border-strong)}
+.pkt text{font:500 12.5px "Geist Mono",monospace;fill:var(--text)}
+.xmark{stroke:var(--err);stroke-width:3;stroke-linecap:square}
+.req{cursor:pointer;outline:none}
+.req rect{fill:var(--layer);stroke:transparent;stroke-width:1}
+.req text{font:500 12.5px "Geist Mono",monospace;fill:var(--text2)}
+.req:hover text{fill:var(--text)}
+.req:hover rect{stroke:var(--border-strong)}
+.req.sel rect{fill:var(--info-bg);stroke:var(--ring);stroke-width:1.5}
+.req.sel text{fill:var(--text)}
+.req:focus-visible rect{stroke:var(--ring);stroke-width:2}
+.grp-t{font:600 12.5px "Pretendard Variable",sans-serif;fill:var(--text3)}
+.hint{font:400 12.5px "Pretendard Variable",sans-serif;fill:var(--text3)}
+.caption{display:flex;gap:12px;align-items:flex-start;background:var(--info-bg);border:1px solid var(--info-line);padding:12px 16px;margin:12px 0 0;min-height:52px}
+.caption.err{background:var(--err-bg);border-color:var(--err)}
+.caption .key{font:500 13px/24px "Geist Mono",monospace;color:var(--text2);white-space:nowrap}
+.caption .msg{font-size:15px;line-height:24px}
+.caption .where{display:block;font:400 12.5px/20px "Geist Mono",monospace;color:var(--text2);margin-top:2px}
+.grid{display:grid;grid-template-columns:360px 1fr;gap:24px;margin-top:24px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+h2{font-size:18px;line-height:28px;font-weight:600;margin:0 0 8px}
+.sub{font-size:13px;color:var(--text3);margin:0 0 8px}
+.results{display:flex;flex-direction:column;gap:4px;max-height:320px;overflow:auto;border:1px solid var(--border);padding:8px}
+.res{display:grid;grid-template-columns:34px 44px 1fr;gap:8px;align-items:start;font:500 12.5px/20px "Geist Mono",monospace}
+.res .meta{color:var(--text2);word-break:break-all}
+.res.mismatch .meta{color:var(--err)}
+.livebar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 12px}
+.livebtn{height:34px;padding:0 12px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:500 14px/20px "Pretendard Variable",sans-serif;cursor:pointer}
+.livebtn[aria-pressed="true"]{background:var(--ok-bg);border-color:var(--ok);color:var(--ok)}
+.livebtn:disabled{cursor:not-allowed;color:var(--text3);background:var(--layer)}
+.livebtn:focus-visible{outline:none;box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--ring)}
+.liveinfo{font-size:13px;color:var(--text2)}
+.chip{display:inline-block;text-align:center;color:var(--bg)}
+.chip.c2{background:var(--ok)}.chip.c4{background:var(--amber)}.chip.c5{background:var(--err)}
+.empty{color:var(--text3);font-size:14px}
+.log{font-size:12.5px;line-height:20px;border:1px solid var(--border);padding:8px 12px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.log .l-req{color:var(--text)}.log .l-fn{color:var(--ring)}.log .l-bad{color:var(--err)}.log .l-ok{color:var(--ok)}.log .l-rest{color:var(--amber)}.log .l-sys{color:var(--text2)}
+.measure{margin-top:40px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid var(--border);padding:8px;text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--text2);font-size:13px}
+td.m{font-family:"Geist Mono",monospace;font-size:12.5px}
+.foot{font-size:14px;line-height:1.55;color:var(--text2);border-left:2px solid var(--border-strong);padding-left:12px;margin-top:12px}
+.tablewrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<main>
+  <div class="kicker">jungle-webserver · poll 이벤트 루프 · 파서 → 라우팅 → 프록시 / 앱 / 정적</div>
+  <h1>요청 하나가 서버를 지나가는 길</h1>
+  <p class="lead">그림 속 블록 위에 놓인 <b>요청</b>을 하나 고르고 <b>클라이언트</b>를 눌러 보세요. 덧셈 같은 가벼운 계산과 정적 파일은 프런트가 직접 답하고, <code>/api/echo</code> 만 프록시가 백엔드로 넘겨요. 파서가 거절한 요청은 라우팅까지 가지 않아요. <b>백엔드</b>를 누르면 꺼지고, <b>프록시</b>를 누르면 <code>failover</code> 가 바뀌어요.</p>
+  <p class="notice">이 페이지는 서버를 실제로 돌리지 않아요. 지나가는 길은 <code>handler_route</code> · <code>proxy_pick_backend</code> · <code>proxy_mark_down</code> · <code>up_start_attempt</code> 의 규칙을 옮긴 거고, 상태 코드 · Content-Type · 바이트 수는 실제 서버로 잰 값을 넣었어요 (맨 아래 표). 단, <code>docs/demo/run-local.sh</code> 로 띄워서 보면 <b>실서버 모드</b>를 켤 수 있고, 그때는 요청을 우리 서버에 진짜로 보내서 예상과 비교해요.</p>
+
+  <div class="confbar">
+    <div class="conf" id="conf" aria-live="polite"></div>
+    <button class="themebtn" id="themebtn" type="button">다크 / 라이트</button>
+  </div>
+  <div class="livebar">
+    <button class="livebtn" id="livebtn" type="button" aria-pressed="false" disabled>실서버 모드: 확인 중</button>
+    <span class="liveinfo" id="liveinfo"></span>
+  </div>
+
+  <div class="stagewrap">
+    <svg id="stage" viewBox="0 0 1000 650" role="img" aria-label="클라이언트, 프런트 서버(파서, 라우팅, 프록시, 앱, 정적), 백엔드 세 개. 각 블록 위의 요청을 눌러 고를 수 있어요">
+      <rect class="frame" x="196" y="20" width="496" height="590"/>
+      <text class="frame-t" x="212" y="46">프런트 webserver</text>
+      <text class="frame-s" x="212" y="66">-p 18800 -r www -c proxy.conf</text>
+
+      <path id="e-cp" class="edge" d="M164,330 L214,330"/>
+      <path id="e-pr" class="edge" d="M374,330 L398,330"/>
+      <path id="e-rx" class="edge" d="M518,330 C540,330 534,200 556,200"/>
+      <path id="e-ra" class="edge" d="M518,330 C540,330 534,358 556,358"/>
+      <path id="e-rs" class="edge" d="M518,330 C540,330 534,546 556,546"/>
+      <path id="e-b0" class="edge" d="M676,200 C740,200 740,156 800,156"/>
+      <path id="e-b1" class="edge" d="M676,200 C740,200 740,326 800,326"/>
+      <path id="e-b2" class="edge" d="M676,200 C740,200 740,496 800,496"/>
+
+      <g id="chips"></g>
+
+      <g id="n-client" class="node click" role="button" tabindex="0" aria-label="클라이언트: 눌러서 고른 요청 보내기">
+        <rect class="box" x="20" y="286" width="144" height="88"/>
+        <text class="t1" x="34" y="314">클라이언트</text>
+        <text class="t2" x="34" y="336" id="cl-req">GET /index.html</text>
+        <text class="t3" x="34" y="358">눌러서 보내기</text>
+      </g>
+      <g id="n-parse" class="node">
+        <rect class="box" x="214" y="300" width="160" height="60"/>
+        <text class="t1" x="228" y="326">① 파서</text>
+        <text class="t3" x="228" y="348">http_request</text>
+      </g>
+      <g id="n-route" class="node">
+        <rect class="box" x="398" y="300" width="120" height="60"/>
+        <text class="t1" x="410" y="326">② 라우팅</text>
+        <text class="t3" x="410" y="348">handler_route</text>
+      </g>
+      <g id="n-proxy" class="node click" role="button" tabindex="0" aria-label="프록시: 눌러서 failover 바꾸기">
+        <rect class="box" x="556" y="170" width="120" height="60"/>
+        <text class="t1" x="568" y="194">③ 프록시</text>
+        <text class="t3" x="568" y="216" id="px-fo">failover=off</text>
+      </g>
+      <g id="n-app" class="node">
+        <rect class="box" x="556" y="330" width="120" height="56"/>
+        <text class="t1" x="568" y="353">앱 /api/*</text>
+        <text class="t3" x="568" y="374">app.c 직접 계산</text>
+      </g>
+      <g id="n-static" class="node">
+        <rect class="box" x="556" y="516" width="120" height="60"/>
+        <text class="t1" x="568" y="540">정적 www/</text>
+        <text class="t3" x="568" y="562">static_file</text>
+      </g>
+
+      <g id="n-b0" class="node click" role="button" tabindex="0">
+        <rect class="box" x="800" y="120" width="180" height="72"/>
+        <circle class="dot st-up" cx="818" cy="144" r="5"/>
+        <text class="t1" x="832" y="149">18801</text>
+        <text class="t2" x="818" y="174">주 · 앱 /api/*</text>
+        <text class="rest" x="966" y="149" text-anchor="end"></text>
+      </g>
+      <g id="n-b1" class="node click" role="button" tabindex="0">
+        <rect class="box" x="800" y="290" width="180" height="72"/>
+        <circle class="dot st-up" cx="818" cy="314" r="5"/>
+        <text class="t1" x="832" y="319">18802</text>
+        <text class="t2" x="818" y="344">주 · 앱 /api/*</text>
+        <text class="rest" x="966" y="319" text-anchor="end"></text>
+      </g>
+      <g id="n-b2" class="node click" role="button" tabindex="0">
+        <rect class="box" x="800" y="460" width="180" height="72"/>
+        <circle class="dot st-up" cx="818" cy="484" r="5"/>
+        <text class="t1" x="832" y="489">18803</text>
+        <text class="t2" x="818" y="514">백업 · 앱 /api/*</text>
+        <text class="rest" x="966" y="489" text-anchor="end"></text>
+      </g>
+
+      <g id="xmarks"></g>
+      <g id="pkt" class="pkt" visibility="hidden">
+        <rect x="0" y="-30" width="10" height="20"/>
+        <text x="0" y="-15"></text>
+        <circle r="7"/>
+      </g>
+      <text class="hint" x="20" y="638">블록 위 요청 = 고르기 · 클라이언트 = 보내기 · 백엔드 = 끄기/켜기 · 프록시 = failover 바꾸기 (Tab 으로 고르고 Enter)</text>
+    </svg>
+  </div>
+
+  <div class="caption" id="cap" aria-live="polite">
+    <span class="key" id="cap-key">READY</span>
+    <span class="msg"><span id="cap-msg">요청 종류를 고르고 클라이언트를 눌러 보세요.</span><span class="where" id="cap-where"></span></span>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>클라이언트가 받은 응답</h2>
+      <p class="sub">상태 · Content-Type · 본문 바이트 · X-Instance</p>
+      <div class="results" id="results"><span class="empty">아직 요청이 없어요</span></div>
+    </section>
+    <section>
+      <h2>서버 안에서 일어난 일</h2>
+      <p class="sub">코드 규칙으로 만든 줄이에요 (실제 서버 로그 아님)</p>
+      <div class="log" id="log" role="log"></div>
+    </section>
+  </div>
+
+  <section class="measure">
+    <h2>실제 서버로 잰 값</h2>
+    <p class="sub">WSL Ubuntu, PR #51 빌드 <code>b4ae352</code>, 2026-11-25. 프런트 <code>:18800</code> 1개 (<code>-c</code>: <code>/api/echo 127.0.0.1:18801 127.0.0.1:18802 backup=127.0.0.1:18803 failover=connect</code>) + 같은 바이너리 백엔드 2개, curl</p>
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>요청</th><th>상태</th><th>Content-Type · 바이트</th><th>X-Instance</th><th>누가 답했나</th></tr></thead>
+      <tbody id="mtable"></tbody>
+    </table>
+    </div>
+    <h2 style="margin-top:24px">페일오버 장면</h2>
+    <p class="sub">이 표만 설정이 달라요: 접두사 <code>/api/</code> 전체를 넘기고 <code>GET /api/add?a=1&amp;b=2</code> 로 잼. 백엔드를 고르는 규칙은 접두사와 상관없이 같아요.</p>
+    <div class="tablewrap">
+    <table>
+      <thead><tr><th>장면</th><th>설정</th><th>켜진 백엔드</th><th>응답 (순서대로)</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td class="m">failover 없음</td><td class="m">18801</td><td class="m">200(18801) · 502 · 200(18801) · 502</td></tr>
+        <tr><td>②</td><td class="m">failover=connect</td><td class="m">18801</td><td class="m">200(18801) × 4</td></tr>
+        <tr><td>③</td><td class="m">failover=connect</td><td class="m">없음</td><td class="m">502 × 2</td></tr>
+        <tr><td>④</td><td class="m">failover=connect, backup=18803</td><td class="m">18803</td><td class="m">200(18803) × 2</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="foot">위 그림에서 <code>POST /api/echo</code> 로 같은 조작을 하면 같은 순서가 나와야 해요 (③은 백업 18803 까지 끄면 돼요). 다르게 나오면 이 페이지의 규칙이 코드와 어긋난 거예요.</p>
+  </section>
+</main>
+
+<script>
+(function(){
+  "use strict";
+  var DOWN_MS = 10000;   // PROXY_BACKEND_DOWN_MS
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---- 요청 종류: 결과 값은 실제 서버로 잰 것 ----
+  // kind: static = 프런트 정적 / proxy = /api/ 프록시 → 백엔드 앱 / parse = 파서가 거절
+  var CASES = [
+    {grp:"정적", id:"idx",  m:"GET",    p:"/index.html",       kind:"static", st:200, ct:"text/html", n:309,
+     why:"/api/ 접두사가 아니고 앱 경로도 아니라 정적 파일로 가요. www/index.html 을 열어 보내요."},
+    {id:"png",  m:"GET",    p:"/img/logo.png",     kind:"static", st:200, ct:"image/png", n:70,
+     why:"확장자로 Content-Type 을 정해요 (mime.c). 큰 파일도 메모리에 다 올리지 않고 나눠 보내요."},
+    {id:"nf",   m:"GET",    p:"/nope.html",        kind:"static", st:404, ct:"text/html", n:49,
+     why:"정적 파일로 왔지만 www/ 에 그 파일이 없어요."},
+    {id:"add",  m:"GET",    p:"/api/add?a=1&b=2",  kind:"app", st:200, ct:"text/plain", n:2, body:"3",
+     why:"프록시 접두사는 /api/echo 뿐이라 /api/add 는 안 걸려요. 프런트 앱이 바로 더해서 답해요. 바퀴를 잠깐만 쓰는 가벼운 계산이에요."},
+    {id:"bad",  m:"GET",    p:"/api/add?a=x&b=2",  kind:"app", st:400, ct:"text/html", n:51,
+     why:"프런트 앱이 a=x 를 숫자로 못 읽어 400 을 줘요. 앱이 답했으니 X-Instance 에 프런트 포트 18800 이 붙어요."},
+    {id:"nope", m:"GET",    p:"/api/nope",         kind:"app", st:404, ct:"text/html", n:49,
+     why:"/api/ 아래지만 앱에 없는 경로라 앱이 404 를 줘요 (X-Instance 18800)."},
+    {id:"echo", m:"POST",   p:"/api/echo",         kind:"proxy", st:200, ct:"application/octet-stream", n:5, body:"hello",
+     why:"POST 본문 hello 를 그대로 돌려줘요. 요청을 보낸 뒤에는 실패해도 다른 백엔드로 안 넘겨요 (두 번 실행될 수 있어서)."},
+    {id:"405",  m:"GET",    p:"/api/echo",         kind:"proxy", st:405, ct:"text/html", n:58, allow:"POST",
+     why:"/api/echo 는 POST 만 받아요. 405 와 함께 Allow: POST 를 알려 줘요."},
+    {grp:"파서가 거절", id:"del", m:"DELETE", p:"/index.html", kind:"parse", st:501, ct:"text/html", n:55,
+     why:"파서가 DELETE 를 지원 안 하는 메서드로 거절해요. 라우팅까지 가지 않아요."},
+    {id:"dot",  m:"GET",    p:"/../etc/passwd",    kind:"parse", st:400, ct:"text/html", n:51,
+     why:"docroot 밖으로 나가는 .. 조각이라 파서가 400 으로 막아요 (#31 경로 정규형)."},
+    {id:"dbl",  m:"GET",    p:"//index.html",      kind:"parse", st:400, ct:"text/html", n:51,
+     why:"빈 조각 // 는 기본이 400 이에요 (--merge-slashes 를 켜면 / 로 합쳐요)."}
+  ];
+
+  // ---- 라우팅 표 (proxy_route) ----
+  var route = {
+    failover: 0, next: 0,
+    backends: [
+      {port:18801, backup:false, up:true, downUntil:0},
+      {port:18802, backup:false, up:true, downUntil:0},
+      {port:18803, backup:true,  up:true, downUntil:0}
+    ]
+  };
+  route.tries = route.backends.length;
+
+  function primaries(){ var p=[]; route.backends.forEach(function(b,i){ if(!b.backup) p.push(i); }); return p; }
+  function rrBegin(){ var np=primaries().length; if(np===0) return 0; var k=route.next%np; route.next=(k+1)%np; return k; }
+  function pick(now, tried, rrStart){
+    var prim=primaries(), np=prim.length, order=[], i, pass;
+    if(route.failover===0){ if(np===0) return -1; var only=prim[rrStart%np]; return (tried&(1<<only))?-1:only; }
+    for(i=0;i<np;i++) order.push(prim[(rrStart%np+i)%np]);
+    route.backends.forEach(function(b,j){ if(b.backup) order.push(j); });
+    for(i=0;i<order.length;i++) if(now>=route.backends[order[i]].downUntil) break;
+    var allDown = order.length>0 && i===order.length;
+    for(pass=0; pass<(allDown?2:1); pass++)
+      for(i=0;i<order.length;i++){
+        var b=route.backends[order[i]];
+        if(tried&(1<<order[i])) continue;
+        if(pass===0 && now<b.downUntil) continue;
+        return order[i];
+      }
+    return -1;
+  }
+  function markDown(i, now){ if(route.failover===0) return; route.backends[i].downUntil = now + DOWN_MS; }
+
+  // ---- DOM ----
+  var $ = function(id){ return document.getElementById(id); };
+  var E = {cp:$("e-cp"), pr:$("e-pr"), rx:$("e-rx"), ra:$("e-ra"), rs:$("e-rs"), b:[$("e-b0"),$("e-b1"),$("e-b2")]};
+  var N = {client:$("n-client"), parse:$("n-parse"), route:$("n-route"), proxy:$("n-proxy"), app:$("n-app"), stat:$("n-static"), b:[$("n-b0"),$("n-b1"),$("n-b2")]};
+  var pkt=$("pkt"), pktText=pkt.querySelector("text"), pktRect=pkt.querySelector("rect");
+  var logEl=$("log"), resEl=$("results"), xmarks=$("xmarks");
+  var cur = CASES[0], busy=false, queue=[], reqNo=0;
+  function now(){ return performance.now(); }
+
+  // 요청 고르기: 각 묶음을 그 요청이 끝나는 블록 위에 둔다
+  var GROUPS = {
+    parse:  {x:214, y:208, w:160, title:"파서가 거절"},
+    proxy:  {x:504, y:110, w:172, title:"프록시 → 백엔드"},
+    app:    {x:524, y:254, w:160, title:"프런트 앱 (가벼운 계산)"},
+    static: {x:504, y:430, w:172, title:"정적 파일"}
+  };
+  var SVGNS="http://www.w3.org/2000/svg", chipsEl=$("chips"), chipEls=[];
+  Object.keys(GROUPS).forEach(function(k){
+    var G=GROUPS[k], t=document.createElementNS(SVGNS,"text");
+    t.setAttribute("class","grp-t"); t.setAttribute("x",G.x); t.setAttribute("y",G.y-8); t.textContent=G.title;
+    chipsEl.appendChild(t); G.row=0;
+  });
+  function selectCase(c){
+    cur=c;
+    chipEls.forEach(function(e){ var on=e.__c===c; e.classList.toggle("sel",on); e.setAttribute("aria-pressed",on?"true":"false"); });
+    $("cl-req").textContent=(c.m+" "+c.p).slice(0,18);
+  }
+  CASES.forEach(function(c){
+    var G=GROUPS[c.kind], y=G.y+G.row*26; G.row++;
+    var g=document.createElementNS(SVGNS,"g");
+    g.setAttribute("class","req"); g.setAttribute("role","button"); g.setAttribute("tabindex","0");
+    g.setAttribute("aria-label","요청 고르기: "+c.m+" "+c.p);
+    g.innerHTML='<rect x="'+G.x+'" y="'+y+'" width="'+G.w+'" height="22"/><text x="'+(G.x+6)+'" y="'+(y+15.5)+'"></text>';
+    g.querySelector("text").textContent=c.m+" "+c.p;
+    g.__c=c; chipEls.push(g); chipsEl.appendChild(g);
+    bind(g, function(){
+      selectCase(c);
+      if(!busy) caption("PICK", c.m+" "+c.p+" 를 골랐어요. 클라이언트를 누르면 보내요.", c.why);
+    });
+  });
+
+  // measured table
+  CASES.forEach(function(c){
+    var tr=document.createElement("tr");
+    var who = c.kind==="parse" ? "프런트 파서" : c.kind==="static" ? "프런트 정적" : c.kind==="app" ? "프런트 앱" : "백엔드 앱 (프록시 경유)";
+    tr.innerHTML = '<td class="m"></td><td class="m"></td><td class="m"></td><td class="m"></td><td></td>';
+    var td=tr.children;
+    td[0].textContent=c.m+" "+c.p; td[1].textContent=c.st+(c.allow?" (Allow: "+c.allow+")":"");
+    td[2].textContent=c.ct+" · "+c.n+" B"+(c.body?' · "'+c.body+'"':"");
+    td[3].textContent=c.kind==="proxy"?"18801 / 18802 번갈아":c.kind==="app"?"18800 (프런트)":"없음"; td[4].textContent=who;
+    $("mtable").appendChild(tr);
+  });
+
+  function renderConf(){
+    var fo = route.failover ? '<span class="on">failover=connect</span>' : '<span class="off">failover=off</span>';
+    $("conf").innerHTML = 'proxy.conf  /api/echo 127.0.0.1:18801 127.0.0.1:18802 backup=127.0.0.1:18803 ' + fo;
+    $("px-fo").textContent = (route.failover ? "connect" : "off") + " · next=" + route.next;
+  }
+  function renderNodes(){
+    var t=now();
+    route.backends.forEach(function(b,i){
+      var g=N.b[i];
+      g.classList.toggle("down", !b.up);
+      g.querySelector(".dot").setAttribute("class", "dot "+(b.up?"st-up":"st-down"));
+      g.querySelector(".t2").textContent=(b.backup?"백업":"주")+" · "+(b.up?"앱 /api/*":"꺼짐");
+      var left=b.downUntil-t;
+      g.querySelector(".rest").textContent = left>0 ? "쉬는 중 "+(left/1000).toFixed(1)+"s" : "";
+      g.setAttribute("aria-label", b.port+" "+(b.backup?"백업":"주 백엔드")+", "+(b.up?"켜짐":"꺼짐")+". 눌러서 "+(b.up?"끄기":"켜기"));
+    });
+  }
+  setInterval(renderNodes, 100);
+
+  function caption(key, msg, where, err){
+    $("cap-key").textContent=key; $("cap-msg").textContent=msg; $("cap-where").textContent=where||"";
+    $("cap").classList.toggle("err", !!err);
+  }
+  function log(cls, text){ var d=document.createElement("div"); d.className=cls; d.textContent=text; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+  function addResult(n, c, st, inst, real){
+    if(resEl.querySelector(".empty")) resEl.textContent="";
+    var row=document.createElement("div"); row.className="res";
+    var meta = st===502 ? "text/html · 프록시가 직접 답함 · X-Instance 없음"
+             : c.ct+" · "+c.n+" B"+(c.body?' "'+c.body+'"':"")+(c.allow?" · Allow: "+c.allow:"")+" · "+(inst?"X-Instance: "+inst:"X-Instance 없음");
+    var shown = st, extra = "";
+    if(real){
+      if(real.skipped){ extra = "  [실서버: 보낼 수 없음, "+real.skipped+"]"; }
+      else {
+        shown = real.status;
+        extra = "  [실서버: "+real.status+" · "+real.bytes+" B · "+(real.xi?"X-Instance "+real.xi:"X-Instance 없음")+(real.match?" ✓ 예상과 같음]":" ⚠ 예상과 다름]");
+        if(!real.match) row.classList.add("mismatch");
+      }
+      meta = "예상 "+st+" · "+meta;
+    }
+    row.innerHTML='<span></span><span class="chip c'+String(shown)[0]+'"></span><span class="meta"></span>';
+    row.children[0].textContent="#"+n; row.children[1].textContent=shown; row.children[2].textContent=c.m+" "+c.p+" → "+meta+extra;
+    resEl.appendChild(row); resEl.scrollTop=resEl.scrollHeight;
+  }
+
+  // ---- 실서버 모드 (로컬): run-local.sh 가 띄운 프런트가 이 페이지를 서빙할 때만 켤 수 있다 ----
+  var live = {available:false, on:false, info:null};
+  async function realRequest(c){
+    if(c.p.indexOf("/..")>=0) return {skipped:"브라우저가 URL 의 .. 를 지워서 그대로 못 보냄"};
+    var opt = {method:c.m, cache:"no-store", redirect:"manual"};
+    if(c.m==="POST"){ opt.body = c.body || ""; opt.headers = {"Content-Type":"application/octet-stream"}; }
+    try{
+      var r = await fetch(location.origin + c.p, opt);
+      var buf = await r.arrayBuffer();
+      return {status:r.status, bytes:buf.byteLength, xi:r.headers.get("X-Instance")};
+    }catch(e){ return {status:0, bytes:0, xi:null, error:String(e)}; }
+  }
+  async function report(n, c, st, inst, realP){
+    if(!realP){ addResult(n, c, st, inst); return ""; }
+    var r = await realP;
+    if(!r.skipped){
+      r.match = r.status===st && String(r.xi||"")===String(inst||"") && (st===502 || r.bytes===c.n);
+    }
+    addResult(n, c, st, inst, r);
+    if(r.skipped) return "실서버: "+r.skipped;
+    if(r.match) return "실서버도 "+r.status+(r.xi?" · X-Instance "+r.xi:"")+" 로 같았어요 ✓";
+    log("l-bad", "#"+n+" ⚠ 실서버 "+r.status+(r.xi?" · X-Instance "+r.xi:"")+" ≠ 예상 "+st+(inst?" · "+inst:""));
+    return "⚠ 실서버는 "+r.status+(r.xi?" · X-Instance "+r.xi:" · X-Instance 없음")+" 였어요. 백엔드를 터미널에서 끄고 그림에서도 눌렀는지, 페이지를 새로고침해서 순번이 어긋나지 않았는지 보세요.";
+  }
+  function renderLive(){
+    var b=$("livebtn");
+    b.disabled = !live.available;
+    b.setAttribute("aria-pressed", live.on ? "true" : "false");
+    b.textContent = "실서버 모드: " + (live.on ? "켜짐" : live.available ? "꺼짐" : "쓸 수 없음");
+    $("liveinfo").textContent = live.available
+      ? (live.on ? "요청을 진짜로 보내고 예상과 비교해요. 프런트 "+location.host+" · 설정 "+live.info.conf : "로컬 서버가 이 페이지를 서빙 중이에요. 켜면 요청을 진짜로 보내요.")
+      : "docs/demo/run-local.sh 로 띄웠을 때만 켜져요. 지금은 시뮬레이션만 해요.";
+  }
+  async function detectLive(){
+    try{
+      var r = await fetch("live.json", {cache:"no-store"});
+      if(r.ok){ live.info = await r.json(); live.available = true; }
+    }catch(e){}
+    renderLive();
+  }
+
+  // ---- motion ----
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, reduce?0:ms); }); }
+  function setPacket(x,y,label){
+    pkt.setAttribute("transform","translate("+x+","+y+")");
+    if(label!==undefined){
+      pktText.textContent=label;
+      var w=Math.max(24, label.length*7.4+12);
+      pktRect.setAttribute("x",-w/2); pktRect.setAttribute("width",w); pktText.setAttribute("x",-w/2+6);
+    }
+  }
+  function travel(path, reverse, label, kind, dur){
+    dur = reduce ? 0 : (dur||450);
+    pkt.setAttribute("class","pkt"+(kind?" "+kind:"")); pkt.setAttribute("visibility","visible");
+    var cls = kind==="errp" ? "bad" : kind==="okp" ? "good" : "hot";
+    path.classList.add(cls);
+    var L=path.getTotalLength();
+    return new Promise(function(resolve){
+      var t0=null;
+      function step(ts){
+        if(t0===null) t0=ts;
+        var u = dur===0 ? 1 : Math.max(0, Math.min(1,(ts-t0)/dur));
+        var e = u<.5 ? 4*u*u*u : 1-Math.pow(-2*u+2,3)/2;
+        var p = path.getPointAtLength(L*(reverse?1-e:e));
+        setPacket(p.x,p.y,label); label=undefined;
+        if(u<1) requestAnimationFrame(step);
+        else { path.classList.remove(cls); pkt.setAttribute("visibility","hidden"); resolve(); }
+      }
+      requestAnimationFrame(step);
+    });
+  }
+  async function chain(paths, label, kind, dur){ for(var i=0;i<paths.length;i++) await travel(paths[i][0], paths[i][1], label, kind, dur); }
+  function flash(g, cls){ g.classList.add(cls); setTimeout(function(){ g.classList.remove(cls); }, reduce?300:900); }
+  function xmark(i){
+    var y=[156,326,496][i], ns="http://www.w3.org/2000/svg", g=document.createElementNS(ns,"g");
+    g.innerHTML='<line class="xmark" x1="776" y1="'+(y-10)+'" x2="792" y2="'+(y+6)+'"/><line class="xmark" x1="792" y1="'+(y-10)+'" x2="776" y2="'+(y+6)+'"/>';
+    xmarks.appendChild(g); setTimeout(function(){ g.remove(); }, reduce?600:1400);
+  }
+  function kindOf(st){ return st<300 ? "okp" : st<500 ? "" : "errp"; }
+
+  // ---- 요청 하나 ----
+  async function oneRequest(c){
+    var n=++reqNo, label=c.m+" "+c.p, note="";
+    var realP = live.on ? realRequest(c) : null;   // 진짜 요청은 그림과 같이 출발하고, 결과는 끝에서 비교
+    log("l-req", "#"+n+" "+label+(live.on?"  (실서버로도 보냄)":""));
+    caption("STEP 1", "클라이언트가 요청을 보내요. 바이트는 먼저 프런트의 커널 수신 버퍼에 쌓이고, poll 이 깨어나 read 해요.", "server.c conn_on_readable");
+    await travel(E.cp, false, label.slice(0,22), "", 500);
+
+    flash(N.parse, "active");
+    if(c.kind==="parse"){
+      log("l-bad", "#"+n+" http_request 파서 → "+c.st+" ("+c.why.split(".")[0]+")");
+      caption("STEP 2", c.why, "http_request.c → 오류 응답, 라우팅 안 감", true);
+      flash(N.parse, "fail"); await sleep(600);
+      await travel(E.cp, true, String(c.st), "errp", 450);
+      log("l-bad", "#"+n+" 응답 "+c.st+" (프런트가 직접 답함, X-Instance 없음)");
+      note = await report(n, c, c.st, null, realP);
+      caption("DONE", c.st+" 을 받았어요. 파서에서 끝나서 라우팅 · 프록시 · 백엔드는 지나가지 않았어요.", note, true);
+      return;
+    }
+    log("l-fn", "#"+n+" http_request 파서 → PARSE_DONE, target "+c.p);
+    caption("STEP 2", "파서가 요청 줄과 헤더를 다 읽었어요 (PARSE_DONE). 경로는 정규형으로 바꿔 둬요.", "http_request.c");
+    await sleep(350);
+    await travel(E.pr, false, "PARSE_DONE", "", 300);
+    flash(N.route, "active");
+
+    if(c.kind==="static"){
+      log("l-fn", "#"+n+" handler_route → 프록시 접두사 아님 → 앱 경로 아님 → ROUTE_STATIC");
+      caption("STEP 3", "handler_route 는 프록시 → 앱 → 정적 순서로 봐요. 셋째 칸, 정적 파일이에요.", "handler.c handler_route");
+      await sleep(350);
+      await travel(E.rs, false, "ROUTE_STATIC", "", 400);
+      flash(N.stat, c.st<300 ? "ok" : "fail");
+      log(c.st<300?"l-ok":"l-bad", "#"+n+" static_file "+c.p+" → "+c.st+" "+c.ct+" "+c.n+" B");
+      caption("STEP 4", c.why, "static_file.c, mime.c", c.st>=400);
+      await sleep(500);
+      await chain([[E.rs,true],[E.pr,true],[E.cp,true]], c.st+" · "+c.n+" B", kindOf(c.st), 300);
+      note = await report(n, c, c.st, null, realP);
+      caption("DONE", c.st+" 을 받았어요. 프런트가 직접 답해서 X-Instance 가 없어요.", note, c.st>=400);
+      return;
+    }
+
+    if(c.kind==="app"){
+      log("l-fn", "#"+n+" handler_route → proxy_match: /api/echo 와 안 맞음 → app_match → ROUTE_APP");
+      caption("STEP 3", "프록시 접두사 /api/echo 와 안 맞아서 둘째 칸, 프런트 앱으로 가요.", "handler.c handler_route → app_match");
+      await sleep(350);
+      await travel(E.ra, false, "ROUTE_APP", "", 400);
+      flash(N.app, c.st<300 ? "ok" : "fail");
+      log(c.st<300?"l-ok":"l-sys", "#"+n+" app (프런트 18800) → "+c.st+" "+c.ct+" "+c.n+" B");
+      caption("STEP 4", c.why, "app.c", c.st>=400);
+      await sleep(500);
+      await chain([[E.ra,true],[E.pr,true],[E.cp,true]], c.st+" · X-Instance: 18800", kindOf(c.st), 300);
+      note = await report(n, c, c.st, 18800, realP);
+      caption("DONE", c.st+" 을 받았어요. 프런트 앱이 답해서 X-Instance 가 프런트 포트 18800 이에요. 백엔드는 안 거쳤어요.", note, c.st>=400);
+      return;
+    }
+
+    // proxy
+    log("l-fn", "#"+n+" handler_route → proxy_match /api/echo → ROUTE_PROXY");
+    caption("STEP 3", "/api/echo 가 프록시 접두사예요. 프록시가 먼저 보니까 프런트 앱까지 안 가고 백엔드로 넘겨요.", "handler.c handler_route → proxy_match");
+    await sleep(400);
+    await travel(E.rx, false, "ROUTE_PROXY", "", 400);
+    flash(N.proxy, "active");
+
+    var rr=rrBegin(), prim=primaries(), tried=0, ntries=0;
+    renderConf();
+    log("l-fn", "#"+n+" proxy_rr_begin → "+route.backends[prim[rr]].port+" 부터, next → "+route.next);
+    caption("STEP 4", "proxy_rr_begin: 요청마다 순번을 한 칸 밀어요. 이번엔 "+route.backends[prim[rr]].port+" 부터 시도해요.", "proxy_config.c proxy_rr_begin");
+    await sleep(350);
+
+    while(ntries < route.tries){
+      var idx=pick(now(), tried, rr);
+      if(idx<0){ log("l-sys", "#"+n+" proxy_pick_backend → 더 고를 백엔드 없음"); break; }
+      var b=route.backends[idx]; tried|=(1<<idx); ntries++;
+      log("l-fn", "#"+n+" proxy_pick_backend → "+b.port+(b.backup?" (백업)":"")+"  [시도 "+ntries+"/"+route.tries+"]");
+      caption("STEP 5", b.port+" 를 골랐어요. 논블로킹 connect 를 시작해요.", "server.c up_start_attempt → proxy_connect_start");
+      await travel(E.b[idx], false, "connect", "", 400);
+      if(b.up){
+        flash(N.b[idx], c.st<300 ? "ok" : "fail");
+        log("l-ok", "#"+n+" connect "+b.port+" → 연결됨, 요청 바이트를 보냄 (여기부터는 안 넘김)");
+        log(c.st<300?"l-ok":"l-sys", "#"+n+" 백엔드 "+b.port+" 앱 → "+c.st+" "+c.ct+" "+c.n+" B");
+        caption("STEP 6", c.why, "백엔드 app.c · 프런트 proxy.c 가 응답을 그대로 중계", c.st>=400);
+        await sleep(450);
+        await chain([[E.b[idx],true],[E.rx,true],[E.pr,true],[E.cp,true]], c.st+" · X-Instance: "+b.port, kindOf(c.st), 280);
+        log("l-sys", "#"+n+" 프록시 응답 뒤 클라이언트 연결은 닫음 (keep-alive 없음)");
+        note = await report(n, c, c.st, b.port, realP);
+        caption("DONE", c.st+" 을 받았어요. 답한 건 백엔드 "+b.port+" 예요 (X-Instance).", note, c.st>=400);
+        return;
+      }
+      xmark(idx); flash(N.b[idx], "fail");
+      log("l-bad", "#"+n+" connect "+b.port+" → 거절 (ECONNREFUSED). 요청은 아직 안 보냄");
+      if(route.failover){
+        markDown(idx, now());
+        log("l-rest", "#"+n+" proxy_mark_down "+b.port+" → 10초 쉬는 중");
+        caption("STEP 6", b.port+" 이 연결을 거절했어요. 요청을 아직 안 보냈으니 다음 백엔드로 넘겨도 안전해요. 10초 동안 쉬는 중으로 적어 둬요.", "server.c up_start_attempt / up_connect_failed → proxy_mark_down", true);
+        await sleep(500);
+      } else {
+        log("l-sys", "#"+n+" failover=off → 다른 백엔드로 안 넘김");
+        caption("STEP 6", b.port+" 이 연결을 거절했어요. failover 가 꺼져 있어서 다른 백엔드로 넘기지 않아요.", "server.c up_start_attempt", true);
+        await sleep(500);
+        break;
+      }
+    }
+    await chain([[E.rx,true],[E.pr,true],[E.cp,true]], "502 Bad Gateway", "errp", 300);
+    log("l-bad", "#"+n+" 응답 502 (프록시가 직접 답함, X-Instance 없음)");
+    note = await report(n, c, 502, null, realP);
+    caption("DONE", "502 Bad Gateway. 뒤의 서버한테서 응답을 못 받아서 프록시가 직접 답했어요. 그래서 X-Instance 가 없어요.", note, true);
+  }
+
+  async function pump(){
+    if(busy) return;
+    busy=true;
+    while(queue.length){ await oneRequest(queue.shift()); await sleep(250); }
+    busy=false;
+  }
+  function send(){ if(queue.length<5) queue.push(cur); pump(); }
+  function toggleBackend(i){
+    var b=route.backends[i]; b.up=!b.up;
+    log("l-sys", "-- "+b.port+(b.up?" 켬":" 끔 (프로세스 종료)")+(live.on?"  · 그림의 예상만 바뀜, 실서버는 터미널에서":""));
+    if(live.on){
+      var cmd = b.up ? live.info.start[String(b.port)] : live.info.stop[String(b.port)];
+      caption("BACKEND", "그림에서는 "+b.port+" 을 "+(b.up?"켰어요":"껐어요")+". 브라우저는 프로세스를 못 다뤄서, 실서버도 같게 하려면 WSL 터미널에서 아래 명령을 쳐 주세요.", cmd, !b.up);
+    } else if(!busy) caption("BACKEND", b.port+(b.up?" 을 다시 켰어요.":" 을 껐어요. 이 포트로 오는 connect 는 거절돼요."), "", !b.up);
+    renderNodes();
+  }
+  function toggleProxy(){
+    if(busy){ caption("WAIT", "요청을 처리하는 중이라 프록시를 다시 띄울 수 없어요. 끝나고 눌러 주세요."); return; }
+    if(live.on){ caption("PROXY", "실서버 모드에서는 run-local.sh 가 띄운 설정 그대로예요 (failover=connect). 바꾸려면 스크립트를 다시 실행해야 해요.", live.info.conf); return; }
+    route.failover = route.failover ? 0 : 1; route.next=0;
+    route.backends.forEach(function(b){ b.downUntil=0; });
+    renderConf(); renderNodes();
+    log("l-sys", "-- 프런트 다시 시작: failover="+(route.failover?"connect":"off")+" (설정은 시작할 때 한 번 읽음, next 와 쉬는 중 표시도 처음부터)");
+    caption("PROXY", route.failover
+      ? "failover=connect 로 다시 띄웠어요. connect 가 실패하면 다음 백엔드로 넘기고, 주 백엔드가 다 안 되면 백업 18803 도 써요."
+      : "failover=off 로 다시 띄웠어요. 예전 Round-Robin 그대로라 백업은 쓰이지 않아요.", "server.c server_run → proxy_config_load");
+  }
+  function bind(el, fn){
+    el.addEventListener("click", fn);
+    el.addEventListener("keydown", function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); fn(); } });
+  }
+  bind(N.client, send); bind(N.proxy, toggleProxy);
+  N.b.forEach(function(g,i){ bind(g, function(){ toggleBackend(i); }); });
+  $("themebtn").addEventListener("click", function(){
+    var r=document.documentElement, c=r.getAttribute("data-theme");
+    var dark = c ? c==="dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    r.setAttribute("data-theme", dark?"light":"dark");
+  });
+  $("livebtn").addEventListener("click", function(){
+    if(!live.available || busy) return;
+    live.on = !live.on;
+    if(live.on){
+      // 실서버와 같은 출발점: failover=connect, 순번 0, 쉬는 중 표시 없음, 백엔드 전부 켜짐
+      route.failover = 1; route.next = 0;
+      route.backends.forEach(function(b){ b.downUntil = 0; b.up = true; });
+      log("l-sys", "-- 실서버 모드 켬: 그림의 예상도 서버 시작 상태로 맞춤 (failover=connect, next 0). 서버를 띄운 뒤 프록시 요청을 이미 보냈다면 순번이 어긋날 수 있어요");
+    } else log("l-sys", "-- 실서버 모드 끔: 다시 시뮬레이션만");
+    renderConf(); renderNodes(); renderLive();
+  });
+  renderConf(); renderNodes(); selectCase(CASES[0]); detectLive();
+  caption("READY", "요청 종류를 고르고 클라이언트를 눌러 보세요. 지금은 "+CASES[0].m+" "+CASES[0].p+" 예요.", CASES[0].why);
+})();
+</script>
+</body>
+</html>
