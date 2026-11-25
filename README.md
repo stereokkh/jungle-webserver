@@ -13,8 +13,8 @@ CS:APP 11장의 Tiny 웹서버에서 출발해, Tiny 가 멈추거나 죽던 경
 
 1. [한눈에 보기](#1-한눈에-보기)
 2. [바로 실행해 보기](#2-바로-실행해-보기)
-3. [동작 방식](#3-동작-방식)
-4. [요청 처리 세 갈래](#4-요청-처리-세-갈래) — [정적 파일](#4-1-정적-파일) · [동적 처리](#4-2-동적-처리-내장-앱) · [Reverse Proxy](#4-3-reverse-proxy)
+3. [요청 처리 네 갈래](#3-요청-처리-네-갈래) — [헬스체크](#3-1-헬스체크-healthz) · [Reverse Proxy](#3-2-reverse-proxy) · [동적 처리](#3-3-동적-처리-내장-앱) · [정적 파일](#3-4-정적-파일)
+4. [동작 방식](#4-동작-방식)
 5. [다른 방식과 비교](#5-다른-방식과-비교)
 6. [더 보기](#더-보기)
 
@@ -34,7 +34,7 @@ flowchart LR
 
 - **이벤트 루프 하나**: 프로세스·스레드 하나가 `poll()` 로 연결 최대 1024개를 논블로킹으로 처리한다. 아무것도 안 보내는 연결이 있어도 다른 요청은 멈추지 않는다
 - **같은 바이너리로 프런트와 백엔드**: `-c` 를 주면 프런트(Reverse Proxy), 안 주면 백엔드. Round-Robin 분산, connect 단계의 failover
-- **세 갈래 처리**: 프록시 → 내장 앱(`/api/`) → 정적 파일 순서로 라우팅. 헬스체크 `/healthz` 만은 프록시보다 먼저 자기 자신이 답한다
+- **네 갈래 처리**: 헬스체크 → 프록시 → 내장 앱(`/api/`) → 정적 파일 순서로 라우팅
 - **Tiny 에서 고친 것**: 블로킹 대기, SIGPIPE 로 인한 종료, `../` 경로 탈출, 오류 페이지의 반사형 XSS 등 재현한 11가지 ([docs/classic.md](docs/classic.md))
 
 **안 하는 것**: CGI, Forward Proxy, 캐시, TLS, chunked 본문, 요청을 백엔드에 보낸 뒤의 재시도 → [지원 범위](docs/api.md#지원하는-http-범위)
@@ -82,14 +82,51 @@ for i in 1 2 3 4; do curl -si -X POST --data hi localhost:8080/api/echo | grep X
 
 </details>
 
-## 3. 동작 방식
+## 3. 요청 처리 네 갈래
+
+`handler_route()` 가 요청 하나를 넷 중 하나로 보낸다. 순서는 헬스체크 → 프록시 → 내장 앱 → 정적 파일. `-c` 가 없으면 프록시 검사는 건너뛴다.
+
+### 3-1. 헬스체크 (`/healthz`)
+
+- 정확히 `/healthz` 일 때만. GET·HEAD → 200 `ok`, 그 외 메서드는 405 (`Allow: GET, HEAD`)
+- 프록시보다 먼저 본다. 프런트에 보낸 헬스체크를 백엔드가 대신 답하면 안 되므로, 어느 인스턴스든 자기 자신이 답한다
+- 응답에 `X-Instance: <포트>` 가 붙는다
+
+**자세히 →** [api: 헬스체크](docs/api.md#헬스체크-healthz)
+
+### 3-2. Reverse Proxy
+
+- 설정 한 줄 `/api 127.0.0.1:8001 127.0.0.1:8002`. 경로 경계에서 가장 긴 접두사가 이긴다
+- Round-Robin. `failover=` · `backup=` · `tries=` 를 주면 **connect 단계에서만** 다음 백엔드로 넘긴다. 요청을 보낸 뒤에는 넘기지 않아 POST 가 두 번 실행되지 않는다
+- 업스트림 소켓도 같은 `poll()` 루프에서 논블로킹. 클라이언트가 느리면 업스트림 읽기를 멈춘다 (역압력, 64KB)
+- 응답이 시작되기 전의 실패는 502/504, 시작된 뒤의 실패는 받은 데까지 보내고 닫는다
+
+**자세히 →** [architecture: Reverse Proxy](docs/architecture.md#4-3-reverse-proxy) · [api: 설정 형식과 옵션](docs/api.md#reverse-proxy--c)
+
+### 3-3. 동적 처리 (내장 앱)
+
+- `POST /api/echo` → 받은 본문 그대로
+- CGI(`fork`·`exec`) 대신 **서버 안의 함수 호출**. 이벤트 루프 안에서 자식 프로세스와 파이프를 기다리면 서버 전체가 멈출 수 있어서다
+- 앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다
+
+**자세히 →** [architecture: 내장 앱](docs/architecture.md#4-2-동적-처리-내장-앱) · [api: 내장 앱](docs/api.md#내장-앱-api)
+
+### 3-4. 정적 파일
+
+- GET·HEAD. 폴더면 `index.html`, 마지막 확장자로 Content-Type
+- docroot 밖(`..`, 바깥을 가리키는 심볼릭 링크)은 파일이 **있든 없든 같은 403** 이라 바깥 파일의 존재가 새지 않는다
+- 헤더만 버퍼에 쓰고 본문은 파일에서 16KB 조각씩 `pread` + `write`. 막히면 루프로 돌아가므로 큰 파일도 메모리에 올리지 않는다
+
+**자세히 →** [architecture: 정적 파일](docs/architecture.md#4-1-정적-파일) · [api: 정적 파일](docs/api.md#정적-파일)
+
+## 4. 동작 방식
 
 ```mermaid
 flowchart LR
     P(("poll()")) -->|POLLIN| R["읽기<br/>read() 한 번"]
     R --> Q["파싱<br/>http_parse_request"]
     Q -->|"덜 옴 (NEED_MORE)"| P
-    Q -->|DONE| RT["라우팅<br/>프록시 → 앱 → 정적"]
+    Q -->|DONE| RT["라우팅<br/>헬스체크 → 프록시 → 앱 → 정적"]
     RT --> W["응답 쓰기<br/>write() 한 번씩"]
     W -->|"막힘 (EAGAIN)"| P
     W -->|"keep-alive"| R
@@ -144,35 +181,6 @@ stateDiagram-v2
 
 **자세히 →** [docs/architecture.md](docs/architecture.md) · 이벤트 루프, 상태 머신, 버퍼, 타임아웃
 
-## 4. 요청 처리 세 갈래
-
-`handler_route()` 가 요청 하나를 셋 중 하나로 보낸다. `-c` 가 없으면 프록시 검사는 건너뛴다.
-
-### 4-1. 정적 파일
-
-- GET·HEAD. 폴더면 `index.html`, 마지막 확장자로 Content-Type
-- docroot 밖(`..`, 바깥을 가리키는 심볼릭 링크)은 파일이 **있든 없든 같은 403** 이라 바깥 파일의 존재가 새지 않는다
-- 헤더만 버퍼에 쓰고 본문은 파일에서 16KB 조각씩 `pread` + `write`. 막히면 루프로 돌아가므로 큰 파일도 메모리에 올리지 않는다
-
-**자세히 →** [architecture: 정적 파일](docs/architecture.md#4-1-정적-파일) · [api: 정적 파일](docs/api.md#정적-파일)
-
-### 4-2. 동적 처리 (내장 앱)
-
-- `GET /healthz` → `ok` (헬스체크, 프록시보다 먼저 봐서 프런트든 백엔드든 자기 자신이 답함), `POST /api/echo` → 받은 본문 그대로
-- CGI(`fork`·`exec`) 대신 **서버 안의 함수 호출**. 이벤트 루프 안에서 자식 프로세스와 파이프를 기다리면 서버 전체가 멈출 수 있어서다
-- 헬스체크·앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다
-
-**자세히 →** [architecture: 내장 앱](docs/architecture.md#4-2-동적-처리-내장-앱) · [api: 내장 앱](docs/api.md#내장-앱-api)
-
-### 4-3. Reverse Proxy
-
-- 설정 한 줄 `/api 127.0.0.1:8001 127.0.0.1:8002`. 경로 경계에서 가장 긴 접두사가 이긴다
-- Round-Robin. `failover=` · `backup=` · `tries=` 를 주면 **connect 단계에서만** 다음 백엔드로 넘긴다. 요청을 보낸 뒤에는 넘기지 않아 POST 가 두 번 실행되지 않는다
-- 업스트림 소켓도 같은 `poll()` 루프에서 논블로킹. 클라이언트가 느리면 업스트림 읽기를 멈춘다 (역압력, 64KB)
-- 응답이 시작되기 전의 실패는 502/504, 시작된 뒤의 실패는 받은 데까지 보내고 닫는다
-
-**자세히 →** [architecture: Reverse Proxy](docs/architecture.md#4-3-reverse-proxy) · [api: 설정 형식과 옵션](docs/api.md#reverse-proxy--c)
-
 ## 5. 다른 방식과 비교
 
 | 비교 축 | 우리 선택 | 비교 대상 |
@@ -193,7 +201,7 @@ stateDiagram-v2
 
 | 문서 | 내용 |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | 모듈 지도, 이벤트 루프, 상태 머신, 세 갈래 처리, 버퍼·오류 처리 원칙 |
+| [docs/architecture.md](docs/architecture.md) | 모듈 지도, 이벤트 루프, 상태 머신, 네 갈래 처리, 버퍼·오류 처리 원칙 |
 | [docs/comparison.md](docs/comparison.md) | Tiny · 동시성 모델 · 동적 처리 방식 · 정적 전송 · nginx 와 비교 |
 | [docs/api.md](docs/api.md) | 사용법, HTTP 지원 범위, 프록시 설정, 운영 제약 |
 | [docs/decisions.md](docs/decisions.md) | 결정 기록 (무엇을 왜 그렇게 정했나) |
