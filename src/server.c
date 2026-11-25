@@ -1315,6 +1315,7 @@ static void dispatch(server *s, const ev_event *evs, int nev)
         } else if (is_up_state(c->state)) {
             up_on_client_event(s, slot, re);
         } else if (re & WS_EV_ERR) {
+            c->close_why = "client-closed";      /* RST 등 소켓 오류 (프록시 504 를 쓰려다 오기도 한다, 결정 1) */
             conn_close(s, slot);
         } else if (c->state == CONN_READING || c->state == CONN_LINGERING) {
             if (re & (WS_EV_IN | WS_EV_HUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */

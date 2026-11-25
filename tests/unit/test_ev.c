@@ -171,6 +171,50 @@ static void test_einval(void)
     ev_close(NULL);
 }
 
+/* 7. fd 둘이 함께 준비되면 이벤트 둘, 각자의 tag */
+static void test_two_fds(void)
+{
+    ev_loop *ev = ev_open(4);
+    const ev_event *out;
+    int a[2], b[2], n, i, seen_a = 0, seen_b = 0;
+
+    REQUIRE(ev != NULL);
+    REQUIRE(pair(a) == 0);
+    REQUIRE(pair(b) == 0);
+    REQUIRE(write(a[1], "x", 1) == 1);
+    REQUIRE(write(b[1], "y", 1) == 1);
+    ev_begin(ev);
+    REQUIRE(ev_want(ev, a[0], 100, WS_EV_IN) == 0);
+    REQUIRE(ev_want(ev, b[0], 200, WS_EV_IN) == 0);
+    n = ev_wait(ev, 0, &out);
+    CHECK_INT(n, 2);
+    for (i = 0; i < n; i++) {
+        seen_a += out[i].tag == 100;
+        seen_b += out[i].tag == 200;
+    }
+    CHECK_INT(seen_a, 1);
+    CHECK_INT(seen_b, 1);
+    ev_forget(ev, a[0]);
+    ev_forget(ev, b[0]);
+    close(a[0]);
+    close(a[1]);
+    close(b[0]);
+    close(b[1]);
+    ev_close(ev);
+}
+
+/* 8. 감시 목록이 비어 있고 timeout 0 이면 바로 0 */
+static void test_empty_timeout0(void)
+{
+    ev_loop *ev = ev_open(4);
+    const ev_event *out;
+
+    REQUIRE(ev != NULL);
+    ev_begin(ev);
+    CHECK_INT(ev_wait(ev, 0, &out), 0);
+    ev_close(ev);
+}
+
 int main(void)
 {
     printf("  ev backend: %s\n", ev_backend());
@@ -180,5 +224,7 @@ int main(void)
     RUN(test_level_triggered);
     RUN(test_switch_in_to_out);
     RUN(test_einval);
+    RUN(test_two_fds);
+    RUN(test_empty_timeout0);
     return test_report();
 }

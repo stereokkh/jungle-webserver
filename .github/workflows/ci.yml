@@ -49,3 +49,6 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build & test with sanitizers
         run: make asan WERROR=1
+      # 같은 build/asan 안에서 백엔드만 바꿔 다시 링크된다 (EVENT 스탬프)
+      - name: Build & test with sanitizers (epoll)
+        run: make asan WERROR=1 EVENT=epoll
