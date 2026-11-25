@@ -54,8 +54,8 @@ curl -X POST --data hi localhost:8080/api/echo   # hi
 ```bash
 ./webserver -p 8001 -r www &
 ./webserver -p 8002 -r www &
-echo '/api 127.0.0.1:8001 127.0.0.1:8002' > proxy.conf
-./webserver -p 8080 -r www -c proxy.conf &
+echo '/api 127.0.0.1:8001 127.0.0.1:8002' > /tmp/proxy.conf
+./webserver -p 8080 -r www -c /tmp/proxy.conf &
 
 for i in 1 2 3 4; do curl -si -X POST --data hi localhost:8080/api/echo | grep X-Instance; done
 # X-Instance 가 8001, 8002 로 번갈아 바뀐다
@@ -97,7 +97,7 @@ for i in 1 2 3 4; do curl -si -X POST --data hi localhost:8080/api/echo | grep X
 ### 3-2. Reverse Proxy
 
 - 설정 한 줄 `/api 127.0.0.1:8001 127.0.0.1:8002`. 경로 경계에서 가장 긴 접두사가 이긴다
-- Round-Robin. `failover=` · `backup=` · `tries=` 를 주면 **connect 단계에서만** 다음 백엔드로 넘긴다. 요청을 보낸 뒤에는 넘기지 않아 POST 가 두 번 실행되지 않는다
+- Round-Robin. `failover=` 를 주면 **connect 단계에서만** 다음 백엔드로 넘긴다 (`backup=`·`tries=` 는 `failover=` 와 함께일 때만). 요청을 보낸 뒤에는 넘기지 않아 POST 가 두 번 실행되지 않는다
 - 업스트림 소켓도 같은 `poll()` 루프에서 논블로킹. 클라이언트가 느리면 업스트림 읽기를 멈춘다 (역압력, 64KB)
 - 응답이 시작되기 전의 실패는 502/504, 시작된 뒤의 실패는 받은 데까지 보내고 닫는다
 
@@ -135,8 +135,8 @@ flowchart LR
 ```
 
 - **소켓·시간·상태는 `server.c` 하나가 갖는다.** 파서·응답·정적 파일·앱·프록시 정책은 "바이트 → 바이트" 함수라서 서버를 띄우지 않고 단위 테스트한다
-- **`read`·`write` 는 부를 때마다 한 번.** 막히면 루프로 돌아가고 다른 연결을 처리한다. 파서는 상태를 저장하지 않아 덜 온 요청은 더 읽은 뒤 처음부터 다시 보고, 본문만 남았으면 다 모일 때까지 파서를 부르지 않는다 ([#24](docs/decisions.md))
-- **경로는 파서가 정규형 하나로 만든다.** 라우팅·앱·백엔드 전달이 모두 그 문자열을 써서 `/%61pi/echo`, `//api/echo` 같은 표기로 프록시 라우트를 건너뛸 수 없다 ([#31](docs/decisions.md))
+- **`read`·`write` 는 부를 때마다 한 번.** 막히면 루프로 돌아가고 다른 연결을 처리한다. 파서는 상태를 저장하지 않아 덜 온 요청은 더 읽은 뒤 처음부터 다시 보고, 본문만 남았으면 다 모일 때까지 파서를 부르지 않는다 ([PR #24](https://github.com/stereokkh/jungle-webserver/pull/24))
+- **경로는 파서가 정규형 하나로 만든다.** 라우팅·앱·백엔드 전달이 모두 그 문자열을 써서 `/%61pi/echo`, `//api/echo` 같은 표기로 프록시 라우트를 건너뛸 수 없다 ([#31](https://github.com/stereokkh/jungle-webserver/issues/31))
 - **타임아웃은 타이머 스레드 없이** 가장 이른 마감을 `poll()` 대기 시간으로 쓴다. 유휴 10초, 요청 하나 30초(slow loris), 업스트림 5초
 
 <details>

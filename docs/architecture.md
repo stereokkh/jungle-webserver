@@ -242,8 +242,8 @@ flowchart TD
 | `CLIENT_REQUEST_TIMEOUT_MS` | 30초 | 지금 요청의 **첫 바이트** | 응답 없이 닫기 (slow loris) |
 | `CLIENT_LINGER_TIMEOUT_MS` | 2초 | `shutdown(SHUT_WR)` | 닫기 |
 | `UPSTREAM_TIMEOUT_MS` | 5초 | 응답 시작 전: 프록시에 넘긴 때 / 시작 후: 마지막 업스트림 바이트 | 시작 전 504 / 시작 후 남은 out 보내고 닫기 |
-| `PROXY_CONNECT_TIMEOUT_MS` | 1초 | 이번 시도의 connect 시작 | `failover=timeout` 이면 다음 백엔드, 아니면 504 |
-| `PROXY_BACKEND_DOWN_MS` | 10초 | connect 가 실패한 때 | 그동안 그 백엔드를 고르지 않음 (failover 라우트만) |
+| `PROXY_CONNECT_TIMEOUT_MS` | 1초 | 이번 시도의 connect 시작 | `failover=timeout` 라우트에서만 잼 → 다음 백엔드 (아니면 전체 마감 5초까지 기다림) |
+| `PROXY_BACKEND_DOWN_MS` | 10초 | connect 오류·시간 초과가 난 때 | 그동안 그 백엔드를 고르지 않음 (failover 라우트만) |
 
 - `conn_deadline()` 이 상태별로 가장 이른 마감을 계산하고, `expire_idle()` 이 전체 연결을 돌며 지난 것은 닫고, 남은 것 중 최소값을 `poll` 대기 시간으로 쓴다. 타이머 스레드가 없다
 - 시계는 `CLOCK_MONOTONIC`. 벽시계는 시스템 시간을 바꾸면 뒤로 간다
