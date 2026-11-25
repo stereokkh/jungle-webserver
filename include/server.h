@@ -75,6 +75,7 @@ typedef struct {
     const char *docroot;     /* -r */
     const char *proxy_conf;  /* -c (없으면 NULL → 프록시 없는 백엔드 인스턴스) */
     int merge_slashes;       /* --merge-slashes: 경로의 빈 조각 "//" 를 400 대신 "/" 로 합친다 (#31) */
+    int access_log;          /* --access-log: 연결 열림·요청·닫힘을 stderr 에 한 줄씩 (기본 꺼짐) */
 } server_config;
 
 /* 이벤트 루프를 돌린다. 시그널로 정상 종료하면 0, 초기화 실패 시 -1 */

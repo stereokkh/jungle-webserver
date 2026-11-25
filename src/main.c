@@ -4,7 +4,7 @@
  * CS:APP 대응: tiny.c main() 의 인자 검사 부분 (이벤트 루프는 server.c)
  *   Tiny 는 포트 하나만 받고 docroot 는 현재 디렉터리(".")로 고정이다.
  *   여기서는 docroot 를 -r 로 받고, 서버를 띄우기 전에 잘못된 인자는 바로 exit 1 한다.
- *   긴 옵션 --merge-slashes (#31) 는 getopt 전에 직접 빼낸다 (take_long_options).
+ *   긴 옵션 --merge-slashes (#31), --access-log 는 getopt 전에 직접 빼낸다 (take_long_options).
  * 담당: 트랙 A · 이슈 #7, #31
  */
 #include "server.h"
@@ -19,7 +19,7 @@
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s -p <port> -r <docroot> [-c <proxy.conf>] [--merge-slashes]\n", prog);
+    fprintf(stderr, "usage: %s -p <port> -r <docroot> [-c <proxy.conf>] [--merge-slashes] [--access-log]\n", prog);
 }
 
 /*
@@ -50,6 +50,8 @@ static int take_long_options(int *argc, char **argv, server_config *cfg)
         }
         if (strcmp(a, "--merge-slashes") == 0) {
             cfg->merge_slashes = 1;
+        } else if (strcmp(a, "--access-log") == 0) {
+            cfg->access_log = 1;
         } else {
             fprintf(stderr, "webserver: unknown option '%s'\n", a);
             return -1;
@@ -82,7 +84,7 @@ static int valid_port(const char *s)
 
 int main(int argc, char **argv)
 {
-    server_config cfg = { NULL, NULL, NULL, 0 };
+    server_config cfg = { NULL, NULL, NULL, 0, 0 };
     struct stat st;
     int opt;
 
