@@ -3,7 +3,7 @@
  *
  * 소켓 없이 바이트를 먹이고 out 에 쌓인 것을 비교한다. 입력은 전부 NUL 종료 없는 정확한 크기의
  * 힙 복사본으로 넘겨서 머리 해석이 길이를 넘어 읽으면 make asan 이 잡는다.
- * Round-Robin(proxy_next_backend)은 tests/unit/test_contract.c 에 있다.
+ * Round-Robin(proxy_rr_begin·proxy_pick_backend)은 tests/unit/test_contract.c 와 test_proxy_config.c 에 있다.
  */
 #include <stdint.h>
 

@@ -6,11 +6,12 @@
  *   응답 중계(proxy_relay_*, 머리 해석 + 본문 길이 판단)는 #9 에서 구현했다.
  *   소켓을 만지는 것은 connect 두 함수뿐이고, proxy_relay_* 는 바이트와 buffer 만 다루는 순수 함수다
  *   (단위 테스트 tests/unit/test_proxy_relay.c). poll 루프와 read/write 는 server.c 몫이다.
- * 흐름 (#9): handler_route → ROUTE_PROXY → proxy_next_backend → proxy_connect_start
+ * 흐름 (#9): handler_route → ROUTE_PROXY → proxy_rr_begin·proxy_pick_backend → proxy_connect_start
  *   → POLLOUT 에서 SO_ERROR 확인 → 요청 송신 → 응답 수신 → 클라이언트로 중계
  *   - 응답 시작 전 실패: 502 (연결 실패·깨진 응답) / 504 (타임아웃)
  *   - 응답 시작 후 실패: 연결 종료 + 자원 회수
- *   - 자동 재시도 없음
+ *   - 페일오버 (라우트에 failover= 가 있을 때만): connect 실패·connect 시간 초과일 때만 다른 백엔드로 넘긴다.
+ *     요청 바이트를 보내기 시작한 뒤의 실패는 넘기지 않는다 (같은 요청이 두 번 실행되지 않게). 규칙은 proxy.h, proxy_config.h
  * 담당: 트랙 B · 이슈 #8 (proxy_build_request), #9 (나머지)
  */
 #include "proxy.h"
@@ -229,26 +230,33 @@ int proxy_connect_start(const proxy_backend *backend)
 
     if (backend == NULL) {
         errno = EINVAL;
-        return -1;
+        return PROXY_CONNECT_LOCAL;
     }
+    /* socket()·논블로킹 설정 실패는 이쪽 자원 문제(EMFILE 등)다. connect 를 해 보지 않았으니 백엔드 탓이 아니라서
+     * PROXY_CONNECT_LOCAL 로 구별해 돌려준다 (서버가 이 백엔드에 죽은 표시를 붙이지 않게).
+     * connect 가 EADDRNOTAVAIL 로 실패하는 것도 같다 (아래) */
     fd = socket(((const struct sockaddr *)&backend->addr)->sa_family, SOCK_STREAM, 0);
     if (fd < 0)
-        return -1;
-    if (net_set_nonblocking(fd) < 0)
-        goto fail;
+        return PROXY_CONNECT_LOCAL;
+    if (net_set_nonblocking(fd) < 0) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return PROXY_CONNECT_LOCAL;
+    }
     /* 논블로킹 connect 는 보통 EINPROGRESS 로 돌아오고 결과는 POLLOUT 뒤 SO_ERROR 로 본다.
      * EINTR 도 연결은 커널이 이어서 하는 중이다 (다시 connect 를 부르면 EALREADY).
      * 0 이어도 fd 를 돌려줘 서버는 같은 길(POLLOUT → proxy_connect_result)을 탄다 */
     if (connect(fd, (const struct sockaddr *)&backend->addr, backend->addrlen) < 0
-        && errno != EINPROGRESS && errno != EINTR)
-        goto fail;
+        && errno != EINPROGRESS && errno != EINTR) {
+        saved = errno;              /* 동기 connect 실패 (ENETUNREACH, ECONNREFUSED 등): 백엔드에 닿지 못한 것 */
+        close(fd);
+        errno = saved;
+        /* EADDRNOTAVAIL 은 백엔드가 아니라 이쪽 문제다: 리눅스는 쓸 임시 포트(ephemeral port)가 바닥나면 connect 에서 이 오류를 낸다.
+         * socket() 실패와 같이 PROXY_CONNECT_LOCAL 로 돌려줘 멀쩡한 백엔드에 죽은 표시가 붙지 않게 한다 */
+        return saved == EADDRNOTAVAIL ? PROXY_CONNECT_LOCAL : -1;
+    }
     return fd;
-
-fail:
-    saved = errno;
-    close(fd);
-    errno = saved;
-    return -1;
 }
 
 int proxy_connect_result(int fd)

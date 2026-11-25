@@ -107,16 +107,21 @@ static void test_static_close_idempotent(void)
     CHECK_INT(f.fd, -1);
 }
 
-static void test_next_backend_null_safe(void)
+static void test_pick_backend_null_safe(void)
 {
     proxy_route route;
     memset(&route, 0, sizeof route);
-    CHECK(proxy_next_backend(NULL) == NULL);
-    CHECK(proxy_next_backend(&route) == NULL);
+    CHECK_INT(proxy_rr_begin(NULL), 0);
+    CHECK_INT(proxy_rr_begin(&route), 0);               /* 주 백엔드 없음 */
+    CHECK_INT(proxy_pick_backend(NULL, 0, 0, 0), -1);
+    CHECK_INT(proxy_pick_backend(&route, 0, 0, 0), -1);
+    proxy_mark_down(NULL, 0, 0);                        /* 아무 일도 없다 */
+    proxy_mark_down(&route, 0, 0);
 }
 
-/* Round-Robin (#9): 백엔드 셋이면 0, 1, 2, 0 ...  하나면 늘 0. 라우트마다 순번이 따로다 */
-static void test_next_backend_round_robin(void)
+/* Round-Robin (#9): 백엔드 셋이면 0, 1, 2, 0 ...  하나면 늘 0. 라우트마다 순번이 따로다.
+ * 요청 하나 = proxy_rr_begin 한 번 + proxy_pick_backend (모두 0 인 route 는 전부 주 백엔드, 페일오버 꺼짐, 안 죽음) */
+static void test_pick_backend_round_robin(void)
 {
     static proxy_route a, b;                    /* 수 KB 라서 스택에 두지 않는다 */
     size_t i;
@@ -125,23 +130,23 @@ static void test_next_backend_round_robin(void)
     memset(&b, 0, sizeof b);
     a.nbackends = 3;
     for (i = 0; i < 7; i++)
-        CHECK(proxy_next_backend(&a) == &a.backends[i % 3]);
+        CHECK_INT(proxy_pick_backend(&a, 0, 0, proxy_rr_begin(&a)), i % 3);
     CHECK_INT(a.next, 7 % 3);
 
     b.nbackends = 1;
     for (i = 0; i < 4; i++)
-        CHECK(proxy_next_backend(&b) == &b.backends[0]);
+        CHECK_INT(proxy_pick_backend(&b, 0, 0, proxy_rr_begin(&b)), 0);
     CHECK_INT(b.next, 0);
 
     b.nbackends = 2;                            /* 다른 라우트의 호출이 a 의 순번을 건드리지 않는다 */
-    CHECK(proxy_next_backend(&b) == &b.backends[0]);
-    CHECK(proxy_next_backend(&b) == &b.backends[1]);
-    CHECK(proxy_next_backend(&a) == &a.backends[1]);
+    CHECK_INT(proxy_pick_backend(&b, 0, 0, proxy_rr_begin(&b)), 0);
+    CHECK_INT(proxy_pick_backend(&b, 0, 0, proxy_rr_begin(&b)), 1);
+    CHECK_INT(proxy_pick_backend(&a, 0, 0, proxy_rr_begin(&a)), 1);
 
     a.next = 99;                                /* 범위 밖 순번도 나머지로 맞춘다 */
-    CHECK(proxy_next_backend(&a) == &a.backends[99 % 3]);
+    CHECK_INT(proxy_pick_backend(&a, 0, 0, proxy_rr_begin(&a)), 99 % 3);
     a.nbackends = 0;
-    CHECK(proxy_next_backend(&a) == NULL);
+    CHECK_INT(proxy_pick_backend(&a, 0, 0, proxy_rr_begin(&a)), -1);
 }
 
 int main(void)
@@ -152,7 +157,7 @@ int main(void)
     RUN(test_route_without_proxy);
     RUN(test_app_match_prefix_only);
     RUN(test_static_close_idempotent);
-    RUN(test_next_backend_null_safe);
-    RUN(test_next_backend_round_robin);
+    RUN(test_pick_backend_null_safe);
+    RUN(test_pick_backend_round_robin);
     return test_report();
 }

@@ -23,9 +23,9 @@
 |---|---|---|
 | 동시성 | **처음부터 `poll()` 이벤트 루프** (논블로킹). 블로킹 서버를 먼저 만들고 갈아엎지 않는다 | 팀 이식성 규칙, 느린 클라이언트 격리, 재작성 비용 회피 |
 | 동적 처리 | **서버 내장 앱 라우트** `GET /api/add`, `POST /api/echo`. CGI는 하지 않는다 | 과제가 "CGI 또는 백엔드 전달"을 허용. poll 루프 안의 CGI 파이프·`waitpid`는 서버 전체를 막을 위험 |
-| 프록시 | **Reverse Proxy만** (경로 최장 접두사 라우팅, 502/504, 마지막에 Round-Robin). 백엔드는 같은 바이너리를 프록시 설정 없이 다른 포트로 실행 | 외부 인터넷 없이 결정적 테스트 가능 |
+| 프록시 | **Reverse Proxy만** (경로 최장 접두사 라우팅, 502/504, 마지막에 Round-Robin). 백엔드는 같은 바이너리를 프록시 설정 없이 다른 포트로 실행. 라우트 옵션으로 **페일오버**(`backup=`, `failover=`, `tries=`, 2026-11-25): connect 실패·connect 시간 초과일 때만, 요청을 업스트림에 쓰기 전에만 다른 백엔드로 넘긴다. 기본은 꺼짐(예전 동작) | 외부 인터넷 없이 결정적 테스트 가능. 요청을 보낸 뒤에는 넘기지 않아 같은 요청이 두 번 실행되지 않는다 |
 | 처리 순서 | 프록시 경로 → 내장 앱 경로 → 정적 파일 | 백엔드 인스턴스에서 프록시 순환 방지 |
-| 범위 밖 | CGI, Forward Proxy, 캐시, 백엔드 장애 시 자동 재시도/페일오버, chunked, TLS | 4.5일 일정. 필요하면 마감 후 후속 이슈로 |
+| 범위 밖 | CGI, Forward Proxy, 캐시, 요청을 업스트림에 보낸 뒤의 자동 재시도(페일오버는 11-25 부터 범위 안, 위 프록시 행), chunked, TLS | 4.5일 일정. 필요하면 마감 후 후속 이슈로 |
 
 구현 시 지킬 계약 (모듈 연결·버퍼 소유권·반환값 규칙은 `docs/interfaces.md`, 함수별 계약은 각 헤더 주석):
 
@@ -36,6 +36,7 @@
 - 송신은 진행 상태(offset)를 저장하고, 막히면(`EAGAIN`) 이벤트 루프에 제어권을 돌려준다. 루프 안에서 끝날 때까지 `write` 를 반복하지 않는다
 - 백엔드 주소는 설정 로드 시 `getaddrinfo` 로 한 번 해석한다. 요청 처리 중에는 이름 해석을 하지 않는다
 - 응답 송신 시작 전 실패는 502/504, 시작 후 실패는 연결 종료 + 자원 회수
+- 페일오버는 요청 바이트를 업스트림에 쓰기 전(`CONN_UP_CONNECTING`)에만 한다. 전체 마감(`UPSTREAM_TIMEOUT_MS`)은 첫 시도부터 한 번만 잰다. 백엔드 선택·죽은 표시는 `proxy_config.c` 의 순수 함수(`proxy_rr_begin`, `proxy_pick_backend`, `proxy_mark_down`)에 둔다. 결정은 `docs/decisions.md` 2026-11-25
 - 종료(`SIGINT`/`SIGTERM`) 시 listen 소켓뿐 아니라 모든 연결·파일·업스트림을 정리한다
 
 파일 구조와 CS:APP Tiny 대응 (각 파일 맨 위 주석에 자세히):
@@ -54,7 +55,7 @@
 | `proxy` | 없음 | B · #8, #9 |
 | `buffer` | `rio_t` 내부 버퍼 (고정 배열 대신 늘어나는 버퍼) | A · #4 |
 
-- 모든 모듈(`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config`, `proxy`)이 구현·테스트 완료됐다 (`proxy` 의 connect·응답 중계는 #9, 리뷰 대기). 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
+- 모든 모듈(`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config`, `proxy`)이 구현·테스트 완료됐다 (`proxy` 의 connect·응답 중계는 #9, 리뷰 대기). 프록시 페일오버(11-25)는 `proxy_config`(옵션 읽기·선택)와 `server.c`(`CONN_UP_CONNECTING` 에서 다음 백엔드로)에 들어 있고, 리뷰 대기다. 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
 - `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 프록시(#9)는 업스트림 상태(`CONN_UP_CONNECTING/SENDING/RECEIVING`)로 중계한다 (구현함, 리뷰 대기: 연결이 pollfd 를 둘 쓰고, 응답은 머리만 해석해 받은 바이트를 그대로 넘기며, 중계가 끝나면 클라이언트 연결을 닫는다. 결정은 `docs/decisions.md` 2026-11-23). 앱(#10)도 연결 완료됐다
 

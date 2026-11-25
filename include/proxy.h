@@ -5,17 +5,21 @@
  * 담당: 트랙 B · 이슈 #8 (proxy_build_request: 요청 다시 쓰기), #9 (connect·중계, 이벤트 루프 통합은 A와 협업)
  *
  * 서버(server.c)에서 쓰는 순서 (#9 에서 A·B 가 함께 확정):
- *   1. handler_route → ROUTE_PROXY, route → proxy_next_backend(route)   (Round-Robin, C9)
+ *   1. handler_route → ROUTE_PROXY, route → proxy_rr_begin(route) 로 Round-Robin 시작 위치 (C9),
+ *      proxy_pick_backend(route, now, tried, rr_start) 로 백엔드 선택 (둘 다 proxy_config.h)
  *   2. proxy_build_request(req, backend, client_ip, &up_out)   ← 입력 버퍼 consume 전에. 실패면 431 (결정 6)
- *   3. fd = proxy_connect_start(backend) → 실패면 502
- *   4. upstream POLLOUT·POLLERR·POLLHUP → proxy_connect_result(fd) 가 0 이 아니면 502 → up_out 송신
+ *   3. fd = proxy_connect_start(backend) → 실패면 (페일오버가 꺼져 있으면) 502
+ *   4. upstream POLLOUT·POLLERR·POLLHUP → proxy_connect_result(fd) 가 0 이 아니면 (페일오버가 꺼져 있으면) 502 → up_out 송신
  *   5. upstream POLLIN → proxy_relay_want 만큼 read → proxy_relay_input 으로 클라이언트 out 버퍼에 중계
  *      (EOF·read 오류는 proxy_relay_eof)
  *   - 응답 시작 전 실패 502, UPSTREAM_TIMEOUT_MS 초과 504, 시작 후 실패는 남은 out 을 보내고 연결 종료
- *   - 자동 재시도 없음
+ *   - 페일오버 (라우트에 failover= 가 있을 때만, 결정 2026-11-25): 3·4 의 connect 실패와 connect 시간 초과
+ *     (PROXY_CONNECT_TIMEOUT_MS)에서만 다른 백엔드로 2 부터 다시 한다. 요청 바이트를 보내기 시작한 뒤(5 이후, 4 의 송신 포함)의
+ *     실패는 예전 그대로 502/504/연결 종료다. 그래서 같은 요청이 두 백엔드에서 실행되는 일이 없다.
+ *     2 를 다시 하므로 Host 가 새 백엔드 이름으로 바뀐다. 요청이 끝난 뒤의 자동 재시도는 하지 않는다
  *
  * 결정 1-6 은 상철님이 11-23 설계 문답에서 정했고, C1-C9 는 구현 중 정해 11-23 확인했다.
- *   C1-C5: 아래 "응답 중계" 블록. C6-C8: server.c 쪽 (docs/decisions.md). C9: proxy_next_backend 가
+ *   C1-C5: 아래 "응답 중계" 블록. C6-C8: server.c 쪽 (docs/decisions.md). C9: proxy_rr_begin 이
  *   라우트마다 next 를 돌려 Round-Robin (proxy_config.c)
  */
 #ifndef PROXY_H
@@ -75,8 +79,15 @@
 int proxy_build_request(const http_request *req, const proxy_backend *backend,
                         const char *client_ip, buffer *out);
 
-/* 논블로킹 connect 시작. 성공(진행 중 포함): fd, 실패: -1 (errno 유지). connect 가 0 이어도 fd 를 돌려주고
- * 서버는 똑같이 POLLOUT 을 기다린다. EINPROGRESS·EINTR 은 진행 중으로 본다.
+/* proxy_connect_start 의 실패 두 가지 (둘 다 errno 를 남긴다).
+ *   -1                    connect 가 동기적으로 실패했다 (ENETUNREACH, ECONNREFUSED 등): 백엔드에 닿지 못한 것
+ *   PROXY_CONNECT_LOCAL   이쪽 문제로 연결하지 못했다: socket() 이 EMFILE·ENFILE·ENOBUFS·ENOMEM 등으로 실패, 논블로킹 설정 실패,
+ *                         또는 connect 가 EADDRNOTAVAIL (리눅스에서 임시 포트가 바닥남. 로컬 주소를 못 얻은 것).
+ *                         백엔드 탓이 아니므로 호출자는 이 백엔드에 죽은 표시를 붙이면 안 된다 (시도 횟수에는 센다) */
+#define PROXY_CONNECT_LOCAL (-2)
+
+/* 논블로킹 connect 시작. 성공(진행 중 포함): fd (0 이상), 실패: -1 또는 PROXY_CONNECT_LOCAL (errno 유지, 위).
+ * connect 가 0 이어도 fd 를 돌려주고 서버는 똑같이 POLLOUT 을 기다린다. EINPROGRESS·EINTR 은 진행 중으로 본다.
  * (EINTR 뒤에는 connect 를 다시 부르지 않는다. 연결은 커널이 이어서 하고, 다시 부르면 EALREADY 가 난다)
  * fd 는 서버가 닫는다 */
 int proxy_connect_start(const proxy_backend *backend);
