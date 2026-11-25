@@ -45,6 +45,7 @@
 |---|---|---|
 | `net` | `open_listenfd` | A · #7 |
 | `server` | `main` 의 반복 accept 루프 → poll 이벤트 루프 | A · #7 |
+| `ev` (`ev_poll.c`, `ev_epoll.c`) | 없음. 이벤트 대기 계층: 기본 poll, `make EVENT=epoll` (명세 `docs/event-backend.md`, [제안] 단계) | 상철 제안, A 리뷰 |
 | `handler` | `doit` 의 정적/동적 분기 → 프록시 → 앱 → 정적 | A(틀) · #4, #8, #10 |
 | `http_request` | `doit` 요청 라인, `read_requesthdrs`, `parse_uri` | B · #5 |
 | `http_response` | `clienterror`, `serve_static` 헤더 | C · #6 |
@@ -83,7 +84,7 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 | `MSG_NOSIGNAL` | 시작 시 `signal(SIGPIPE, SIG_IGN)` |
 | `socket(..., SOCK_NONBLOCK)`, `accept4()` | `fcntl(fd, F_SETFL, O_NONBLOCK)` |
 | `gethostbyname()` | `getaddrinfo()` (IPv4/IPv6) |
-| `epoll` / `kqueue` 를 기본 경로로 | `poll()` 기본, epoll/kqueue는 나중에 최적화로만 |
+| `epoll` / `kqueue` 를 기본 경로로 | `poll()` 기본, epoll/kqueue는 `make EVENT=...` 선택 빌드로만 (`src/ev_<이름>.c` 한 파일에 OS 분기를 모은다) |
 | `sendfile()` | `read`/`write` 루프 (시그니처가 OS마다 다름) |
 
 - `struct sockaddr_*` 는 사용 전 반드시 `memset` 0 초기화 (macOS에는 `sin_len` 필드가 있음)
@@ -103,7 +104,7 @@ scripts/    보조 스크립트 (fetch-tiny.sh: Tiny 받기·빌드, claude-sync
 classic/    (gitignore) make classic 으로 받은 Tiny 원본. 커밋 금지
 docker/     검증용 Dockerfile (ubuntu, alpine) — 배포용 아님
 .github/    CI (ci.yml), main 보호 검사 (main-guard.yml), PR/이슈 템플릿
-docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), benchmark.md (처리량·Tiny 비교·프록시 경유, #11)
+docs/       decisions.md (결정 기록), interfaces.md (모듈 연결 약속), event-backend.md (이벤트 대기 계층 ev.h 명세), classic.md (Tiny 관찰 → 개선 요약 표, #3), api.md (사용법·지원 범위·운영 제약), benchmark.md (처리량·Tiny 비교·프록시 경유, #11)
 .claude/    settings.json (팀 공용 훅: 세션 동기화)
 www/        정적 파일 예제
 ```
@@ -117,6 +118,7 @@ make test                               # 빌드 + 단위 테스트 + 스모크 
 make asan                               # ASan+UBSan 으로 build/asan/ 에 따로 빌드해 make test (Alpine 불가)
 make WERROR=1                           # 경고를 에러로 (CI와 동일)
 make CC=clang                           # 컴파일러 지정
+make EVENT=epoll                        # 이벤트 대기를 epoll 로 (Linux). test·asan·docker-test 에도 붙일 수 있다
 make docker-test [DISTRO=alpine] [CC=clang]   # 컨테이너에서 빌드+테스트
 make docker-test-all                    # Ubuntu + Alpine
 make docker-shell DISTRO=alpine         # 컨테이너 안 셸
@@ -205,6 +207,7 @@ Claude의 노션 사용 범위:
 ## 아직 하지 않은 것 (나중에 할 일)
 
 - 서버 구현: poll 루프·CLI·종료·모듈 연결·keep-alive(#7), 프록시 설정·요청 재작성(#8), 앱(#10), 프록시 중계(#9, PR #36) 완료. 정적 파일 keep-alive 의 약 44ms 지연은 받은 연결에 `TCP_NODELAY` 를 켜서 해결 (PR #43). `docs/benchmark.md` 의 keep-alive 표는 PR #43 빌드로 다시 쟀다
+- 이벤트 대기 계층 `ev.h` ([제안], 리뷰 대기): poll·epoll 구현됨. kqueue 백엔드(`src/ev_kqueue.c`)와 그 CI 항목은 아직 (`docs/event-backend.md` "구현 상태"). poll·epoll·kqueue 부하 비교도 아직
 - `tests/run.sh` 는 서버를 백그라운드로 띄워 검사한다 (준비 대기 최대 5초, 종료 대기는 `wait_exit`). 서버 동작 테스트는 여기에 추가한다. 응답은 상태 코드와 필요한 줄만 검사한다 (Date 가 매초 바뀜). 30초 요청 타임아웃처럼 오래 걸리는 동작은 넣지 않고 `-DCLIENT_REQUEST_TIMEOUT_MS=2000` 으로 따로 빌드해 손으로 확인한다
 - 배포용 Docker 이미지 (빌드된 바이너리만 담는 작은 이미지). 마감 범위 밖
 - 팀원 Collaborator 초대는 완료. develop 필수 리뷰 수 1 (교차 리뷰), main 은 0 유지 (develop 에서 이미 리뷰됨)

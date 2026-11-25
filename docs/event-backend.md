@@ -167,7 +167,7 @@ epoll 은 `epoll_event.data.u64` 에, kqueue 는 `kevent.udata` 에 `(void *)(ui
 - **결정**: `CONN_UP_*` 동안 클라이언트 fd 는 `ev_pause`. 응답이 시작돼 `out` 에 바이트가 있을 때만 `WS_EV_OUT`. 결정 C6(2026-11-23)의 "events 0 으로 끊김만 감지"를 바꾼다
 - **이유**:
   - kqueue 는 필터를 걸지 않으면 그 fd 소식이 없어 "끊김만 감지"를 그대로 옮길 수 없다. `EVFILT_READ` 를 걸면 파이프라이닝으로 이미 들어와 있는 바이트 때문에 레벨 트리거로 계속 깬다
-  - 지금 poll 이 이 경로로 감지하는 것은 **RST 뿐**이다. 클라이언트가 평범하게 `close()` 하면 FIN 만 오고, Linux 는 양방향이 다 닫혀야 `POLLHUP` 을 준다. 응답 시작 전에는 서버가 클라이언트에 아무것도 보내지 않아 RST 가 올 일도 드물다 (지식으로 판단, 실행 확인 안 함)
+  - 지금 poll 이 이 경로로 감지하는 것은 **RST 뿐**이다. 클라이언트가 평범하게 `close()` 하면 FIN 만 오고, Linux 는 양방향이 다 닫혀야 `POLLHUP` 을 준다. 응답 시작 전에는 서버가 클라이언트에 아무것도 보내지 않아 RST 가 올 일도 드물다 (11-25 WSL Ubuntu 22.04 에서 확인: events 0 으로 poll 하면 FIN 뒤에는 아무것도, RST 뒤에는 `POLLERR|POLLHUP`)
   - 그래서 잃는 것은 "드물게 RST 를 보낸 클라이언트를 응답을 쓸 때(`EPIPE`)나 마감(`UPSTREAM_TIMEOUT_MS` 5초) 때 알게 된다" 정도다. 그동안 업스트림 연결을 붙잡고 있을 수 있다
   - 다른 안: kqueue 만 `NOTE_LOWAT` 를 크게 걸어 EOF 로만 깨우기 → kqueue 만 FIN 에도 끊어 백엔드 동작이 달라지고, 그 동작도 macOS 확인이 필요한 추측이라 버림. kqueue 만 pause → 백엔드 동작이 달라 비교 측정에 섞여 버림
 - **영향**: `server.c` `build_interest`, `up_on_client_event` (ERR·HUP 분기는 `WS_EV_OUT` 을 걸었을 때만 들어온다), `docs/decisions.md` 에 C6 변경 항목, `docs/interfaces.md` 105행
@@ -231,8 +231,16 @@ epoll 은 `epoll_event.data.u64` 에, kqueue 는 `kevent.udata` 에 `(void *)(ui
 - `SERVER_MAX_CONNS` 가 1024 라 그 이상은 accept 하자마자 닫는다. 연결 수 10..10000 비교는 이 값을 올려야 한다 (`server.h`, A 트랙 파일. `#ifndef` 가 아니라 `-D` 로 못 바꾼다). WSL 의 `ulimit -n` 은 10240.
 - 백엔드와 상관없이 서버는 바퀴마다 모든 칸을 훑는다 (`expire_idle`, `build_interest`, 둘 다 `SERVER_MAX_CONNS` 번).
 
-## 이 PR 에 든 것과 아직 없는 것
+## 구현 상태 (브랜치 `feat/ev-backend`)
 
-- 이 PR: 이 문서와 `include/ev.h` (인터페이스만. 아직 어떤 `.c` 도 쓰지 않아 빌드에 영향이 없다), `docs/decisions.md` 의 [제안] 항목.
-- 상철 로컬에 참고 구현이 있다 (`src/ev_poll.c`, `src/ev_epoll.c`, `server.c` 수정). **빌드·테스트를 한 번도 안 했고**, 결정 1(프록시 중 클라이언트 pause)과 결정 2의 `EINVAL` 검사가 빠진 이전 버전이라 올리지 않았다. 이 제안으로 가기로 하면 브랜치로 올린다.
-- 아직 없음: Makefile `EVENT`, CI 항목, `tests/unit/test_ev.c`, `src/ev_kqueue.c`, README·CLAUDE.md·`interfaces.md` 수정 (9장).
+| 항목 | 상태 |
+|---|---|
+| `include/ev.h` | 3장 그대로 |
+| `src/ev_poll.c` | 구현 (기본) |
+| `src/ev_epoll.c` | 구현 (`regs[]` 에 fd 별 등록 기록, 바뀔 때만 `epoll_ctl`, `ev_forget` 은 기록만 지움) |
+| `src/ev_kqueue.c` | **없음** (혜성님 담당). 없을 때 `make EVENT=kqueue` 는 "not written yet" 으로 멈춘다 |
+| `src/server.c` | `build_interest`, `dispatch`, `close_watched`, tag·칸 세대, 결정 1 반영 |
+| Makefile | `EVENT`, 빈 값 = poll, 모르는 값 오류, 스탬프로 다시 링크 |
+| CI | `ubuntu-latest / gcc / epoll` (필수 아님), asan 잡에 epoll 단계. kqueue 항목은 `ev_kqueue.c` 가 생기면 추가 |
+| `tests/unit/test_ev.c` | 7장 1~6 + 두 fd 동시, 등록 안 한 fd pause, 빈 목록 |
+| 문서 | README, CLAUDE.md, `interfaces.md`, `server.h` 주석 (9장) |

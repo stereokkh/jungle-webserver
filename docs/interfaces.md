@@ -74,6 +74,8 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
 
 ## 연결 상태와 타임아웃 (`server.c`, `server.h`)
 
+이벤트 이름은 poll 기준이다. 실제로는 `include/ev.h` 의 `WS_EV_IN`/`WS_EV_OUT` 으로 감시하고 백엔드(poll·epoll)가 옮긴다 (`docs/event-backend.md` 4장의 상태별 표).
+
 | 상태 | poll 이벤트 | 다음 |
 |---|---|---|
 | `CONN_READING` | 클라이언트 POLLIN | 요청 완성 → 응답 준비 후 `CONN_WRITING` |
@@ -102,7 +104,8 @@ CS:APP Tiny의 `doit()` 한 함수가 하던 일을 나눈 것이다. A는 `main
   - 중계 상한: 클라이언트 `out` 에 대기한 바이트가 `PROXY_RELAY_MAX`(64KB) 이상이면 업스트림을 읽지 않는다 (역압력). 그래서 `BUFFER_MAX` 보다 큰 응답도 모으지 않고 흘려보낸다
   - 응답 시작 = 머리 해석이 끝나 상태 줄 검사를 통과하고 머리 바이트를 `out` 에 넣은 때. 그 전 실패는 502/504, 그 뒤는 `out` 에 있는 것까지 보내고 닫는다 (요청을 보낸 뒤의 재시도는 없다. 응답 시작 전 connect 단계의 페일오버만 아래 "프록시 페일오버")
   - 본문 없음: 요청이 `HEAD` 이거나 상태가 204·304 이면 `Content-Length` 가 있어도 본문이 없다. `Transfer-Encoding` 이 있으면 업스트림 EOF 까지가 본문이다
-  - 한 연결이 pollfd 를 최대 둘 쓴다 (클라이언트, 업스트림). 프록시 중에는 클라이언트 입력을 읽지 않고 (`events` 0, 끊김만 감지), 응답이 시작돼 `out` 에 바이트가 있을 때만 클라이언트 POLLOUT 을 본다
+  - 한 연결이 감시할 fd 를 최대 둘 쓴다 (클라이언트, 업스트림). 프록시 중에는 클라이언트 fd 를 보지 않고 (`ev_pause`), 응답이 시작돼 `out` 에 바이트가 있을 때만 클라이언트 POLLOUT 을 본다. 예전에는 `events` 0 으로 끊김만 감지했으나 kqueue 와 동작을 맞추려고 바꿨다 (`docs/event-backend.md` 결정 1)
+  - 감시하던 fd 는 `close_watched` (`ev_forget` + `close`) 로만 닫는다. 페일오버가 닫자마자 연 새 업스트림 fd 가 같은 번호를 받아도 epoll 이 새 fd 를 등록하게 한다
   - 업스트림 fd 는 `conn_close` 뿐 아니라 응답 끝·실패 때 `up_release` 가 닫는다 (`upstream_fd = -1` 로 두 번 닫기를 막는다)
 - `SIGINT`/`SIGTERM`: 새 연결을 받지 않고 모든 `conn` 을 `conn_close` 한 뒤 `server_run` 이 0 을 반환한다
 

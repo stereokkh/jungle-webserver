@@ -17,8 +17,8 @@
   3. 등록 실패는 그 자리에서 -1 (kqueue 도 변경을 모으지 않는다)
   4. tag 는 64비트 (kqueue `udata` 에 `uintptr_t` 로)
   5. 이벤트 비트 접두사 `WS_EV_` (`<sys/event.h>` 의 `EV_*` 와 섞이지 않게)
-- **이유**: 원래 목적은 poll 과 epoll/kqueue 를 연결 수별로 비교하는 것이다. 바퀴마다 다시 등록하면 비용 모양이 poll 과 같아 비교할 차이가 작아지므로 등록을 커널에 유지한다. 비교 결과를 백엔드 차이로 읽으려면 세 백엔드의 동작이 같아야 해서 1~3 을 그 기준으로 골랐다. 1 에서 잃는 것: 지금 poll 이 이 경로로 감지하는 것은 RST 뿐이고(평범한 close 의 FIN 으로는 `POLLHUP` 이 오지 않는다), 응답 시작 전에는 RST 가 드물다. 그런 클라이언트는 응답을 쓸 때나 `UPSTREAM_TIMEOUT_MS` 마감 때 닫힌다 (지식으로 판단, 실행 확인 안 함)
-- **영향 (가기로 하면)**: `include/ev.h`, `src/ev_poll.c`, `src/ev_epoll.c`, `src/ev_kqueue.c`, `src/server.c` (트랙 A 파일: `build_interest`, `dispatch`, `close_watched`, tag·칸 세대), Makefile `EVENT`, CI 필수 아닌 epoll·kqueue 항목 (기존 필수 검사 이름은 그대로), `tests/unit/test_ev.c`, `docs/interfaces.md`, README, CLAUDE.md. 이 PR 자체는 명세와 헤더만 넣는다 (빌드 영향 없음)
+- **이유**: 원래 목적은 poll 과 epoll/kqueue 를 연결 수별로 비교하는 것이다. 바퀴마다 다시 등록하면 비용 모양이 poll 과 같아 비교할 차이가 작아지므로 등록을 커널에 유지한다. 비교 결과를 백엔드 차이로 읽으려면 세 백엔드의 동작이 같아야 해서 1~3 을 그 기준으로 골랐다. 1 에서 잃는 것: 지금 poll 이 이 경로로 감지하는 것은 RST 뿐이고(평범한 close 의 FIN 으로는 `POLLHUP` 이 오지 않는다), 응답 시작 전에는 RST 가 드물다. 그런 클라이언트는 응답을 쓸 때나 `UPSTREAM_TIMEOUT_MS` 마감 때 닫힌다 (11-25 WSL Ubuntu 22.04 에서 확인: events 0 인 poll 은 FIN 뒤 아무것도 안 주고 RST 뒤 `POLLERR|POLLHUP`. RST 를 보낸 클라이언트는 poll·epoll 둘 다 5초 마감에 닫혔고 그동안 CPU 0)
+- **영향 (가기로 하면)**: `include/ev.h`, `src/ev_poll.c`, `src/ev_epoll.c`, `src/ev_kqueue.c`, `src/server.c` (트랙 A 파일: `build_interest`, `dispatch`, `close_watched`, tag·칸 세대), Makefile `EVENT`, CI 필수 아닌 epoll·kqueue 항목 (기존 필수 검사 이름은 그대로), `tests/unit/test_ev.c`, `docs/interfaces.md`, README, CLAUDE.md. 명세와 헤더는 PR #55, poll·epoll 구현은 그 위의 `feat/ev-backend`. kqueue 백엔드는 아직 없다
 
 ## 2026-11-25 · 프록시 페일오버: backup=, failover=, tries= (범위 안으로)
 

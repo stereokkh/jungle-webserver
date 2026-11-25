@@ -8,7 +8,8 @@ on:
 
 jobs:
   native:
-    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    # event 가 없는 항목은 이름이 예전 그대로다 (develop 보호 규칙의 필수 검사가 이 이름으로 걸려 있어 바꾸면 안 된다)
+    name: ${{ matrix.os }} / ${{ matrix.cc }}${{ matrix.event && format(' / {0}', matrix.event) || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -16,13 +17,16 @@ jobs:
           - { os: ubuntu-latest, cc: gcc }
           - { os: ubuntu-latest, cc: clang }
           - { os: macos-latest,  cc: clang }
+          # 필수 검사 아님. poll 대신 epoll 백엔드로 같은 테스트 (docs/event-backend.md)
+          - { os: ubuntu-latest, cc: gcc, event: epoll }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      # EVENT 가 비면 Makefile 이 poll 로 본다
       - name: Build
-        run: make CC=${{ matrix.cc }} WERROR=1
+        run: make CC=${{ matrix.cc }} WERROR=1 EVENT=${{ matrix.event }}
       - name: Test
-        run: make test CC=${{ matrix.cc }}
+        run: make test CC=${{ matrix.cc }} EVENT=${{ matrix.event }}
 
   alpine:
     name: alpine (musl) / ${{ matrix.cc }}
@@ -45,3 +49,6 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build & test with sanitizers
         run: make asan WERROR=1
+      # 같은 build/asan 에서 백엔드만 바꿔 다시 링크한다 (Makefile 의 EV_STAMP)
+      - name: Build & test with sanitizers (epoll)
+        run: make asan WERROR=1 EVENT=epoll

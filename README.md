@@ -21,7 +21,8 @@ sudo apt update && sudo apt install -y build-essential git curl
 ## 빌드 & 실행
 
 ```bash
-make                                  # ./webserver 생성
+make                                  # ./webserver 생성 (이벤트 대기는 poll)
+make EVENT=epoll                      # 이벤트 대기를 epoll 로 (Linux, 비교 측정용 · docs/event-backend.md)
 ./webserver -p 8080 -r www            # Ctrl-C(SIGINT)·SIGTERM 으로 종료
 ./webserver -p 8080 -r www -c proxy.conf   # Reverse Proxy (설정에 적은 접두사는 백엔드로 중계 · 형식은 docs/interfaces.md)
 ./webserver -p 8080 -r www --merge-slashes # 경로의 // 를 400 대신 / 로 합침
@@ -38,7 +39,7 @@ access: #2 127.0.0.1:51930 "GET /api/add?a=3&b=4 HTTP/1.1" 200 187 0ms
 access: #2 close idle-timeout requests=1 10003ms (active 0)
 ```
 
-닫힘 이유: `done`(응답 뒤 정상 종료), `client-closed`, `idle-timeout`(10초), `request-timeout`(30초, slow loris), `linger-timeout`, `read-error`, `write-error`, `shutdown`. stderr 를 받는 쪽이 막히면 이벤트 루프도 멈추므로 관찰할 때만 켭니다.
+닫힘 이유: `done`(응답 뒤 정상 종료), `client-closed`, `idle-timeout`(10초), `request-timeout`(30초, slow loris), `linger-timeout`, `read-error`, `write-error`, `event-error`(이벤트 감시 등록 실패, epoll 에서만 날 수 있음), `shutdown`. stderr 를 받는 쪽이 막히면 이벤트 루프도 멈추므로 관찰할 때만 켭니다.
 
 > `--merge-slashes` 는 nginx 의 `merge_slashes` 지시어와 같은 동작이지만 **기본값이 반대**입니다. nginx 는 기본으로 합치고, 이 서버는 기본으로 `//` 가 든 요청을 400 으로 거절합니다. 이유는 `docs/decisions.md` (2026-11-23).
 
@@ -47,11 +48,11 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 
 ## 동시성 모델과 제약
 
-프로세스 하나, 스레드 하나가 `poll()` 이벤트 루프로 모든 연결(클라이언트·업스트림)을 논블로킹으로 다룹니다.
+프로세스 하나, 스레드 하나가 `poll()` 이벤트 루프로 모든 연결(클라이언트·업스트림)을 논블로킹으로 다룹니다. 이벤트 대기는 `include/ev.h` 한 곳을 거치므로 빌드 때 `make EVENT=epoll` 로 바꿀 수 있습니다 (비교 측정용, 시작 줄에 `poll`/`epoll` 이 찍힘).
 
 | 고른 것 | 이유 |
 |---|---|
-| `poll()` | POSIX 라서 macOS·Linux(glibc, musl)에서 같은 코드가 돈다. `epoll`(Linux)·`kqueue`(macOS)는 OS 마다 다름 |
+| `poll()` (기본) | POSIX 라서 macOS·Linux(glibc, musl)에서 같은 코드가 돈다. `epoll`(Linux)·`kqueue`(macOS)는 OS 마다 다르므로 선택 빌드로만 (`docs/event-backend.md`) |
 | 처음부터 이벤트 루프 | 블로킹 서버(Tiny)는 요청을 안 보내는 연결 하나에 다른 요청이 모두 멈춘다 (`docs/classic.md`). 나중에 갈아엎는 비용도 피함 |
 | 스레드·`fork` 없음 | 공유 상태 잠금, 자식 정리(`waitpid`)가 필요 없다. CGI 대신 내장 앱 라우트를 쓴 이유도 같음 |
 
@@ -60,6 +61,7 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 - 코어 하나만 쓴다. 요청 처리 중 오래 걸리는 계산이 있으면 그동안 다른 연결도 기다린다
 - 동시 연결 상한 1024 (닫히는 중인 연결 포함). 넘으면 새 연결은 받자마자 닫는다
 - 요청은 30초 안에 다 와야 하고, 유휴 연결은 10초 뒤 닫는다
+- 프록시 중(응답을 보내기 전)에는 클라이언트 소켓을 보지 않는다. 그동안 끊긴 클라이언트는 응답을 쓸 때나 업스트림 마감(5초) 때 닫힌다
 - 업스트림 응답 머리가 5초 안에 안 오면 504. 응답이 시작된 뒤 업스트림이 5초 동안 아무것도 안 보내면 받은 바이트까지만 보내고 연결을 닫는다
 - 프록시는 업스트림 연결을 요청마다 새로 열고, 요청을 보낸 뒤에는 재시도하지 않는다 (라우트 옵션 `failover=` 로 connect 단계에서만 다음 백엔드로 넘길 수 있다. `docs/api.md`). 중계가 끝나면 클라이언트 연결도 닫는다 (keep-alive 없음)
 - HTTP 지원 범위와 운영 제약은 `docs/api.md`
@@ -76,6 +78,7 @@ POSIX 범위를 벗어나는 함수가 필요하면 `#ifdef __APPLE__` / `#ifdef
 make unit                               # 단위 테스트만
 make test                               # 내 환경에서 빌드 + 단위 테스트 + 스모크 테스트
 make asan                               # AddressSanitizer/UBSan 빌드로 같은 테스트 (Ubuntu·WSL·macOS)
+make test EVENT=epoll                   # epoll 백엔드로 같은 테스트 (Linux)
 make docker-test                        # Ubuntu 컨테이너에서
 make docker-test DISTRO=alpine          # Alpine 컨테이너에서
 make docker-test DISTRO=alpine CC=clang # 컴파일러 지정
@@ -86,7 +89,7 @@ make docker-shell DISTRO=alpine         # 컨테이너 안에서 직접 확인
 - Docker 컨테이너는 **개발용이 아니라 검증용**입니다. 개발은 각자 환경에서 하고, 다른 환경에서 되는지만 명령 한 줄로 확인합니다.
 - 소스는 읽기 전용으로 마운트되고 컨테이너 안 복사본에서 빌드하므로 호스트의 `build/`는 건드리지 않습니다.
 - Windows는 WSL 안에서 실행하세요 (Docker Desktop의 WSL 연동 필요).
-- CI는 push/PR마다 Ubuntu(gcc, clang), macOS(clang), Alpine(gcc, clang) 5개 조합으로 `-Werror` 빌드와 테스트를 실행합니다.
+- CI는 push/PR마다 Ubuntu(gcc, clang), macOS(clang), Alpine(gcc, clang) 5개 조합으로 `-Werror` 빌드와 테스트를 실행합니다. 필수가 아닌 검사로 Ubuntu gcc + epoll, ASan(poll·epoll)도 돕니다.
 
 ## 디렉터리 구조
 

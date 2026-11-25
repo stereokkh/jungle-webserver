@@ -2,12 +2,12 @@
  * ev.h — 이벤트 대기 계층 (poll / epoll / kqueue 중 빌드 때 하나)
  *
  * 명세: docs/event-backend.md (결정 1~5 는 그 문서 6장)
- * 상태: 제안 (트랙 A 합의 전). 아직 어떤 .c 도 이 헤더를 쓰지 않는다. 아래 make EVENT=... 와 ev_*.c 는 계획이다
+ * 상태: 제안 (트랙 A 합의 전). poll·epoll 은 구현됐고 kqueue 는 아직이다 (명세의 "구현 상태")
  *
  * server.c 는 poll·epoll·kqueue 를 직접 부르지 않고 이 함수들만 쓴다. 백엔드는 빌드 때 고른다:
  *   make               → src/ev_poll.c   (POSIX, 기본. macOS·Linux·musl 모두)
  *   make EVENT=epoll   → src/ev_epoll.c  (Linux)
- *   make EVENT=kqueue  → src/ev_kqueue.c (macOS)
+ *   make EVENT=kqueue  → src/ev_kqueue.c (macOS, 아직 없음: 지금은 Makefile 이 멈춘다)
  * 세 백엔드는 같은 의미를 지킨다. 그래서 server.c 의 상태 기계는 어느 쪽에서도 똑같이 돈다.
  *
  * 쓰는 순서 (루프 한 바퀴):

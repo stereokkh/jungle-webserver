@@ -1,21 +1,23 @@
 /*
- * server.c — poll() 이벤트 루프, 연결 수명주기, 시그널/종료
+ * server.c — 이벤트 루프 (poll 기본, make EVENT=epoll|kqueue 로 선택), 연결 수명주기, 시그널/종료
  *
  * CS:APP 대응: tiny.c main()
  *   Tiny:  listenfd = Open_listenfd(port);
  *          while (1) { connfd = Accept(...); doit(connfd); Close(connfd); }
  *   → 한 번에 연결 하나. 요청을 다 보내지 않는 클라이언트 하나가 다른 모든 연결을 기다리게 한다.
- *   여기서는 poll 로 listen fd + 모든 연결 fd 를 감시하고, 연결마다 상태(conn)를 두어
+ *   여기서는 listen fd + 모든 연결 fd 를 한꺼번에 감시하고, 연결마다 상태(conn)를 두어
  *   읽기/처리/쓰기를 "지금 할 수 있는 만큼만" 진행한 뒤 루프로 돌아온다.
+ *   감시는 include/ev.h 의 함수로만 한다. 어느 백엔드(poll·epoll·kqueue)인지는 빌드 때 정해지고 이 파일은 모른다.
+ *   명세: docs/event-backend.md
  *
  * 루프 한 바퀴:
- *   1. 유휴 시간을 넘긴 연결을 닫고, poll 대기 시간을 가장 먼저 만료될 연결 기준으로 정한다
- *   2. pollfd 목록을 새로 만든다: [0] 시그널 파이프, [1] listen 소켓, [2..] 연결
- *      (연결 상태에 따라 POLLIN 또는 POLLOUT 중 하나만 감시. 프록시 중인 연결은 클라이언트 fd 와
- *       업스트림 fd 로 칸을 둘 쓰고, 칸마다 어느 fd 인지(pfd_kind)를 기억한다)
- *   3. poll → 연결 이벤트 처리 → 마지막에 accept
+ *   1. 유휴 시간을 넘긴 연결을 닫고, 대기 시간을 가장 먼저 만료될 연결 기준으로 정한다
+ *   2. 감시할 fd 와 원하는 이벤트를 ev 에 다시 알린다 (build_interest): 시그널 파이프, listen 소켓, 연결
+ *      (연결 상태에 따라 WS_EV_IN 또는 WS_EV_OUT 중 하나만 감시하거나 아예 보지 않는다(ev_pause). 프록시 중인 연결은
+ *       업스트림 fd 도 감시하고, 이벤트의 tag 에 칸 번호·fd 종류·칸 세대를 담아 어느 연결의 어느 fd 인지 안다)
+ *   3. ev_wait → 연결 이벤트 처리 → 마지막에 accept
  *      (accept 를 먼저 하면 방금 닫은 칸에 새 연결이 들어가서, 같은 칸을 가리키는
- *       이전 pollfd 의 revents 가 새 연결에 잘못 적용될 수 있다)
+ *       이전 이벤트가 새 연결에 잘못 적용될 수 있다)
  *
  * 요청 하나의 흐름 (docs/interfaces.md 1~6단계):
  *   READING ─파서 DONE→ 응답을 out 에 만듦 → WRITING ─out 다 보냄→ (정적 파일이면) SENDING_FILE
@@ -25,7 +27,7 @@
  *   프록시 경로 (#9): 응답을 만들지 않고 업스트림 연결을 시작한다
  *     UP_CONNECTING ─연결됨→ UP_SENDING ─요청 다 보냄→ UP_RECEIVING ─응답 끝→ WRITING (남은 out 을 보내고 닫기)
  *     응답 시작 전 실패는 502/504 를 out 에 쓰고 WRITING, 시작 후 실패는 남은 out 만 보내고 닫는다.
- *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 pollfd 를 최대 둘 쓴다
+ *     프록시 응답 뒤에는 항상 연결을 닫는다 (keep-alive 안 함). 연결 하나가 감시할 fd 를 최대 둘 쓴다
  *     페일오버 (라우트에 failover= 가 있을 때만): UP_CONNECTING 에서 connect 가 실패하거나 시간이 넘으면 업스트림 fd 를
  *     닫고 다음 백엔드로 UP_CONNECTING 을 다시 한다. 요청 바이트는 UP_SENDING 부터 나가므로 그 전에만 되고,
  *     그래서 같은 요청(POST 포함)이 두 백엔드에서 실행되지 않는다. 시계(up_start_ms)는 첫 시도부터 한 번만 잰다
@@ -46,6 +48,7 @@
 #include "app.h"
 #include "proxy_config.h"
 #include "proxy.h"
+#include "ev.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -54,7 +57,6 @@
 #include <netdb.h>
 #include <errno.h>
 #include <limits.h>
-#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -67,25 +69,25 @@
 /* read 한 번에 확보할 입력 버퍼 여유 */
 #define READ_CHUNK 4096
 
-/* accept 가 fd 고갈(EMFILE 등)로 실패하면 이 시간 동안 listen 소켓을 감시하지 않는다.
- * 그대로 두면 대기열의 연결 때문에 poll 이 계속 깨어나 CPU 를 다 쓴다 */
+/* accept 가 fd 고갈(EMFILE 등)로 실패하면 이 시간 동안 listen 소켓을 감시하지 않는다 (ev_pause).
+ * 그대로 두면 대기열의 연결 때문에 이벤트 대기가 계속 깨어나 CPU 를 다 쓴다 */
 #define ACCEPT_PAUSE_MS 100
 
-/* poll 한 바퀴에 accept 할 최대 연결 수. 대기열이 계속 차 있어도 기존 연결 처리·유휴 만료·
- * 종료 시그널 확인이 밀리지 않게 한다. 남은 연결은 다음 바퀴에 poll 이 다시 알려 준다 */
+/* 루프 한 바퀴에 accept 할 최대 연결 수. 대기열이 계속 차 있어도 기존 연결 처리·유휴 만료·
+ * 종료 시그널 확인이 밀리지 않게 한다. 남은 연결은 다음 바퀴에 다시 알려 준다 (레벨 트리거) */
 #define ACCEPT_PER_PASS 64
 
 /* 연결 하나의 상태 (docs/interfaces.md 의 상태 표).
  * conn 은 calloc 으로 힙에 만든다 (http_request 가 수 KB). 이 파일 밖으로 내보내지 않는다 */
 typedef enum {
-    CONN_READING,        /* 요청을 읽는 중 (POLLIN). 파서가 NEED_MORE */
-    CONN_WRITING,        /* out 버퍼를 보내는 중 (POLLOUT). EAGAIN 이면 다음 POLLOUT 까지 대기 */
-    CONN_SENDING_FILE,   /* 헤더를 다 보내고 파일 조각을 보내는 중 (POLLOUT) */
-    CONN_UP_CONNECTING,  /* 프록시: 업스트림 connect 진행 중 (업스트림 POLLOUT) */
-    CONN_UP_SENDING,     /* 프록시: 다시 쓴 요청을 업스트림에 보내는 중 (업스트림 POLLOUT) */
-    CONN_UP_RECEIVING,   /* 프록시: 응답을 읽어 out 으로 중계 중 (업스트림 POLLIN, 시작 후 out 이 있으면 클라이언트 POLLOUT) */
-    CONN_CLOSING,        /* 오류 응답을 보내는 중 (POLLOUT). 다 보내면 LINGERING */
-    CONN_LINGERING       /* 송신을 닫았다 (POLLIN). 받은 건 버리고 EOF·마감이면 닫는다 */
+    CONN_READING,        /* 요청을 읽는 중 (WS_EV_IN). 파서가 NEED_MORE */
+    CONN_WRITING,        /* out 버퍼를 보내는 중 (WS_EV_OUT). EAGAIN 이면 다음 WS_EV_OUT 까지 대기 */
+    CONN_SENDING_FILE,   /* 헤더를 다 보내고 파일 조각을 보내는 중 (WS_EV_OUT) */
+    CONN_UP_CONNECTING,  /* 프록시: 업스트림 connect 진행 중 (업스트림 WS_EV_OUT) */
+    CONN_UP_SENDING,     /* 프록시: 다시 쓴 요청을 업스트림에 보내는 중 (업스트림 WS_EV_OUT) */
+    CONN_UP_RECEIVING,   /* 프록시: 응답을 읽어 out 으로 중계 중 (업스트림 WS_EV_IN, 시작 후 out 이 있으면 클라이언트 WS_EV_OUT) */
+    CONN_CLOSING,        /* 오류 응답을 보내는 중 (WS_EV_OUT). 다 보내면 LINGERING */
+    CONN_LINGERING       /* 송신을 닫았다 (WS_EV_IN). 받은 건 버리고 EOF·마감이면 닫는다 */
 } conn_state;
 
 typedef struct {
@@ -127,12 +129,26 @@ typedef struct {
     const char *close_why;   /* 닫는 이유. NULL 이면 닫을 때의 상태 이름 */
 } conn;
 
-/* pollfd 목록의 고정 위치 */
-enum { PFD_SIGNAL = 0, PFD_LISTEN = 1, PFD_FIRST_CONN = 2 };
+/* 이벤트의 tag (ev_want 에 넘기고 ev_wait 이 그대로 돌려준다): 어느 연결 칸의 어느 fd 인지.
+ *   비트 0..31 fd, 32..47 conns 칸 번호, 48..51 종류, 52..63 칸 세대 (server.slot_gen 의 아래 12비트)
+ * 종류: 프록시 연결은 fd 를 둘(클라이언트, 업스트림) 감시한다. listen·시그널은 칸이 없다 (칸 번호·세대 0) */
+enum { TAG_CLIENT = 0, TAG_UPSTREAM = 1, TAG_LISTEN = 2, TAG_SIGNAL = 3 };
+#define TAG_GEN_MASK 0xfffu
+_Static_assert(SERVER_MAX_CONNS <= 0x10000, "conns slot index must fit in the 16-bit tag field");
 
-/* 프록시 연결은 pollfd 를 둘(클라이언트, 업스트림) 쓴다. 칸 하나가 가리키는 fd 의 종류 */
-enum { PFD_KIND_CLIENT = 0, PFD_KIND_UPSTREAM = 1 };
-#define PFD_MAX (PFD_FIRST_CONN + 2 * SERVER_MAX_CONNS)
+/* 한 바퀴에 감시하는 fd 의 최대 수: 시그널 파이프 + listen + 연결마다 둘 */
+#define WATCH_MAX (2 + 2 * SERVER_MAX_CONNS)
+
+static uint64_t make_tag(int fd, size_t slot, unsigned kind, unsigned gen)
+{
+    return (uint64_t)(uint32_t)fd | (uint64_t)slot << 32 | (uint64_t)kind << 48 |
+           (uint64_t)(gen & TAG_GEN_MASK) << 52;
+}
+
+static int tag_fd(uint64_t t)        { return (int)(uint32_t)t; }
+static size_t tag_slot(uint64_t t)   { return (size_t)((t >> 32) & 0xffffu); }
+static unsigned tag_kind(uint64_t t) { return (unsigned)((t >> 48) & 0xfu); }
+static unsigned tag_gen(uint64_t t)  { return (unsigned)(t >> 52); }
 
 /* respond() 의 반환: 응답을 out 에 만들었다 / 응답 대신 업스트림 연결을 시작했다 */
 enum { RESPOND_OUT = 0, RESPOND_PROXY = 1 };
@@ -144,10 +160,9 @@ typedef struct {
     int64_t accept_resume_ms;                   /* 0 이 아니면 이 시각까지 accept 쉼 */
     conn *conns[SERVER_MAX_CONNS];              /* 빈 칸은 NULL */
     size_t nconns;
-    struct pollfd pfds[PFD_MAX];
-    size_t pfd_slot[PFD_MAX];                   /* pfds[i] 가 가리키는 conns 칸 */
-    int pfd_kind[PFD_MAX];                      /* pfds[i] 가 클라이언트 fd 인지 업스트림 fd 인지 */
-    proxy_config proxy;                         /* -c 가 있을 때만 (서버 수명 동안 유지) */
+    unsigned slot_gen[SERVER_MAX_CONNS];        /* 칸 세대: conn_close 마다 1 증가. 이미 닫은 칸의 이벤트를 알아본다 */
+    ev_loop *ev;                                /* 감시 (poll·epoll·kqueue 중 빌드 때 하나, include/ev.h) */
+    proxy_config proxy;                        /* -c 가 있을 때만 (서버 수명 동안 유지) */
     int has_proxy;
     http_parse_options parse_opt;               /* 요청마다 같은 파서 옵션 (#31) */
     unsigned long long next_conn_id;            /* --access-log 의 연결 번호 */
@@ -155,9 +170,9 @@ typedef struct {
 
 /*
  * 시그널 처리: self-pipe.
- *   핸들러는 플래그를 세우고 파이프에 1바이트를 쓴다. 파이프 읽기 끝을 poll 에 넣어 두면
- *   "플래그 검사 → poll 진입" 사이에 시그널이 와도 poll 이 바로 깨어난다.
- *   (플래그만 쓰면 그 틈에 온 시그널은 poll 이 다음 이벤트·타임아웃으로 깰 때까지 묻힌다)
+ *   핸들러는 플래그를 세우고 파이프에 1바이트를 쓴다. 파이프 읽기 끝을 감시 목록에 넣어 두면
+ *   "플래그 검사 → ev_wait 진입" 사이에 시그널이 와도 ev_wait 이 바로 깨어난다.
+ *   (플래그만 쓰면 그 틈에 온 시그널은 다음 이벤트·타임아웃으로 깰 때까지 묻힌다)
  *   핸들러 안에서는 async-signal-safe 함수(write)만 쓴다. errno 는 보존한다.
  */
 static volatile sig_atomic_t stop_requested;
@@ -197,7 +212,7 @@ static int setup_signals(void)
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_stop_signal;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;   /* SA_RESTART 없음: poll 이 EINTR 로 깨어나게 */
+    sa.sa_flags = 0;   /* SA_RESTART 없음: ev_wait(poll·epoll_wait·kevent)이 EINTR 로 깨어나게 */
     if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0)
         return -1;
     return 0;
@@ -247,7 +262,7 @@ static int would_block(int err)
  *   요청 줄은 응답을 끝까지 보냈을 때(또는 그 전에 연결이 닫히면 "incomplete" 를 붙여) 쓴다.
  *   상태 코드는 모듈마다 응답을 out 에 쓰는 방식이 달라서(정적·앱·오류·프록시 중계) 따로 넘기지 않고,
  *   클라이언트로 처음 쓰는 상태 줄 "HTTP/1.x NNN" 에서 읽는다.
- *   stderr 는 버퍼링이 없어 줄이 바로 나가지만, 받는 쪽(파이프)이 막히면 poll 루프도 멈춘다.
+ *   stderr 는 버퍼링이 없어 줄이 바로 나가지만, 받는 쪽(파이프)이 막히면 이벤트 루프도 멈춘다.
  *   그래서 기본은 꺼 두고 관찰할 때만 켠다
  * --------------------------------------------------------------- */
 
@@ -415,6 +430,14 @@ static int conn_open(server *s, int fd)
     return 0;
 }
 
+/* 감시 중일 수 있는 fd 는 모두 이것으로 닫는다: 감시 기록을 먼저 지우고 close (ev_forget 설명은 ev.h).
+ * 페일오버는 업스트림 fd 를 닫자마자 새로 열어 같은 번호를 받는 일이 흔해서, 기록이 남으면 epoll 에서 새 fd 가 감시되지 않는다 */
+static void close_watched(server *s, int fd)
+{
+    ev_forget(s->ev, fd);
+    close(fd);
+}
+
 /* 연결의 모든 자원을 정리하는 유일한 함수. 이미 닫힌 칸에 다시 불러도 아무 일도 하지 않는다 */
 static void conn_close(server *s, size_t slot)
 {
@@ -428,9 +451,9 @@ static void conn_close(server *s, size_t slot)
                 c->id, c->close_why != NULL ? c->close_why : conn_state_name(c->state), c->nreq,
                 (long long)(now_ms() - c->open_ms), s->nconns - 1);
     }
-    close(c->fd);
+    close_watched(s, c->fd);
     if (c->upstream_fd >= 0)
-        close(c->upstream_fd);
+        close_watched(s, c->upstream_fd);
     static_close(&c->file);
     buffer_free(&c->in);
     buffer_free(&c->out);
@@ -438,6 +461,7 @@ static void conn_close(server *s, size_t slot)
     proxy_relay_free(&c->relay);
     free(c);
     s->conns[slot] = NULL;
+    s->slot_gen[slot]++;        /* 이 칸을 가리키던 이벤트는 이제 낡은 것이다 (dispatch) */
     s->nconns--;
     s->accept_resume_ms = 0;    /* fd 가 하나 생겼으니 쉬던 accept 를 다시 시도한다 */
 }
@@ -479,10 +503,10 @@ static int respond_static(server *s, conn *c, int head)
 }
 
 /* 업스트림 fd·요청·중계 상태를 정리한다 (conn_close 와 달리 클라이언트 연결은 둔다) */
-static void up_release(conn *c)
+static void up_release(server *s, conn *c)
 {
     if (c->upstream_fd >= 0)
-        close(c->upstream_fd);
+        close_watched(s, c->upstream_fd);
     c->upstream_fd = -1;
     buffer_free(&c->up_out);
     proxy_relay_free(&c->relay);
@@ -496,7 +520,7 @@ static int up_budget_spent(const conn *c, int64_t now)
 
 /* 지금 시도의 connect 가 PROXY_CONNECT_TIMEOUT_MS 를 넘겼나. failover=timeout 인 라우트에서만 잰다
  * (없으면 connect 도 전체 마감 하나로 잰다). expire_idle 과 up_on_event 가 같은 판단을 쓰도록 한 곳에 둔다:
- * poll 이 연결 이벤트를 늦게 돌려줘도 마감을 넘긴 시도는 연결됐다고 받지 않고 시간 초과로 다룬다 */
+ * 연결 이벤트를 늦게 처리해도 마감을 넘긴 시도는 연결됐다고 받지 않고 시간 초과로 다룬다 */
 static int up_connect_expired(const conn *c, int64_t now)
 {
     return c->state == CONN_UP_CONNECTING && (c->up_route->failover & PROXY_FAILOVER_TIMEOUT) &&
@@ -506,7 +530,7 @@ static int up_connect_expired(const conn *c, int64_t now)
 /* 업스트림 connect 가 지금 어디까지 왔나 (소켓에 물어본다). 전체 마감에 걸린 두 자리(expire_idle, up_on_event 맨 위)가
  * "그 백엔드를 죽었다고 표시할까"를 같은 판단으로 하도록 한 곳에 둔다.
  *   SO_ERROR != 0            → UP_CONN_FAILED  (거절·도달 불가 등)
- *   getpeername 성공         → UP_CONN_CONNECTED (연결은 이미 끝났고 POLLOUT 을 아직 처리하지 못했을 뿐: 멀쩡한 백엔드)
+ *   getpeername 성공         → UP_CONN_CONNECTED (연결은 이미 끝났고 WS_EV_OUT 을 아직 처리하지 못했을 뿐: 멀쩡한 백엔드)
  *   getpeername ENOTCONN     → UP_CONN_PENDING (SYN 에 답이 없다)
  *   그 밖의 getpeername 오류 → UP_CONN_FAILED  (소켓이 이미 망가졌다)
  * 순서가 중요하다: 오류가 난 소켓도 getpeername 은 ENOTCONN 이라 SO_ERROR 를 먼저 봐야 PENDING 과 구별된다.
@@ -533,7 +557,7 @@ static int up_deadline_backend_failed(const conn *c)
 }
 
 /* 이번 요청의 다음 백엔드를 골라 up_out 을 새로 만들고 connect 를 시작한다. 첫 시도와 페일오버가 같은 함수를 쓴다.
- * 성공하면 0: upstream_fd 가 열려 있으니 UP_CONNECTING 에서 POLLOUT 을 기다리면 된다.
+ * 성공하면 0: upstream_fd 가 열려 있으니 UP_CONNECTING 에서 WS_EV_OUT 을 기다리면 된다.
  * 실패하면 호출자가 클라이언트에게 보낼 상태 코드를 돌려준다. 이때 up_out 은 비우지 않고 둔다: 정리는 호출자의 up_release(up_fail 포함)가
  * 한 곳에서 한다 (실패 경로마다 책임이 같다. 다음 시도 앞의 buffer_free 는 새 요청을 만들 자리를 비우는 것일 뿐이다):
  *   431  다시 쓴 요청이 HTTP_MAX_HEADER 를 넘음 (결정 6). 첫 시도뿐 아니라 이름이 더 긴 백엔드로 넘어가다 넘어도 같다
@@ -595,7 +619,7 @@ static int up_start_attempt(conn *c)
 /* ROUTE_PROXY: 다시 쓴 요청을 up_out 에 만들고 업스트림 connect 를 시작한다 (#9).
  * 프록시 응답 뒤에는 항상 연결을 닫으므로 keep_alive 는 0 (백엔드에도 Connection: close 를 보냈다).
  * 요청이 in 을 가리키는 동안(consume 전) 불러야 한다. 이 요청의 in 은 연결이 닫힐 때까지 consume 하지 않는다 (handle_request) */
-static int respond_proxy(conn *c, proxy_route *route, int head)
+static int respond_proxy(server *s, conn *c, proxy_route *route, int head)
 {
     int64_t now = now_ms();   /* 결정 4a: 요청을 프록시에 넘긴 시각. 재구성·connect 시작 시간도 마감에 든다 */
     int code;
@@ -611,7 +635,7 @@ static int respond_proxy(conn *c, proxy_route *route, int head)
     c->up_last_ms = now;
     code = up_start_attempt(c);
     if (code != 0) {
-        up_release(c);
+        up_release(s, c);
         return http_append_error(&c->out, code, 0, head, NULL);
     }
     c->last_active_ms = now_ms();
@@ -631,7 +655,7 @@ static int respond(server *s, conn *c)
 
     switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
     case ROUTE_PROXY:
-        return respond_proxy(c, route, head);
+        return respond_proxy(s, c, route, head);
     case ROUTE_APP:
         if (app_handle(&c->req, s->cfg->port, &c->out) == 0)
             return RESPOND_OUT;
@@ -734,7 +758,7 @@ static void conn_response_done(server *s, size_t slot)
     }
     c->state = CONN_READING;
     /* 파이프라이닝: 클라이언트가 응답을 기다리지 않고 보낸 다음 요청이 in 에 이미 있으면
-     * 새 바이트를 기다리지 않고 바로 처리한다 (안 그러면 poll 이 깨워 주지 않아 멈춘다) */
+     * 새 바이트를 기다리지 않고 바로 처리한다 (안 그러면 새 입력이 없어 이벤트가 오지 않고 멈춘다) */
     if (buffer_pending(&c->in) > 0) {
         c->req_start_ms = now_ms();
         if (handle_request(s, c) < 0)
@@ -803,7 +827,7 @@ static void conn_send_file(server *s, size_t slot)
     }
     c->last_active_ms = now_ms();
     if (r == 0)
-        return;                    /* 남은 건 다음 POLLOUT 에 */
+        return;                    /* 남은 건 다음 WS_EV_OUT 에 */
     c->resp_bytes += (unsigned long long)c->file.size;
     /* 다 보냈으면 바로 닫는다. keep-alive 로 다음 요청의 static_open 이 덮어쓰면 fd 가 샌다
      * (PR #25 리뷰). conn_close 의 static_close 와 겹쳐도 안전하다 */
@@ -833,7 +857,7 @@ static void conn_on_writable(server *s, size_t slot)
     c->resp_bytes += (unsigned long long)n;
     c->last_active_ms = now_ms();
     if (buffer_pending(&c->out) > 0)
-        return;                    /* 남은 건 다음 POLLOUT 에 */
+        return;                    /* 남은 건 다음 WS_EV_OUT 에 */
 
     if (c->file.fd >= 0) {         /* 헤더를 다 보냈다. 본문은 파일에서 */
         c->state = CONN_SENDING_FILE;
@@ -852,7 +876,7 @@ static void up_fail(server *s, size_t slot, int code)
     conn *c = s->conns[slot];
     int head = c->relay.request_was_head;
 
-    up_release(c);
+    up_release(s, c);
     c->keep_alive = 0;
     c->last_active_ms = now_ms();   /* 클라이언트 유휴 타이머는 이 응답을 쓰는 시점부터 */
     if (http_append_error(&c->out, code, 0, head, NULL) < 0) {
@@ -881,7 +905,7 @@ static void up_finish(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
 
-    up_release(c);
+    up_release(s, c);
     c->keep_alive = 0;
     c->state = CONN_WRITING;
     if (buffer_pending(&c->out) == 0)
@@ -902,7 +926,7 @@ static void up_connect_failed(server *s, size_t slot, int timed_out)
     int code = timed_out ? 504 : 502;
 
     c->up_last_timeout = timed_out;
-    close(c->upstream_fd);
+    close_watched(s, c->upstream_fd);   /* 바로 아래 up_start_attempt 의 새 fd 가 같은 번호를 받을 수 있다 */
     c->upstream_fd = -1;
     proxy_mark_down(route, c->up_backend, now_ms());
     if (route->failover & kind) {
@@ -937,7 +961,7 @@ static int is_up_state(conn_state st)
     return st == CONN_UP_CONNECTING || st == CONN_UP_SENDING || st == CONN_UP_RECEIVING;
 }
 
-/* UP_SENDING: up_out 을 업스트림으로. write 한 번, EAGAIN 이면 다음 POLLOUT 에 이어서 */
+/* UP_SENDING: up_out 을 업스트림으로. write 한 번, EAGAIN 이면 다음 WS_EV_OUT 에 이어서 */
 static void up_send(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
@@ -956,7 +980,7 @@ static void up_send(server *s, size_t slot)
     c->up_last_ms = now_ms();
 }
 
-/* UP_RECEIVING: 업스트림에서 읽어 relay 에 먹인다. read 한 번 (남은 건 poll 이 다시 알려 준다) */
+/* UP_RECEIVING: 업스트림에서 읽어 relay 에 먹인다. read 한 번 (남은 건 다음 바퀴에 다시 알려 준다: 레벨 트리거) */
 static void up_receive(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
@@ -1003,9 +1027,9 @@ static void up_on_event(server *s, size_t slot)
 {
     conn *c = s->conns[slot];
 
-    /* 같은 poll 배치의 앞 이벤트를 처리하는 동안 마감이 지났을 수 있다. 시작 전이면 늦게 완성된 머리도 504 (결정 4a) */
+    /* 같은 이벤트 배치의 앞 이벤트를 처리하는 동안 마감이 지났을 수 있다. 시작 전이면 늦게 완성된 머리도 504 (결정 4a) */
     if (!c->relay.started && up_budget_spent(c, now_ms())) {
-        /* 아직 connect 중이거나 실패한 백엔드는 죽은 것이다. 연결이 이미 끝났다면(POLLOUT 을 늦게 처리했을 뿐) 표시하지 않는다.
+        /* 아직 connect 중이거나 실패한 백엔드는 죽은 것이다. 연결이 이미 끝났다면(WS_EV_OUT 을 늦게 처리했을 뿐) 표시하지 않는다.
          * expire_idle 과 같은 판단이다 (up_deadline_backend_failed) */
         up_fail_deadline(s, slot, up_deadline_backend_failed(c));
         return;
@@ -1024,7 +1048,7 @@ static void up_on_event(server *s, size_t slot)
             up_connect_failed(s, slot, 1);
             return;
         }
-        /* POLLOUT·POLLERR·POLLHUP 어느 쪽이 와도 getsockopt(SO_ERROR) 만으로 판단 (결정 5) */
+        /* WS_EV_OUT·WS_EV_ERR·WS_EV_HUP 어느 쪽이 와도 getsockopt(SO_ERROR) 만으로 판단 (결정 5) */
         if (proxy_connect_result(c->upstream_fd) != 0) {
             up_connect_failed(s, slot, 0);
             return;                /* 다른 백엔드의 새 fd 로 바뀌었을 수 있다: 이 revents 로 이어서 처리하지 않는다 */
@@ -1046,19 +1070,21 @@ static void up_on_event(server *s, size_t slot)
         up_receive(s, slot);   /* HUP 이어도 read 결과(남은 데이터 또는 0)로 판단 */
 }
 
-/* UP_* 상태의 클라이언트 fd 이벤트: 끊김은 모두 닫기, 응답 시작 후 POLLOUT 이면 out 을 보낸다 */
-static void up_on_client_event(server *s, size_t slot, short re)
+/* UP_* 상태의 클라이언트 fd 이벤트: 끊김은 모두 닫기, 응답 시작 후 WS_EV_OUT 이면 out 을 보낸다.
+ * 클라이언트 fd 는 out 에 보낼 바이트가 있을 때만 감시하므로(build_interest) 이 함수는 그때만 불린다.
+ * 같은 배치에서 업스트림 이벤트가 먼저 처리돼 상태가 바뀌었으면 dispatch 가 일반 경로로 보낸다 */
+static void up_on_client_event(server *s, size_t slot, unsigned re)
 {
     conn *c = s->conns[slot];
     ssize_t n;
     int was_paused = up_paused(c);
 
-    if (re & (POLLERR | POLLHUP | POLLNVAL)) {
+    if (re & (WS_EV_ERR | WS_EV_HUP)) {
         c->close_why = "client-closed";
         conn_close(s, slot);       /* 업스트림 fd 도 같이 닫힌다 */
         return;
     }
-    if (!(re & POLLOUT) || buffer_pending(&c->out) == 0)
+    if (!(re & WS_EV_OUT) || buffer_pending(&c->out) == 0)
         return;
     log_note_status(c);
     n = write(c->fd, buffer_peek(&c->out), buffer_pending(&c->out));
@@ -1144,7 +1170,7 @@ static int64_t conn_deadline(const conn *c)
 /* 마감을 넘긴 연결을 닫고, 남은 연결 중 가장 이른 마감 시각(now_ms 기준 절대 시각, 없으면 -1)을 돌려준다.
  * 마감: 유휴(바이트가 오가지 않음), 요청 하나를 받는 시간(slow loris), lingering.
  * 상대 시간(ms)이 아니라 절대 시각을 돌려주는 이유: 이 루프 안에서 페일오버 재작성·connect 가 시간을 쓰는데, 루프 시작의 now 로
- * 뺀 값을 poll 에 넘기면 그만큼 더 기다린다. poll_timeout_ms 가 poll 직전 시각으로 뺀다 */
+ * 뺀 값을 ev_wait 에 넘기면 그만큼 더 기다린다. wait_timeout_ms 가 ev_wait 직전 시각으로 뺀다 */
 static int64_t expire_idle(server *s, int64_t now)
 {
     int64_t next = -1, d;
@@ -1157,7 +1183,7 @@ static int64_t expire_idle(server *s, int64_t now)
             continue;
         if (is_up_state(c->state) && !c->relay.started && up_budget_spent(c, now)) {
             /* 응답 시작 전 시간 초과: 닫지 않고 504 를 보낸다. 아직 connect 중이었다면 그 백엔드가 마감까지 답이 없던 것이다.
-             * 단 소켓이 이미 연결됐다면(POLLOUT 이 아직 처리되지 않은 것) 표시하지 않는다 (up_deadline_backend_failed) */
+             * 단 소켓이 이미 연결됐다면(WS_EV_OUT 이 아직 처리되지 않은 것) 표시하지 않는다 (up_deadline_backend_failed) */
             up_fail_deadline(s, i, up_deadline_backend_failed(c));
             c = s->conns[i];
             if (c == NULL)
@@ -1201,9 +1227,9 @@ static int64_t expire_idle(server *s, int64_t now)
     return next;
 }
 
-/* expire_idle 이 돌려준 절대 마감 시각을 poll 의 대기 시간(ms)으로 바꾼다. 마감이 없으면 -1(무한), 이미 지났으면 0.
- * 시각은 poll 직전에 다시 읽는다: expire_idle 과 build_pollfds 가 쓴 시간이 대기 시간에서 빠진다 */
-static int poll_timeout_ms(int64_t next_deadline)
+/* expire_idle 이 돌려준 절대 마감 시각을 ev_wait 의 대기 시간(ms)으로 바꾼다. 마감이 없으면 -1(무한), 이미 지났으면 0.
+ * 시각은 ev_wait 직전에 다시 읽는다: expire_idle 과 build_interest 가 쓴 시간이 대기 시간에서 빠진다 */
+static int wait_timeout_ms(int64_t next_deadline)
 {
     int64_t left;
 
@@ -1215,81 +1241,118 @@ static int poll_timeout_ms(int64_t next_deadline)
     return left > INT_MAX ? INT_MAX : (int)left;
 }
 
-static size_t build_pollfds(server *s)
+/* 연결 fd 를 감시 목록에 넣지 못했다 (epoll_ctl·kevent 실패: 메모리, fs.epoll.max_user_watches 등. poll 백엔드는 실패하지 않는다).
+ * 그대로 두면 이벤트가 오지 않아 마감까지 멈춰 있으므로 그 연결만 닫는다 */
+static void want_failed(server *s, size_t slot)
 {
-    size_t n = PFD_FIRST_CONN, i;
-
-    s->pfds[PFD_SIGNAL].fd = sig_pipe[0];
-    s->pfds[PFD_SIGNAL].events = POLLIN;
-    /* 음수 fd 는 poll 이 무시한다 (accept 를 쉬는 동안) */
-    s->pfds[PFD_LISTEN].fd = s->accept_resume_ms != 0 ? -1 : s->listen_fd;
-    s->pfds[PFD_LISTEN].events = POLLIN;
-
-    for (i = 0; i < SERVER_MAX_CONNS; i++) {
-        conn *c = s->conns[i];
-
-        if (c == NULL)
-            continue;
-        s->pfds[n].fd = c->fd;
-        s->pfd_slot[n] = i;
-        s->pfd_kind[n] = PFD_KIND_CLIENT;
-        if (!is_up_state(c->state)) {
-            s->pfds[n].events =
-                (c->state == CONN_READING || c->state == CONN_LINGERING) ? POLLIN : POLLOUT;
-            n++;
-            continue;
-        }
-        /* 프록시: 클라이언트 입력은 읽지 않는다 (C6). events 0 이어도 POLLHUP/POLLERR 는 온다.
-         * 응답이 시작돼 out 에 바이트가 있을 때만 POLLOUT */
-        s->pfds[n].events = (c->state == CONN_UP_RECEIVING && buffer_pending(&c->out) > 0) ? POLLOUT : 0;
-        n++;
-        s->pfds[n].fd = c->upstream_fd;
-        s->pfds[n].events = c->state == CONN_UP_RECEIVING ? POLLIN : POLLOUT;
-        /* 받는 중에 out 이 가득 차 읽을 바이트가 0 이면 음수 fd 로 poll 이 무시하게 한다 */
-        if (c->state == CONN_UP_RECEIVING && up_paused(c))
-            s->pfds[n].fd = -1;
-        s->pfd_slot[n] = i;
-        s->pfd_kind[n] = PFD_KIND_UPSTREAM;
-        n++;
-    }
-    for (i = 0; i < n; i++)
-        s->pfds[i].revents = 0;
-    return n;
+    s->conns[slot]->close_why = "event-error";
+    conn_close(s, slot);
 }
 
-static void dispatch(server *s, size_t npfds)
+/* 연결 상태에서 "지금 원하는 이벤트"를 계산해 ev 에 알린다. 백엔드와 상관없이 이 함수 하나가 정한다.
+ * poll 백엔드는 이 순서(시그널, listen, 칸 순서로 클라이언트 → 업스트림)대로 배열을 만들고,
+ * epoll·kqueue 백엔드는 지난 바퀴와 달라진 fd 만 커널에 고친다. 상태별 표는 docs/event-backend.md 4장.
+ * 반환 0, -1 이면 시그널 파이프나 listen 소켓을 감시하지 못함 (errno, 서버를 끝낸다) */
+static int build_interest(server *s)
 {
     size_t i;
 
-    for (i = PFD_FIRST_CONN; i < npfds; i++) {
-        size_t slot = s->pfd_slot[i];
-        short re = s->pfds[i].revents;
-        conn *c = s->conns[slot];
+    ev_begin(s->ev);
+    if (ev_want(s->ev, sig_pipe[0], make_tag(sig_pipe[0], 0, TAG_SIGNAL, 0), WS_EV_IN) < 0)
+        return -1;
+    /* accept 를 쉬는 동안은 listen 소켓을 아예 보지 않는다 (예전의 음수 fd) */
+    if (s->accept_resume_ms != 0)
+        ev_pause(s->ev, s->listen_fd);
+    else if (ev_want(s->ev, s->listen_fd, make_tag(s->listen_fd, 0, TAG_LISTEN, 0), WS_EV_IN) < 0)
+        return -1;
 
-        if (re == 0 || c == NULL)
+    for (i = 0; i < SERVER_MAX_CONNS; i++) {
+        conn *c = s->conns[i];
+        unsigned gen = s->slot_gen[i];
+
+        if (c == NULL)
             continue;
-        if (s->pfd_kind[i] == PFD_KIND_UPSTREAM) {
-            /* 같은 연결의 앞 항목(클라이언트)이 연결을 닫았거나 상태를 바꿨을 수 있다 → 낡은 항목은 건너뜀.
+        if (!is_up_state(c->state)) {
+            unsigned want = (c->state == CONN_READING || c->state == CONN_LINGERING) ? WS_EV_IN : WS_EV_OUT;
+
+            if (ev_want(s->ev, c->fd, make_tag(c->fd, i, TAG_CLIENT, gen), want) < 0)
+                want_failed(s, i);
+            continue;
+        }
+        /* 프록시: 클라이언트 입력은 읽지 않는다 (C6). 응답이 시작돼 out 에 바이트가 있을 때만 WS_EV_OUT, 그 밖에는 아예 보지 않는다.
+         * 끊김만 보려고 "이벤트 0"으로 걸어 두는 일은 하지 않는다 (docs/event-backend.md 결정 1: kqueue 는 필터 없이 끊김을
+         * 알려 주지 않아 세 백엔드의 동작을 맞출 수 없다). 그동안 끊긴 클라이언트는 응답을 쓸 때(EPIPE)나 업스트림 마감 때 닫힌다 */
+        if (c->state == CONN_UP_RECEIVING && buffer_pending(&c->out) > 0) {
+            if (ev_want(s->ev, c->fd, make_tag(c->fd, i, TAG_CLIENT, gen), WS_EV_OUT) < 0) {
+                want_failed(s, i);
+                continue;
+            }
+        } else {
+            ev_pause(s->ev, c->fd);
+        }
+        /* 받는 중에 out 이 가득 차 읽을 바이트가 0 이면(역압력) 업스트림을 아예 보지 않는다.
+         * 이벤트 0 으로 남겨 두면 안 된다: epoll 은 업스트림이 끊기면 EPOLLHUP 이 계속 오는데 up_receive 는 읽지 않아 루프가 쉬지 못한다 */
+        if (c->state == CONN_UP_RECEIVING && up_paused(c))
+            ev_pause(s->ev, c->upstream_fd);
+        else if (ev_want(s->ev, c->upstream_fd, make_tag(c->upstream_fd, i, TAG_UPSTREAM, gen),
+                         c->state == CONN_UP_RECEIVING ? WS_EV_IN : WS_EV_OUT) < 0)
+            want_failed(s, i);
+    }
+    return 0;
+}
+
+/* ev_wait 이 돌려준 이벤트를 처리한다. epoll·kqueue 는 순서를 정하지 않으므로 한 연결의 업스트림 이벤트가 클라이언트 이벤트보다
+ * 먼저 올 수도 있다. 어느 순서여도 처리 함수는 지금 상태를 보고 판단하므로 괜찮다 (예: 업스트림이 먼저 응답을 끝내
+ * WRITING 이 되면, 뒤의 클라이언트 이벤트는 아래 일반 경로로 간다). listen 은 순서와 상관없이 맨 마지막에 처리한다 */
+static void dispatch(server *s, const ev_event *evs, size_t nevs)
+{
+    size_t i;
+    int signal_ready = 0, listen_ready = 0;
+
+    for (i = 0; i < nevs; i++) {
+        uint64_t tag = evs[i].tag;
+        unsigned re = evs[i].events;
+        size_t slot;
+        conn *c;
+
+        if (tag_kind(tag) == TAG_SIGNAL) {
+            signal_ready = (re & WS_EV_IN) != 0;
+            continue;
+        }
+        if (tag_kind(tag) == TAG_LISTEN) {
+            listen_ready = (re & WS_EV_IN) != 0;
+            continue;
+        }
+        slot = tag_slot(tag);
+        c = s->conns[slot];
+        /* 같은 배치의 앞 이벤트가 이 칸을 닫았다 (c == NULL). 세대 비교는 그 칸에 다른 연결이 들어온 경우까지 거른다.
+         * 지금은 accept 가 배치 맨 끝이라 배치 안에서 칸이 다시 차지 않아 c == NULL 로 충분하지만, 그 순서에 기대지 않게 둔다 */
+        if (c == NULL || tag_gen(tag) != (s->slot_gen[slot] & TAG_GEN_MASK))
+            continue;
+        if (tag_kind(tag) == TAG_UPSTREAM) {
+            /* 같은 연결의 다른 이벤트(클라이언트)가 상태를 바꿨을 수 있다 → 낡은 이벤트는 건너뜀.
              * 페일오버는 업스트림 fd 를 닫고 새로 연다. 새 fd 가 같은 번호를 받을 수 있어서 이 비교만으로는 바뀐 것을 못 알아본다.
-             * 그래도 안전한 이유: 한 연결의 업스트림 칸은 한 바퀴에 하나이고, fd 를 바꾸는 곳(up_on_event, expire_idle)은
-             * 그 칸을 처리하는 중이거나 pollfd 를 만들기 전이다. 다음 바퀴는 build_pollfds 가 현재 fd 로 다시 만든다 */
-            if (c->upstream_fd != s->pfds[i].fd || !is_up_state(c->state))
+             * 그래도 안전한 이유: 같은 fd 의 이벤트는 한 배치에 하나이고, fd 를 바꾸는 곳(up_on_event, expire_idle)은
+             * 이 이벤트를 처리하는 중이거나 ev_wait 전이다. 새 fd 는 다음 바퀴에 build_interest 가 감시 목록에 넣는다 */
+            if (c->upstream_fd != tag_fd(tag) || !is_up_state(c->state))
                 continue;
             up_on_event(s, slot);
         } else if (is_up_state(c->state)) {
             up_on_client_event(s, slot, re);
-        } else if (re & (POLLERR | POLLNVAL)) {
+        } else if (re & WS_EV_ERR) {
+            /* 소켓 오류 = 상대가 RST 등으로 끊음. 프록시 중 끊긴 클라이언트도 결정 1 뒤로는 응답(504 등)을 쓰려 할 때 여기로 온다 */
+            c->close_why = "client-closed";
             conn_close(s, slot);
         } else if (c->state == CONN_READING || c->state == CONN_LINGERING) {
-            if (re & (POLLIN | POLLHUP))     /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */
+            if (re & (WS_EV_IN | WS_EV_HUP))       /* HUP 이면 read 가 0(EOF)을 돌려줘 닫힌다 */
                 conn_on_readable(s, slot);
-        } else if (re & (POLLOUT | POLLHUP)) {
+        } else if (re & (WS_EV_OUT | WS_EV_HUP)) {
             conn_on_writable(s, slot);       /* HUP 이면 write 가 EPIPE 로 실패해 닫힌다 */
         }
     }
-    if (s->pfds[PFD_SIGNAL].revents & POLLIN)
+    if (signal_ready)
         drain_signal_pipe();
-    if (s->pfds[PFD_LISTEN].fd >= 0 && (s->pfds[PFD_LISTEN].revents & POLLIN))
+    if (listen_ready)
         accept_ready(s);   /* 연결 이벤트를 다 처리한 뒤에 (파일 맨 위 주석 3) */
 }
 
@@ -1301,8 +1364,8 @@ static void log_listening(const server *s)
 
     memset(&ss, 0, sizeof ss);
     v6 = getsockname(s->listen_fd, (struct sockaddr *)&ss, &len) == 0 && ss.ss_family == AF_INET6;
-    fprintf(stderr, "webserver: listening on port %s (%s), docroot %s%s%s%s%s\n",
-            s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", s->cfg->docroot,
+    fprintf(stderr, "webserver: listening on port %s (%s, %s), docroot %s%s%s%s%s\n",
+            s->cfg->port, v6 ? "IPv6+IPv4" : "IPv4 only", ev_backend(), s->cfg->docroot,
             s->has_proxy ? ", proxy config " : "", s->has_proxy ? s->cfg->proxy_conf : "",
             s->parse_opt.merge_slashes ? ", merge slashes" : "",
             s->cfg->access_log ? ", access log" : "");
@@ -1314,14 +1377,18 @@ static void shutdown_all(server *s)
     size_t i;
 
     if (s->listen_fd >= 0)
-        close(s->listen_fd);
+        close_watched(s, s->listen_fd);
     s->listen_fd = -1;
     for (i = 0; i < SERVER_MAX_CONNS; i++) {
         if (s->conns[i] != NULL)
             s->conns[i]->close_why = "shutdown";
         conn_close(s, i);
     }
+    if (sig_pipe[0] >= 0)
+        ev_forget(s->ev, sig_pipe[0]);
     close_signal_pipe();
+    ev_close(s->ev);   /* 감시하던 fd 를 다 닫은 뒤에 (그 전에는 close_watched 가 ev 를 쓴다) */
+    s->ev = NULL;
 }
 
 int server_run(const server_config *cfg)
@@ -1358,22 +1425,34 @@ int server_run(const server_config *cfg)
         ret = -1;
         goto out;
     }
+    s->ev = ev_open(WATCH_MAX);
+    if (s->ev == NULL) {
+        fprintf(stderr, "webserver: cannot open %s: %s\n", ev_backend(), strerror(errno));
+        ret = -1;
+        goto out;
+    }
     log_listening(s);
 
     while (!stop_requested) {
         int64_t next_deadline = expire_idle(s, now_ms());
-        size_t npfds = build_pollfds(s);
-        int rc = poll(s->pfds, (nfds_t)npfds, poll_timeout_ms(next_deadline));
+        const ev_event *evs;
+        int rc;
 
+        if (build_interest(s) < 0) {
+            fprintf(stderr, "webserver: %s: cannot watch listen/signal fd: %s\n", ev_backend(), strerror(errno));
+            ret = -1;
+            break;
+        }
+        rc = ev_wait(s->ev, wait_timeout_ms(next_deadline), &evs);
         if (rc < 0) {
             if (errno == EINTR)
                 continue;   /* 시그널: 루프 조건에서 stop_requested 확인 */
-            perror("webserver: poll");
+            fprintf(stderr, "webserver: %s: %s\n", ev_backend(), strerror(errno));
             ret = -1;
             break;
         }
         if (rc > 0)
-            dispatch(s, npfds);
+            dispatch(s, evs, (size_t)rc);
     }
     if (ret == 0)
         fprintf(stderr, "webserver: shutting down (%zu connections)\n", s->nconns);

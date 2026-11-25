@@ -13,8 +13,27 @@ SRC_DIR   := src
 BUILD_DIR := build
 TARGET    := webserver
 
-SRCS := $(wildcard $(SRC_DIR)/*.c)
+# make EVENT=epoll|kqueue → 이벤트 대기 백엔드를 고른다 (docs/event-backend.md). 안 주거나 비우면 poll (기본)
+#   src/ev_<EVENT>.c 하나만 빌드하고 다른 ev_*.c 는 뺀다 (같은 함수를 정의하고, 다른 OS 에서는 #error 다)
+#   CI 행렬에 event 키가 없는 항목은 EVENT= (빈 값)으로 오므로 빈 값도 poll 로 본다
+EVENT ?= poll
+ifeq ($(EVENT),)
+override EVENT := poll
+endif
+ifeq ($(filter $(EVENT),poll epoll kqueue),)
+$(error EVENT must be poll, epoll or kqueue (got '$(EVENT)'))
+endif
+EV_SRC := $(SRC_DIR)/ev_$(EVENT).c
+ifeq ($(wildcard $(EV_SRC)),)
+$(error EVENT=$(EVENT): $(EV_SRC) is not written yet)
+endif
+
+SRCS := $(filter-out $(SRC_DIR)/ev_%.c,$(wildcard $(SRC_DIR)/*.c)) $(EV_SRC)
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+
+# 마지막으로 링크한 EVENT 를 적어 두는 파일. 내용이 바뀔 때만 다시 써서, EVENT 만 바꾼 make 도 다시 링크하게 한다
+# (안 그러면 예전 백엔드의 .o 와 실행 파일이 더 새로워 링크를 건너뛰고, 다른 백엔드를 시험한 줄 알게 된다)
+EV_STAMP := $(BUILD_DIR)/event
 DEPS := $(OBJS:.o=.d)
 
 # 단위 테스트: tests/unit/test_*.c 하나가 실행 파일 하나. main.c 를 뺀 모든 모듈과 링크
@@ -30,17 +49,20 @@ TOOL_DIR  := tests/tools
 FAKE      := $(BUILD_DIR)/tools/fake_upstream
 DEPS      += $(FAKE).d
 
-.PHONY: all clean run test unit asan classic docker-build docker-test docker-test-all docker-shell
+.PHONY: all clean run test unit asan classic docker-build docker-test docker-test-all docker-shell FORCE
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJS) $(EV_STAMP)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+$(EV_STAMP): FORCE | $(BUILD_DIR)
+	@echo '$(EVENT)' | cmp -s - $@ || echo '$(EVENT)' > $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)/unit
+$(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) $(EV_STAMP) | $(BUILD_DIR)/unit
 	$(CC) $(CPPFLAGS) -I$(UNIT_DIR) $(WARN) $(CFLAGS) -MMD -MP -MT $@ -MF $@.d \
 		-o $@ $< $(LIB_OBJS) $(LDFLAGS)
 
@@ -92,6 +114,7 @@ classic:
 #   make docker-test                    # Ubuntu + gcc
 #   make docker-test DISTRO=alpine      # Alpine(musl) + gcc
 #   make docker-test DISTRO=alpine CC=clang
+#   make docker-test DISTRO=alpine EVENT=epoll   # musl 에서 epoll 백엔드
 #   make docker-test-all                # Ubuntu, Alpine 모두
 #   make docker-shell DISTRO=alpine     # 컨테이너 안에서 직접 확인
 # 소스는 읽기 전용으로 마운트하고 컨테이너 내부 복사본에서 빌드하므로
@@ -101,7 +124,7 @@ DISTRO       ?= ubuntu
 DOCKER       ?= docker
 DOCKER_IMAGE := jungle-webserver-$(DISTRO)
 DOCKER_RUN   := $(DOCKER) run --rm -v "$(CURDIR)":/src:ro $(DOCKER_IMAGE)
-IN_CONTAINER := cp -a /src/. /work/ && make clean >/dev/null && make all test CC=$(CC) WERROR=$(WERROR)
+IN_CONTAINER := cp -a /src/. /work/ && make clean >/dev/null && make all test CC=$(CC) WERROR=$(WERROR) EVENT=$(EVENT)
 
 docker-build:
 	$(DOCKER) build -q -f docker/$(DISTRO).Dockerfile -t $(DOCKER_IMAGE) docker
