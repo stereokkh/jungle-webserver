@@ -28,9 +28,9 @@ flowchart TD
     MAIN["main.c<br/>CLI 인자 검사"] --> RUN["server.c · server_run()<br/>poll 이벤트 루프, conn 소유"]
     RUN --> NET["net.c<br/>listen 소켓 · 논블로킹 · NODELAY"]
     RUN --> PARSE["http_request.c<br/>증분 파서 · 경로 정규형"]
-    RUN --> ROUTE["handler.c<br/>프록시 → 앱 → 정적"]
+    RUN --> ROUTE["handler.c<br/>헬스체크 → 프록시 → 앱 → 정적"]
     ROUTE --> PCFG["proxy_config.c<br/>설정 로드 · 최장 접두사 · 백엔드 고르기"]
-    ROUTE --> APP["app.c<br/>/api/add · /api/echo"]
+    ROUTE --> APP["app.c<br/>/healthz · /api/echo"]
     RUN --> STATIC["static_file.c<br/>경로 검사 · 파일 조각 전송"]
     STATIC --> MIME["mime.c<br/>Content-Type"]
     RUN --> PROXY["proxy.c<br/>요청 다시 쓰기 · connect · 응답 중계"]
@@ -47,7 +47,7 @@ flowchart TD
 |---|---|---|---|
 | 진입 | `main.c` | 인자 검사 후 `server_run` | 아니오 |
 | 코어 | `server.c`, `net.c` | poll 루프, 연결 상태 머신, 타임아웃, 시그널, 업스트림 fd, 접근 로그 | **예 (유일)** |
-| 라우팅 | `handler.c` | 요청 하나를 `ROUTE_PROXY / APP / STATIC` 중 하나로 | 아니오 |
+| 라우팅 | `handler.c` | 요청 하나를 `ROUTE_HEALTH / PROXY / APP / STATIC` 중 하나로 | 아니오 |
 | 처리 모듈 | `http_request`, `http_response`, `static_file`, `mime`, `app`, `proxy_config`, `proxy` | 파싱, 응답 조립, 파일, 앱, 프록시 정책·중계 | `proxy_connect_*` 만 예외 |
 | 공통 | `buffer.c` | 입력·출력 버퍼, `mark` / `rollback` | 아니오 |
 
@@ -164,9 +164,11 @@ flowchart TD
     WAIT -->|"마감 지남<br/>idle 10초 / 요청 30초"| TO["expire_idle() → conn_close<br/>(408 없이)"]
     P -->|DONE| RS["respond() → handler_route()"]
     P -->|ERROR| ER["keep_alive = 0<br/>http_append_error(status)<br/>→ CLOSING"]
+    RS --> HZ["ROUTE_HEALTH<br/>app_health()"]
     RS --> PX["ROUTE_PROXY<br/>respond_proxy()"]
     RS --> AP["ROUTE_APP<br/>app_handle()"]
     RS --> ST["ROUTE_STATIC<br/>respond_static()"]
+    HZ --> C
     AP --> C["buffer_consume(in, consumed)<br/>← 응답을 다 만든 뒤에만"]
     ST --> C
     C --> W["WRITING"]
@@ -251,12 +253,14 @@ flowchart TD
 
 ```c
 // handler_route()
+if (app_health_match(req))                                      return ROUTE_HEALTH; // 정확히 "/healthz"
 if (cfg != NULL && (*route = proxy_match(cfg, req->target)))  return ROUTE_PROXY;
 if (app_match(req))                                             return ROUTE_APP;   // "/api/" 로 시작
 return ROUTE_STATIC;
 ```
 
 - 프록시 매칭: 정규형 `target` 의 `?` 앞 경로, **경로 경계에서만** (`/api` 는 `/apix` 에 안 맞음), 가장 긴 접두사가 이긴다
+- 헬스체크가 프록시보다 먼저인 이유: "이 인스턴스가 살아 있나"를 묻는 주소라서, 프런트에 보낸 것을 백엔드가 대신 답하면 안 된다. 정확 일치라 프록시 라우트(`/` 포함)를 가로채는 것은 이 한 경로뿐이다 (`/healthz/x`, `/healthzz` 는 평소 순서로)
 - 프록시가 앱보다 먼저인 이유: 프런트(`-c` 있음)에서는 `/api/` 가 백엔드로 가고, 백엔드(`-c` 없음)에서는 같은 경로를 앱이 처리한다. 같은 바이너리로 프록시 순환 없이 프런트·백엔드를 다 띄우기 위해서다
 - Tiny 는 `strstr(uri, "cgi-bin")` 이라 경로 어디에든 그 글자가 있으면 동적으로 오판했다
 
@@ -277,15 +281,15 @@ return ROUTE_STATIC;
 
 ### 4-2. 동적 처리 (내장 앱)
 
-`app_handle(req, port, &out)` — Tiny 의 `serve_dynamic` + `adder.c` 를 CGI 대신 함수로 옮긴 것.
+`app_handle(req, port, &out)` — Tiny 의 `serve_dynamic` + `adder.c` 자리를 CGI 대신 함수로 옮긴 것. 덧셈(`/api/add`)은 2026-11-25 에 헬스체크(`/healthz`)로 바꿨다 (#53).
 
 | 요청 | 응답 |
 |---|---|
-| `GET /api/add?a=1&b=2` | 200 `3` (형식 오류·범위 초과·오버플로 400) |
+| `GET`·`HEAD /healthz` | 200 `ok` (다른 메서드 405). 정확히 `/healthz` 일 때만, **프록시 라우트보다 먼저** 본다 |
 | `POST /api/echo` | 200 받은 본문 그대로 |
 | 그 밖의 `/api/` | 404, 메서드가 틀리면 405 |
 
-- 앱까지 온 모든 응답(오류 포함)에 `X-Instance: <포트>` 를 붙인다. 프록시 뒤에서 Round-Robin 분산을 눈으로 확인하는 용도다
+- 헬스체크와 앱까지 온 모든 응답(오류 포함)에 `X-Instance: <포트>` 를 붙인다. 프록시 뒤에서 Round-Robin 분산을 눈으로 확인하는 용도다
 - CGI 를 하지 않은 이유: `poll` 루프 안에서 자식 프로세스의 파이프와 `waitpid` 를 다루다 실수하면 서버 전체가 멈춘다. 4.5일 일정에서 이 위험을 지는 대신, 확장은 Reverse Proxy 로 하기로 했다 ([comparison.md](comparison.md#3-동적-처리-방식))
 
 ### 4-3. Reverse Proxy

@@ -34,7 +34,7 @@ flowchart LR
 
 - **이벤트 루프 하나**: 프로세스·스레드 하나가 `poll()` 로 연결 최대 1024개를 논블로킹으로 처리한다. 아무것도 안 보내는 연결이 있어도 다른 요청은 멈추지 않는다
 - **같은 바이너리로 프런트와 백엔드**: `-c` 를 주면 프런트(Reverse Proxy), 안 주면 백엔드. Round-Robin 분산, connect 단계의 failover
-- **세 갈래 처리**: 프록시 → 내장 앱(`/api/`) → 정적 파일 순서로 라우팅
+- **세 갈래 처리**: 프록시 → 내장 앱(`/api/`) → 정적 파일 순서로 라우팅. 헬스체크 `/healthz` 만은 프록시보다 먼저 자기 자신이 답한다
 - **Tiny 에서 고친 것**: 블로킹 대기, SIGPIPE 로 인한 종료, `../` 경로 탈출, 오류 페이지의 반사형 XSS 등 재현한 11가지 ([docs/classic.md](docs/classic.md))
 
 **안 하는 것**: CGI, Forward Proxy, 캐시, TLS, chunked 본문, 요청을 백엔드에 보낸 뒤의 재시도 → [지원 범위](docs/api.md#지원하는-http-범위)
@@ -45,7 +45,8 @@ flowchart LR
 make
 ./webserver -p 8080 -r www                  # 정적 파일 + 내장 앱
 curl localhost:8080/                        # www/index.html
-curl 'localhost:8080/api/add?a=1&b=2'       # 3
+curl localhost:8080/healthz                 # ok (헬스체크)
+curl -X POST --data hi localhost:8080/api/echo   # hi
 ```
 
 프런트 1대 + 백엔드 2대로 Reverse Proxy 띄우기:
@@ -56,7 +57,7 @@ curl 'localhost:8080/api/add?a=1&b=2'       # 3
 echo '/api 127.0.0.1:8001 127.0.0.1:8002' > proxy.conf
 ./webserver -p 8080 -r www -c proxy.conf &
 
-for i in 1 2 3 4; do curl -si 'localhost:8080/api/add?a=1&b=2' | grep X-Instance; done
+for i in 1 2 3 4; do curl -si -X POST --data hi localhost:8080/api/echo | grep X-Instance; done
 # X-Instance 가 8001, 8002 로 번갈아 바뀐다
 ```
 
@@ -98,7 +99,7 @@ flowchart LR
 
 - **소켓·시간·상태는 `server.c` 하나가 갖는다.** 파서·응답·정적 파일·앱·프록시 정책은 "바이트 → 바이트" 함수라서 서버를 띄우지 않고 단위 테스트한다
 - **`read`·`write` 는 부를 때마다 한 번.** 막히면 루프로 돌아가고 다른 연결을 처리한다. 파서는 상태를 저장하지 않아 덜 온 요청은 더 읽은 뒤 처음부터 다시 보고, 본문만 남았으면 다 모일 때까지 파서를 부르지 않는다 ([#24](docs/decisions.md))
-- **경로는 파서가 정규형 하나로 만든다.** 라우팅·앱·백엔드 전달이 모두 그 문자열을 써서 `/%61pi/add`, `//api/add` 같은 표기로 프록시 라우트를 건너뛸 수 없다 ([#31](docs/decisions.md))
+- **경로는 파서가 정규형 하나로 만든다.** 라우팅·앱·백엔드 전달이 모두 그 문자열을 써서 `/%61pi/echo`, `//api/echo` 같은 표기로 프록시 라우트를 건너뛸 수 없다 ([#31](docs/decisions.md))
 - **타임아웃은 타이머 스레드 없이** 가장 이른 마감을 `poll()` 대기 시간으로 쓴다. 유휴 10초, 요청 하나 30초(slow loris), 업스트림 5초
 
 <details>
@@ -157,9 +158,9 @@ stateDiagram-v2
 
 ### 4-2. 동적 처리 (내장 앱)
 
-- `GET /api/add?a=1&b=2` → `3`, `POST /api/echo` → 받은 본문 그대로
+- `GET /healthz` → `ok` (헬스체크, 프록시보다 먼저 봐서 프런트든 백엔드든 자기 자신이 답함), `POST /api/echo` → 받은 본문 그대로
 - CGI(`fork`·`exec`) 대신 **서버 안의 함수 호출**. 이벤트 루프 안에서 자식 프로세스와 파이프를 기다리면 서버 전체가 멈출 수 있어서다
-- 앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다
+- 헬스체크·앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다
 
 **자세히 →** [architecture: 내장 앱](docs/architecture.md#4-2-동적-처리-내장-앱) · [api: 내장 앱](docs/api.md#내장-앱-api)
 

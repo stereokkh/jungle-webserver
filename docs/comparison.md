@@ -21,10 +21,10 @@
 | `server.c` | `while (1) { Accept; doit; Close; }` | poll 이벤트 루프, keep-alive, 타임아웃, lingering close, 시그널 정리 |
 | `net.c` | `open_listenfd` | exit 대신 -1, IPv6 소켓 하나로 IPv4 까지, 논블로킹 |
 | `http_request.c` | 요청 줄 `sscanf`, 헤더는 읽고 버림 | 증분 파서, `Content-Length` 본문, 크기 제한, 경로 정규형 |
-| `handler.c` | `strstr(uri, "cgi-bin")` 로 정적/동적 판단 | 경로 접두사로 프록시 → 앱 → 정적 |
+| `handler.c` | `strstr(uri, "cgi-bin")` 로 정적/동적 판단 | 경로로 헬스체크(정확히 `/healthz`) → 프록시(접두사) → 앱 → 정적 |
 | `http_response.c` | `clienterror` (요청 값을 HTML 에 그대로) | 버퍼에 조립, 요청 내용을 넣지 않음, `Content-Length` 항상 |
 | `static_file.c` | `"."` 뒤에 URI 를 붙여 열고 `mmap` 한 번에 전송 | `..`·심볼릭 링크 탈출 403, 조각 전송 |
-| `app.c` | `serve_dynamic` (CGI `fork`·`exec`) + `adder.c` | 서버 안 함수 호출, 숫자·범위 검사 |
+| `app.c` | `serve_dynamic` (CGI `fork`·`exec`) + `adder.c` | 서버 안 함수 호출 (덧셈은 `/healthz` 헬스체크로 바꿈, #53) |
 | `proxy*.c` | 없음 | Reverse Proxy, Round-Robin, failover |
 
 **가장 크게 다른 점**: Tiny 는 요청을 안 보내는 연결 하나에 `Rio_readlineb` 가 멈춰서 다른 모든 클라이언트가 기다린다. 우리 서버는 그 연결이 `READING` 에서 기다리는 동안 다른 연결을 계속 처리하고, 10초(유휴)·30초(요청) 뒤 끊는다.
@@ -67,7 +67,7 @@
 | poll 루프와 맞물림 | 파이프·`waitpid` 를 논블로킹으로 다뤄야 함, 실수하면 루프가 멈춤 | 소켓이라 무난, 프로토콜 구현 필요 | 계산이 길면 루프가 멈춤 | 소켓이라 무난 |
 | 확장 | 한 기계 안 | 워커 수 조절 | 없음 | 백엔드 추가 + 분산 |
 
-**고른 것**: 간단한 계산(`/api/add`, `/api/echo`)은 함수로, 확장은 Reverse Proxy 로. CS:APP Tiny 의 `serve_dynamic` 이 CGI 라 출발점은 CGI 였지만, poll 루프 안에서 파이프와 자식 프로세스를 다루는 위험을 일정 안에 지지 않기로 했다 ([decisions.md](decisions.md) 2026-11-20). FastCGI 는 프로토콜을 하나 더 구현해야 하는데, 같은 "상주 프로세스에 소켓으로 넘긴다"는 이점을 HTTP Reverse Proxy 로 얻을 수 있었다.
+**고른 것**: 가벼운 내장 처리(`/healthz`, `/api/echo`)는 함수로, 확장은 Reverse Proxy 로. CS:APP Tiny 의 `serve_dynamic` 이 CGI 라 출발점은 CGI 였지만, poll 루프 안에서 파이프와 자식 프로세스를 다루는 위험을 일정 안에 지지 않기로 했다 ([decisions.md](decisions.md) 2026-11-20). FastCGI 는 프로토콜을 하나 더 구현해야 하는데, 같은 "상주 프로세스에 소켓으로 넘긴다"는 이점을 HTTP Reverse Proxy 로 얻을 수 있었다.
 
 **대가**: 앱 코드는 서버와 같은 프로세스라 격리가 없고, 앱을 바꾸려면 서버를 다시 빌드해야 한다. 프록시 경유는 백엔드 직접 호출의 약 40% 처리량을 보였다 (업스트림 연결을 요청마다 새로 열기 때문으로 보지만 단계별로 나눠 재지는 않았다).
 
