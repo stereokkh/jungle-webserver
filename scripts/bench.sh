@@ -147,28 +147,32 @@ done
 stop
 echo
 
-# 프록시: 같은 바이너리로 백엔드 2개(-c 없음) + 프런트(/api/ → 두 백엔드). /api/add 는 앱이 답하는 작은 응답
-start_bg() {   # start_bg 포트 [서버 인자...]: 띄우고 /api/add 가 200 일 때까지 기다림
+# 프록시: 같은 바이너리로 백엔드 2개(-c 없음) + 프런트(/px/ → 두 백엔드). /px/ok 는 3바이트 정적 파일.
+# (2026-11-25 전에는 /api/add?a=1&b=2 (본문 2바이트, 앱 응답)로 쟀다. /api/add 를 /healthz 로 바꾸면서
+#  /healthz 는 프런트가 직접 답해 중계를 거치지 않으므로, 비슷한 크기의 정적 파일로 바꿨다)
+mkdir -p "$W/px"
+printf 'ok\n' > "$W/px/ok"
+start_bg() {   # start_bg 포트 [서버 인자...]: 띄우고 /healthz 가 200 일 때까지 기다림
     local port=$1; shift
     "$BIN" -p "$port" -r "$W" "$@" 2>>"$W/px.log" & PX_PIDS+=($!)
     for _ in $(seq 50); do
-        [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/add?a=1&b=2")" = 200 ] && return 0
+        [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/healthz")" = 200 ] && return 0
         sleep 0.1
     done
     return 1
 }
-echo "## 프록시 (/api/add?a=1&b=2, ab, 연결 재사용 없음, 중앙값)"
-printf '/api/ 127.0.0.1:%s 127.0.0.1:%s\n' "$P_B1" "$P_B2" > "$W/proxy.conf"
+echo "## 프록시 (/px/ok 3바이트 정적 파일, ab, 연결 재사용 없음, 중앙값)"
+printf '/px/ 127.0.0.1:%s 127.0.0.1:%s\n' "$P_B1" "$P_B2" > "$W/proxy.conf"
 if start_bg "$P_B1" && start_bg "$P_B2" && start_bg "$P_FRONT" -c "$W/proxy.conf" &&
-   [ "$(curl -s "http://127.0.0.1:$P_FRONT/api/add?a=1&b=2")" = 3 ]; then
-    echo "- 본문 일치: 직접 = 경유 = 3"
+   [ "$(curl -s "http://127.0.0.1:$P_FRONT/px/ok")" = ok ]; then
+    echo "- 본문 일치: 직접 = 경유 = ok"
     echo "| 경로 | 동시성 | 요청/초 | p50 ms | p99 ms | 실패 / non-2xx / 전체 |"
     echo "|---|---|---|---|---|---|"
     for c in $CONCS; do
-        PORT=$P_B1    URLPATH='/api/add?a=1&b=2' run_ab "백엔드 직접" "$c"
-        PORT=$P_FRONT URLPATH='/api/add?a=1&b=2' run_ab "프런트 경유 (백엔드 2개)" "$c"
+        PORT=$P_B1    URLPATH='/px/ok' run_ab "백엔드 직접" "$c"
+        PORT=$P_FRONT URLPATH='/px/ok' run_ab "프런트 경유 (백엔드 2개)" "$c"
     done
 else
-    echo "- 건너뜀: 이 바이너리는 /api/ 를 중계하지 못함 (PR #36 이전 빌드)"
+    echo "- 건너뜀: 이 바이너리는 /px/ 를 중계하지 못하거나 /healthz 가 없음 (PR #36·헬스체크 이전 빌드)"
 fi
 stop_px

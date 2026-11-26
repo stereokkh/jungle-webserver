@@ -66,11 +66,11 @@ header() { sed -n "s/^$2: //p" "$TMP/$1.h"; }
 start b1 "$P1"
 start b2 "$P2"
 for p in "$P1" "$P2"; do
-    code=$(get d "$p" '/api/add?a=1&b=2')
-    if [ "$code" = 200 ] && [ "$(cat "$TMP/d.b")" = 3 ] && [ "$(header d X-Instance)" = "$p" ]; then
-        ok "backend :$p /api/add -> 3, X-Instance: $p"
+    code=$(get d "$p" '/healthz')
+    if [ "$code" = 200 ] && [ "$(cat "$TMP/d.b")" = ok ] && [ "$(header d X-Instance)" = "$p" ]; then
+        ok "backend :$p /healthz -> ok, X-Instance: $p"
     else
-        bad "backend :$p /api/add -> 3, X-Instance: $p (got $code, X-Instance '$(header d X-Instance)')"
+        bad "backend :$p /healthz -> ok, X-Instance: $p (got $code, X-Instance '$(header d X-Instance)')"
     fi
 done
 
@@ -99,10 +99,6 @@ same() {
 printf 'a\000b\r\nc' >"$TMP/body"
 head -c 65536 /dev/urandom >>"$TMP/body"
 
-same "GET /api/add?a=1&b=2"       '/api/add?a=1&b=2'
-same "GET /api/add?a=-5&b=2"      '/api/add?a=-5&b=2'
-same "GET /api/add?a=x (400)"     '/api/add?a=x&b=1'
-same "GET /api/add overflow (400)" '/api/add?a=9223372036854775807&b=1'
 same "POST /api/echo NUL/CRLF + 64KB" '/api/echo' -H 'Expect:' --data-binary "@$TMP/body"
 cmp -s "$TMP/p.b" "$TMP/body" && ok "POST /api/echo via proxy -> sent bytes back" \
                               || bad "POST /api/echo via proxy -> sent bytes back"
@@ -111,10 +107,18 @@ same "POST /api/echo no Content-Length (empty)" '/api/echo' -H 'Expect:' -X POST
 same "GET /api/echo (405)"        '/api/echo'
 same "GET /api/nope (404)"        '/api/nope'
 
-# Round-Robin: 경유 요청 4개가 두 백엔드에 모두 간다
+# /healthz 는 프록시보다 먼저라 프런트 자신이 답한다 (백엔드가 아니라 프런트 포트가 X-Instance)
+code=$(get h "$PF" '/healthz')
+if [ "$code" = 200 ] && [ "$(cat "$TMP/h.b")" = ok ] && [ "$(header h X-Instance)" = "$PF" ]; then
+    ok "front /healthz -> answered by front (X-Instance: $PF)"
+else
+    bad "front /healthz -> answered by front (got $code, X-Instance '$(header h X-Instance)')"
+fi
+
+# Round-Robin: 경유 요청 4개가 두 백엔드에 모두 간다 (/api/ 아래 404 도 자기 포트를 X-Instance 로 단다)
 seen=
 for i in 1 2 3 4; do
-    get r "$PF" '/api/add?a=1&b=1' >/dev/null
+    get r "$PF" '/api/rr' >/dev/null
     seen="$seen $(header r X-Instance)"
 done
 case "$seen" in
