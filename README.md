@@ -103,13 +103,13 @@ for i in 1 2 3 4; do curl -si -X POST --data hi localhost:8080/api/echo | grep X
 
 **자세히 →** [architecture: Reverse Proxy](docs/architecture.md#4-3-reverse-proxy) · [api: 설정 형식과 옵션](docs/api.md#reverse-proxy--c)
 
-### 3-3. 동적 처리 (내장 앱)
+### <span style="color:gray">~~3-3. 동적 처리 (내장 앱)~~</span>
 
-- `POST /api/echo` → 받은 본문 그대로
-- CGI(`fork`·`exec`) 대신 **서버 안의 함수 호출**. 이벤트 루프 안에서 자식 프로세스와 파이프를 기다리면 서버 전체가 멈출 수 있어서다
-- 앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다
+- <span style="color:gray">~~`POST /api/echo` → 받은 본문 그대로~~</span>
+- <span style="color:gray">~~CGI(`fork`·`exec`) 대신 **서버 안의 함수 호출**. 이벤트 루프 안에서 자식 프로세스와 파이프를 기다리면 서버 전체가 멈출 수 있어서다~~</span>
+- <span style="color:gray">~~앱 응답에는 `X-Instance: <포트>` 가 붙어 프록시 뒤에서 어느 백엔드가 답했는지 보인다~~</span>
 
-**자세히 →** [architecture: 내장 앱](docs/architecture.md#4-2-동적-처리-내장-앱) · [api: 내장 앱](docs/api.md#내장-앱-api)
+<span style="color:gray">~~**자세히 →** [architecture: 내장 앱](docs/architecture.md#4-2-동적-처리-내장-앱) · [api: 내장 앱](docs/api.md#내장-앱-api)~~</span>
 
 ### 3-4. 정적 파일
 
