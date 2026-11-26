@@ -1,5 +1,5 @@
 /*
- * test_app.c — app 모듈 단위 테스트 (이슈 #10)
+ * test_app.c — app 모듈 단위 테스트 (이슈 #10, 헬스체크 2026-11-25)
  *
  * 요청은 실제 파서(http_parse_request)로 만들어서 서버가 넘기는 것과 같은 req 로 시험한다.
  * 응답은 Date 가 매번 바뀌므로 상태 줄·필요한 헤더·본문만 따로 본다.
@@ -72,92 +72,88 @@ static void expect_status(const char *raw, const char *status_line)
     HAS("X-Instance: 8001\r\n");   /* 오류를 포함한 모든 응답 */
 }
 
-static void test_add_ok(void)
+/* raw 를 파싱하고 app_health 를 부른다 (파싱 실패면 -2) */
+static int call_health(const char *raw)
+{
+    size_t consumed = 0;
+    int status = 0;
+
+    buffer_free(&out);
+    buffer_init(&out);
+    if (http_parse_request(raw, strlen(raw), NULL, &req, &consumed, &status) != PARSE_DONE)
+        return -2;
+    return app_health(&req, "8001", &out);
+}
+
+static void test_health_ok(void)
 {
     size_t n;
     const char *b;
 
-    REQUIRE(call("GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    REQUIRE(call_health("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
     HAS("HTTP/1.1 200 OK\r\n");
     HAS("Content-Type: text/plain; charset=utf-8\r\n");
-    HAS("Content-Length: 2\r\n");
+    HAS("Content-Length: 3\r\n");
     HAS("Connection: keep-alive\r\n");
     HAS("X-Instance: 8001\r\n");
     b = body_of(&n);
-    CHECK_MEM(b, n, "3\n", 2);
+    CHECK_MEM(b, n, "ok\n", 3);
+
+    REQUIRE(call_health("GET /healthz HTTP/1.0\r\n\r\n") == 0);   /* 1.0 기본은 close */
+    HAS("Connection: close\r\n");
 }
 
-static void test_add_values(void)
-{
-    size_t n;
-    const char *b;
-
-    REQUIRE(call("GET /api/add?b=2&a=-7 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);   /* 순서 무관, 음수 */
-    b = body_of(&n);
-    CHECK_MEM(b, n, "-5\n", 3);
-
-    REQUIRE(call("GET /api/add?x=9&a=0&b=0&y= HTTP/1.1\r\nHost: x\r\n\r\n") == 0);  /* 다른 이름 무시 */
-    b = body_of(&n);
-    CHECK_MEM(b, n, "0\n", 2);
-
-    /* long long 경계: 넘치지 않는 가장 큰 합 */
-    REQUIRE(call("GET /api/add?a=9223372036854775806&b=1 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
-    b = body_of(&n);
-    CHECK_MEM(b, n, "9223372036854775807\n", 20);
-    REQUIRE(call("GET /api/add?a=-9223372036854775808&b=0 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
-    b = body_of(&n);
-    CHECK_MEM(b, n, "-9223372036854775808\n", 21);
-    /* 합이 정확히 LLONG_MIN (아래로 넘침 검사의 '<' 를 '<=' 로 바꾸면 400 이 됨) */
-    REQUIRE(call("GET /api/add?a=-9223372036854775807&b=-1 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
-    b = body_of(&n);
-    CHECK_MEM(b, n, "-9223372036854775808\n", 21);
-}
-
-static void test_add_bad_400(void)
-{
-    static const char *const bad[] = {
-        "",                       /* 질의 없음 */
-        "a=1",                    /* b 누락 */
-        "b=2",
-        "a=&b=2",                 /* 빈 값 */
-        "a=-&b=2",
-        "a=abc&b=2",              /* atoi 면 0 */
-        "a=12x&b=2",              /* 뒤에 쓰레기 */
-        "a=+1&b=2",               /* strtoll 은 받지만 막는다 */
-        "a=%201&b=2",             /* 퍼센트 인코딩 (공백) */
-        "a=1.5&b=2",
-        "a=1&a=2&b=3",            /* 중복 */
-        "A=1&b=2",                /* 이름은 대소문자 구분 → a 누락 */
-        "a=9223372036854775808&b=0",    /* 범위 초과 (strtoll ERANGE) */
-        "a=99999999999999999999999999999999&b=0",   /* 너무 긴 값 */
-        "a=9223372036854775807&b=1",    /* 합이 넘침 */
-        "a=-9223372036854775808&b=-1",  /* 합이 아래로 넘침 */
-    };
-    char raw[256];
-    size_t i;
-
-    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        snprintf(raw, sizeof raw, "GET /api/add%s%s HTTP/1.1\r\nHost: x\r\n\r\n",
-                 bad[i][0] ? "?" : "", bad[i]);
-        expect_status(raw, "HTTP/1.1 400 Bad Request\r\n");
-        HAS("Connection: keep-alive\r\n");     /* 요청 자체는 멀쩡하니 연결은 유지 */
-    }
-}
-
-static void test_add_head(void)
+static void test_health_head(void)
 {
     size_t n;
 
-    REQUIRE(call("HEAD /api/add?a=40&b=2 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    REQUIRE(call_health("HEAD /healthz HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
     HAS("HTTP/1.1 200 OK\r\n");
     HAS("Content-Length: 3\r\n");       /* GET 과 같은 길이, 본문은 없음 */
     body_of(&n);
     CHECK_INT((long)n, 0);
+}
 
-    REQUIRE(call("HEAD /api/add?a=x&b=2 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
-    HAS("HTTP/1.1 400 Bad Request\r\n");
-    body_of(&n);
-    CHECK_INT((long)n, 0);
+static void test_health_405(void)
+{
+    REQUIRE(call_health("POST /healthz HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n") == 0);
+    HAS("HTTP/1.1 405 Method Not Allowed\r\n");
+    HAS("Allow: GET, HEAD\r\n");
+    HAS("X-Instance: 8001\r\n");
+    HAS("Connection: keep-alive\r\n");  /* 405 뒤에도 연결 유지 */
+}
+
+/* 정확 일치만 (접두사로 다른 경로를 가로채지 않는다). 질의는 보지 않는다. 판정은 파서 정규형으로 */
+static void test_health_match(void)
+{
+    static const char *const yes[] = { "/healthz", "/healthz?probe=1", "/%68ealthz" };   /* 점 조각은 파서가 400 */
+    static const char *const no[] = { "/healthz/", "/healthz/x", "/healthzz", "/health", "/HEALTHZ",
+                                      "/api/healthz", "/x/healthz" };
+    char raw[128];
+    size_t i;
+
+    for (i = 0; i < sizeof yes / sizeof yes[0]; i++) {
+        snprintf(raw, sizeof raw, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", yes[i]);
+        REQUIRE(call_health(raw) == 0);
+        CHECK_INT(app_health_match(&req), 1);
+    }
+    for (i = 0; i < sizeof no / sizeof no[0]; i++) {
+        snprintf(raw, sizeof raw, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", no[i]);
+        REQUIRE(call_health(raw) == 0);
+        CHECK_INT(app_health_match(&req), 0);
+    }
+}
+
+/* instance_port 가 지나치게 길면 -1, out 은 그대로 */
+static void test_health_failure_keeps_out(void)
+{
+    size_t before;
+
+    REQUIRE(call_health("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    before = buffer_pending(&out);
+    CHECK_INT(app_health(&req, "0123456789012345678901234567890123456789012345678901234567890123456789"
+                               "0123456789012345678901234567890123456789", &out), -1);
+    CHECK_INT((long)buffer_pending(&out), (long)before);
 }
 
 static void test_echo(void)
@@ -188,13 +184,9 @@ static void test_method_405(void)
 {
     size_t n;
 
-    expect_status("POST /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
-                  "HTTP/1.1 405 Method Not Allowed\r\n");
-    HAS("Allow: GET, HEAD\r\n");
-    HAS("Connection: keep-alive\r\n");  /* 405 뒤에도 연결 유지 */
-
     expect_status("GET /api/echo HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 405 Method Not Allowed\r\n");
     HAS("Allow: POST\r\n");
+    HAS("Connection: keep-alive\r\n");  /* 405 뒤에도 연결 유지 */
 
     expect_status("HEAD /api/echo HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 405 Method Not Allowed\r\n");
     HAS("Allow: POST\r\n");
@@ -203,12 +195,12 @@ static void test_method_405(void)
 }
 
 /* 파서 정규형으로 라우팅한다 (#31, PR #18 결정 2 를 바꿈): 표기만 바꾼 경로도 같은 라우트 */
-static void test_add_normalized(void)
+static void test_echo_normalized(void)
 {
-    CHECK_INT(call("GET /api/%61dd?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n"), 0);
+    CHECK_INT(call("POST /api/%65cho HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi"), 0);
     HAS("HTTP/1.1 200 OK\r\n");
-    HAS("\r\n\r\n3\n");
-    CHECK_INT(call("GET /%61pi/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n"), 0);
+    HAS("\r\n\r\nhi");
+    CHECK_INT(call("POST /%61pi/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi"), 0);
     HAS("HTTP/1.1 200 OK\r\n");
     CHECK_INT(app_match(&req), 1);
 }
@@ -216,17 +208,19 @@ static void test_add_normalized(void)
 static void test_unknown_404(void)
 {
     expect_status("GET /api/ HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
-    expect_status("GET /api/addx?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
-    expect_status("GET /api/add/ HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
-    expect_status("GET /api/ADD?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
-    /* 비예약 문자를 인코딩한 "/api/%61dd" 는 파서 정규형이 "/api/add" 라 404 가 아니다 (#31).
-     * test_add_normalized 참고 */
+    expect_status("POST /api/echox HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
+    expect_status("POST /api/echo/ HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
+    expect_status("POST /api/ECHO HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
+    /* 덧셈(/api/add)은 2026-11-25 에 /healthz 로 바꿔서 이제 없는 경로다 */
+    expect_status("GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
+    /* 헬스체크는 app_handle 이 아니라 app_health 가 답한다 (handler_route 가 앞에서 나눈다) */
+    expect_status("GET /api/healthz HTTP/1.1\r\nHost: x\r\n\r\n", "HTTP/1.1 404 Not Found\r\n");
     LACKS("/api/");                     /* 오류 본문에 요청 경로를 넣지 않음 (#3 XSS) */
 }
 
 static void test_connection(void)
 {
-    REQUIRE(call("GET /api/add?a=1&b=2 HTTP/1.0\r\n\r\n") == 0);   /* 1.0 기본은 close */
+    REQUIRE(call("GET /api/nope HTTP/1.0\r\n\r\n") == 0);   /* 1.0 기본은 close */
     HAS("Connection: close\r\n");
     REQUIRE(call("GET /api/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") == 0);
     HAS("Connection: close\r\n");
@@ -237,7 +231,7 @@ static void test_failure_keeps_out(void)
     size_t before;
 
     /* 앞에 다른 응답이 쌓여 있어도 뒤에 덧붙이기만 한다 */
-    REQUIRE(call("GET /api/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n") == 0);
+    REQUIRE(call("POST /api/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi") == 0);
     before = buffer_pending(&out);
     REQUIRE(app_handle(&req, "8001", &out) == 0);
     CHECK_INT((long)buffer_pending(&out), (long)(before * 2));
@@ -268,13 +262,14 @@ static void test_body_failure_rolls_back(void)
 int main(void)
 {
     buffer_init(&out);
-    RUN(test_add_ok);
-    RUN(test_add_values);
-    RUN(test_add_bad_400);
-    RUN(test_add_head);
+    RUN(test_health_ok);
+    RUN(test_health_head);
+    RUN(test_health_405);
+    RUN(test_health_match);
+    RUN(test_health_failure_keeps_out);
     RUN(test_echo);
     RUN(test_method_405);
-    RUN(test_add_normalized);
+    RUN(test_echo_normalized);
     RUN(test_unknown_404);
     RUN(test_connection);
     RUN(test_failure_keeps_out);
