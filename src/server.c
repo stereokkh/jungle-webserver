@@ -242,7 +242,7 @@ static int would_block(int err)
  * access log (--access-log, 기본 꺼짐)
  *   stderr 에 한 줄씩 쓴다. 기존 시작·종료 메시지와 같은 곳이라 `make run` 한 창에서 다 보인다.
  *     access: #3 open 127.0.0.1:51234 (active 1)
- *     access: #3 127.0.0.1:51234 "GET /api/add?a=1&b=2 HTTP/1.1" 200 142 1ms
+ *     access: #3 127.0.0.1:51234 "GET /healthz HTTP/1.1" 200 142 1ms
  *     access: #3 close idle-timeout requests=1 10012ms (active 0)
  *   요청 줄은 응답을 끝까지 보냈을 때(또는 그 전에 연결이 닫히면 "incomplete" 를 붙여) 쓴다.
  *   상태 코드는 모듈마다 응답을 out 에 쓰는 방식이 달라서(정적·앱·오류·프록시 중계) 따로 넘기지 않고,
@@ -620,7 +620,7 @@ static int respond_proxy(conn *c, proxy_route *route, int head)
 }
 
 /*
- * 파서가 DONE 을 돌려준 요청 하나의 응답을 out 에 만든다. 처리 순서: 프록시 → 앱 → 정적.
+ * 파서가 DONE 을 돌려준 요청 하나의 응답을 out 에 만든다. 처리 순서: 헬스체크 → 프록시 → 앱 → 정적.
  * 반환 RESPOND_OUT (4xx·5xx 응답을 쓴 것도 성공), RESPOND_PROXY (업스트림 연결을 시작함: out 은 비어 있고
  * 상태는 UP_CONNECTING), -1 응답을 못 씀 (메모리 부족 → 연결 닫기)
  */
@@ -630,6 +630,11 @@ static int respond(server *s, conn *c)
     int head = c->req.method == HTTP_HEAD;
 
     switch (handler_route(&c->req, s->has_proxy ? &s->proxy : NULL, &route)) {
+    case ROUTE_HEALTH:
+        if (app_health(&c->req, s->cfg->port, &c->out) == 0)
+            return RESPOND_OUT;
+        c->keep_alive = 0;   /* 메모리 부족: 앱과 같이 500 (그것도 못 쓰면 -1 → 연결 닫기) */
+        return http_append_error(&c->out, 500, 0, head, NULL);
     case ROUTE_PROXY:
         return respond_proxy(c, route, head);
     case ROUTE_APP:

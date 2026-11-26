@@ -8,6 +8,16 @@
 
 ---
 
+## 2026-11-25 · 내장 덧셈(/api/add)을 헬스체크(/healthz)로 교체, 헬스체크는 프록시보다 먼저
+
+- **결정** (건호 판단, 11-25. 마감 뒤 정리. 앱은 C 트랙 혜성님 파일이라 리뷰 필요):
+  1. `GET /api/add` 를 없앤다. 대신 `GET /healthz` 를 둔다: GET·HEAD 는 200 `ok\n` (`text/plain; charset=utf-8`), 그 외 메서드는 405 `Allow: GET, HEAD`. 모든 응답에 `X-Instance: <포트>`. `POST /api/echo` 는 그대로 둔다 (동적 응답 예시, 프록시 POST 중계 검사)
+  2. 처리 순서를 **헬스체크 → 프록시 → 앱 → 정적** 으로 바꾼다 (`handler_route` 가 `app_health_match` 를 맨 먼저, 새 `ROUTE_HEALTH`). 정규형 `target` 의 `?` 앞이 **정확히** `/healthz` 일 때만이다. 질의는 보지 않는다 (`/healthz?probe=1` 도 헬스체크). `/healthz/x`, `/healthzz`, `/api/healthz` 는 해당하지 않는다
+  3. 헬스체크는 "이 응답을 쓴 인스턴스가 살아 있다"만 뜻한다. 백엔드 상태·페일오버 죽은 표시는 보지 않는다
+  4. 백엔드를 거치는지 보는 시험(`tests/run.sh` 의 `proxy_alive`, 프록시 GET·HEAD·431, `scripts/bench.sh` 의 프록시 측정)은 `/api/add` 대신 백엔드 docroot 의 작은 정적 파일(`/alive/id`, `/files/small`, `/px/ok`)로 본다. `/healthz` 는 프런트가 직접 답해서 중계 확인에 쓸 수 없다
+- **이유**: 덧셈은 Tiny `adder` 를 옮긴 시연용이었고 범용 웹서버가 할 일이 아니다. 운영에서 서버 자체에 두는 동적 주소로는 "살아 있나"를 묻는 헬스체크가 흔하다 (Docker `HEALTHCHECK`, 쿠버네티스 probe, 가동 감시, nginx `location = /health { return 200; }`). 프록시보다 먼저 둔 것은 프런트에 보낸 헬스체크를 백엔드가 대신 답하면 프런트가 살아 있는지 알 수 없기 때문이다. 정확 일치라서 가로채는 경로는 이 하나뿐이고, `/` 를 통째로 넘기는 설정에서도 다른 경로는 그대로 프록시로 간다. 이름 `/healthz` 는 쿠버네티스 관례로, 끝의 `z` 가 일반 페이지 이름과 겹치지 않게 한다
+- **영향**: `include/app.h`, `src/app.c` (`app_health_match`, `app_health`, 덧셈·질의 파싱 삭제), `include/handler.h`, `src/handler.c` (`ROUTE_HEALTH`), `src/server.c` (`respond`), `tests/unit/test_app.c`, `tests/unit/test_contract.c`, `tests/run.sh`, `tests/backends.sh`, `scripts/bench.sh`, `docs/api.md`, `docs/interfaces.md`, `docs/demo/index.html`, `docs/classic.md`·`docs/benchmark.md` (기록 당시 `/api/add` 였다는 메모만), `README.md`, `CLAUDE.md`. 예전 측정값(`docs/benchmark.md` 프록시 표)은 `/api/add` 로 잰 그대로 둔다
+
 ## 2026-11-25 · 프록시 페일오버: backup=, failover=, tries= (범위 안으로)
 
 - **결정** (상철 판단, 11-25. 설계는 이대로 두고 구현한다):

@@ -34,7 +34,7 @@ make clean
 
 ```text
 access: #2 open 127.0.0.1:51930 (active 1)
-access: #2 127.0.0.1:51930 "GET /api/add?a=3&b=4 HTTP/1.1" 200 187 0ms
+access: #2 127.0.0.1:51930 "GET /healthz HTTP/1.1" 200 188 0ms
 access: #2 close idle-timeout requests=1 10003ms (active 0)
 ```
 
