@@ -232,7 +232,7 @@ flowchart TD
 
 **`conn_close()`**: 소켓·업스트림 소켓·파일·버퍼·중계 상태를 정리하는 곳은 이 함수 하나뿐이다. 정리 함수는 모두 두 번 불러도 안전하다. 닫으면 쉬던 accept 를 재개한다.
 
-**접근 로그 (`--access-log`)**: 연결 열림·요청·닫힘 이유를 stderr 에 한 줄씩 쓴다. 요청 줄은 응답을 다 보낸 뒤에 쓰고, 닫힘 이유는 `done`, `client-closed`, `idle-timeout`, `request-timeout`, `linger-timeout`, `read-error`, `write-error`, `shutdown`. stderr 를 받는 쪽이 막히면 루프도 멈추므로 관찰할 때만 켠다.
+**접근 로그 (`--access-log`)**: 연결 열림·요청·닫힘 이유를 stderr 에 한 줄씩 쓴다. 요청 줄은 응답을 다 보낸 뒤에 쓰고, 닫힘 이유는 `done`, `client-closed`, `idle-timeout`, `request-timeout`, `linger-timeout`, `read-error`, `write-error`, `event-error`(이벤트 백엔드 등록 실패), `shutdown`. stderr 를 받는 쪽이 막히면 루프도 멈추므로 관찰할 때만 켠다.
 
 ### 3-5. 타임아웃
 

@@ -32,7 +32,7 @@ flowchart LR
     B2 --> A2["내장 앱<br/>X-Instance: 8002"]
 ```
 
-- **이벤트 루프 하나**: 프로세스·스레드 하나가 `poll()` 로 연결 최대 1024개를 논블로킹으로 처리한다. 아무것도 안 보내는 연결이 있어도 다른 요청은 멈추지 않는다
+- **이벤트 루프 하나**: 프로세스·스레드 하나가 `poll()` 로 연결 최대 1024개를 논블로킹으로 처리한다. 아무것도 안 보내는 연결이 있어도 다른 요청은 멈추지 않는다. 기다리는 부분은 `include/ev.h` 뒤에 있고 기본은 `poll()` 이다 (`make EVENT=epoll` 은 Linux, `make EVENT=kqueue` 는 macOS 에서 비교용. `docs/event-backend.md`).
 - **같은 바이너리로 프런트와 백엔드**: `-c` 를 주면 프런트(Reverse Proxy), 안 주면 백엔드. Round-Robin 분산, connect 단계의 failover
 - **네 갈래 처리**: 헬스체크 → 프록시 → 내장 앱(`/api/`) → 정적 파일 순서로 라우팅
 - **Tiny 에서 고친 것**: 블로킹 대기, SIGPIPE 로 인한 종료, `../` 경로 탈출, 오류 페이지의 반사형 XSS 등 재현한 11가지 ([docs/classic.md](docs/classic.md))

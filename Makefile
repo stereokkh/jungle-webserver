@@ -13,8 +13,20 @@ SRC_DIR   := src
 BUILD_DIR := build
 TARGET    := webserver
 
-SRCS := $(wildcard $(SRC_DIR)/*.c)
+# 이벤트 백엔드 (docs/event-backend.md): make [EVENT=poll|epoll|kqueue]. 비면 poll
+EVENT_ALL := poll epoll kqueue
+override EVENT := $(if $(strip $(EVENT)),$(strip $(EVENT)),poll)
+ifeq ($(filter $(EVENT),$(EVENT_ALL)),)
+$(error EVENT=$(EVENT) 은 모르는 값이다. poll, epoll, kqueue 중 하나)
+endif
+
+# 고르지 않은 백엔드 파일은 빌드에서 뺀다 (#ifdef 로 감싸면 빈 번역 단위라 -Wpedantic 경고)
+SRCS := $(filter-out $(patsubst %,$(SRC_DIR)/ev_%.c,$(filter-out $(EVENT),$(EVENT_ALL))),$(wildcard $(SRC_DIR)/*.c))
 OBJS := $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
+
+# EVENT 를 바꾸면 다시 링크되게: 마지막 EVENT 를 적은 스탬프 (내용이 바뀔 때만 다시 써서 시각이 바뀐다)
+EVENT_STAMP := $(BUILD_DIR)/event.stamp
+$(shell mkdir -p $(BUILD_DIR); [ "$$(cat $(EVENT_STAMP) 2>/dev/null)" = "$(EVENT)" ] || echo "$(EVENT)" > $(EVENT_STAMP))
 DEPS := $(OBJS:.o=.d)
 
 # 단위 테스트: tests/unit/test_*.c 하나가 실행 파일 하나. main.c 를 뺀 모든 모듈과 링크
@@ -34,13 +46,13 @@ DEPS      += $(FAKE).d
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJS) $(EVENT_STAMP)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)/unit
+$(BUILD_DIR)/unit/%: $(UNIT_DIR)/%.c $(LIB_OBJS) $(EVENT_STAMP) | $(BUILD_DIR)/unit
 	$(CC) $(CPPFLAGS) -I$(UNIT_DIR) $(WARN) $(CFLAGS) -MMD -MP -MT $@ -MF $@.d \
 		-o $@ $< $(LIB_OBJS) $(LDFLAGS)
 

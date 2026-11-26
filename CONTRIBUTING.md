@@ -30,6 +30,7 @@ make clean
 make unit                               # 단위 테스트만
 make test                               # 빌드 + 단위 테스트 + 스모크 테스트(run.sh) + 백엔드 비교(backends.sh)
 make asan                               # AddressSanitizer/UBSan 빌드로 같은 테스트 (Ubuntu·WSL·macOS)
+make test EVENT=epoll                   # 이벤트 백엔드를 epoll 로 (Linux). macOS 는 EVENT=kqueue, 기본은 poll
 make docker-test                        # Ubuntu 컨테이너에서
 make docker-test DISTRO=alpine          # Alpine 컨테이너에서
 make docker-test DISTRO=alpine CC=clang # 컴파일러 지정

@@ -44,7 +44,8 @@
 | 파일 (`src/*.c`, `include/*.h`) | Tiny 대응 | 트랙 · 이슈 |
 |---|---|---|
 | `net` | `open_listenfd` | A · #7 |
-| `server` | `main` 의 반복 accept 루프 → poll 이벤트 루프 | A · #7 |
+| `server` | `main` 의 반복 accept 루프 → 이벤트 루프 | A · #7 |
+| `ev_poll` / `ev_epoll` / `ev_kqueue` (`ev.h`) | 없음 (빌드 때 하나, `make EVENT=`) | [제안] `docs/event-backend.md` |
 | `handler` | `doit` 의 정적/동적 분기 → 헬스체크 → 프록시 → 앱 → 정적 | A(틀) · #4, #8, #10 |
 | `http_request` | `doit` 요청 라인, `read_requesthdrs`, `parse_uri` | B · #5 |
 | `http_response` | `clienterror`, `serve_static` 헤더 | C · #6 |
@@ -57,7 +58,7 @@
 
 - 모든 모듈(`buffer`, `http_request`, `mime`, `http_response`, `static_file`, `app`, `proxy_config`, `proxy`)이 구현·테스트 완료됐다 (`proxy` 의 connect·응답 중계는 #9, 리뷰 대기). 프록시 페일오버(11-25)는 `proxy_config`(옵션 읽기·선택)와 `server.c`(`CONN_UP_CONNECTING` 에서 다음 백엔드로)에 들어 있고, 리뷰 대기다. 시그니처는 #4 인터페이스 PR 에서 확정했고, 바꾸려면 관련 담당자 합의 후 헤더와 `docs/interfaces.md` 를 같은 PR 에서 고친다
 - 응답·프록시 요청은 고정 배열이 아니라 `buffer` 에 덧붙인다. 실패하면 `buffer_mark`/`buffer_rollback` 으로 버퍼를 호출 전 상태로 되돌린다
-- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 프록시(#9)는 업스트림 상태(`CONN_UP_CONNECTING/SENDING/RECEIVING`)로 중계한다 (구현함, 리뷰 대기: 연결이 pollfd 를 둘 쓰고, 응답은 머리만 해석해 받은 바이트를 그대로 넘기며, 중계가 끝나면 클라이언트 연결을 닫는다. 결정은 `docs/decisions.md` 2026-11-23). 앱(#10)도 연결 완료됐다
+- `main.c`(CLI `-p -r -c`)·`net.c`·`server.c` 는 #7 에서 구현했다. 서버는 파서 → `handler_route` → 정적 파일·응답으로 실제 요청을 처리하고, keep-alive·파이프라이닝, 본문 대기 중 파서 재호출 생략(`NEED_MORE` 의 `consumed`, PR #24), 요청 타임아웃(30초), lingering close 를 한다. 프록시(#9)는 업스트림 상태(`CONN_UP_CONNECTING/SENDING/RECEIVING`)로 중계한다 (구현함, 리뷰 대기: 연결이 감시 fd 를 둘 쓰고, 응답은 머리만 해석해 받은 바이트를 그대로 넘기며, 중계가 끝나면 클라이언트 연결을 닫는다. 결정은 `docs/decisions.md` 2026-11-23). 앱(#10)도 연결 완료됐다
 
 CS:APP Tiny (이슈 #3):
 
@@ -83,7 +84,7 @@ POSIX로 해결되는 방법을 먼저 쓴다.
 | `MSG_NOSIGNAL` | 시작 시 `signal(SIGPIPE, SIG_IGN)` |
 | `socket(..., SOCK_NONBLOCK)`, `accept4()` | `fcntl(fd, F_SETFL, O_NONBLOCK)` |
 | `gethostbyname()` | `getaddrinfo()` (IPv4/IPv6) |
-| `epoll` / `kqueue` 를 기본 경로로 | `poll()` 기본, epoll/kqueue는 나중에 최적화로만 |
+| `epoll` / `kqueue` 를 기본 경로로 | `poll()` 기본 (`ev_poll.c`). epoll/kqueue 는 `make EVENT=epoll\|kqueue` 로 고르는 비교용, OS 분기는 `ev_*.c` 안에만 |
 | `sendfile()` | `read`/`write` 루프 (시그니처가 OS마다 다름) |
 
 - `struct sockaddr_*` 는 사용 전 반드시 `memset` 0 초기화 (macOS에는 `sin_len` 필드가 있음)
